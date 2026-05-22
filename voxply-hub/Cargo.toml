@@ -1,0 +1,39 @@
+[package]
+name = "voxply-hub"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "voxply-hub"
+path = "src/main.rs"
+
+[lib]
+name = "voxply_hub"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+hex = "0.4"
+rand = "0.8"
+sha2 = "0.10"
+voxply-identity = { path = "../voxply-identity" }
+reqwest = { version = "0.12", features = ["json"] }
+sqlx = { workspace = true }
+futures-util = "0.3"
+uuid = { workspace = true }
+bytes = "1"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+
+[dev-dependencies]
+axum-test = "19"
+tokio = { workspace = true }
+reqwest = { version = "0.12", features = ["json"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
