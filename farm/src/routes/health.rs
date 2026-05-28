@@ -16,6 +16,8 @@ pub struct FarmInfoResponse {
     pub public_key: String,
     pub directory_public: bool,
     pub auth: AuthUrls,
+    /// Count of non-suspended, non-deleted hubs on this farm.
+    pub hosted_hubs: i64,
 }
 
 #[derive(Serialize)]
@@ -46,6 +48,14 @@ pub async fn farm_info(State(state): State<Arc<FarmState>>) -> Json<FarmInfoResp
             .map(|v| v != 0)
             .unwrap_or(false);
 
+    let hosted_hubs: i64 =
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM hubs WHERE suspended_at IS NULL AND deleted_at IS NULL",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(0);
+
     Json(FarmInfoResponse {
         kind: "voxply-farm",
         version: env!("CARGO_PKG_VERSION"),
@@ -58,5 +68,6 @@ pub async fn farm_info(State(state): State<Arc<FarmState>>) -> Json<FarmInfoResp
             verify_url: "/auth/verify",
             renew_url: "/auth/renew",
         },
+        hosted_hubs,
     })
 }

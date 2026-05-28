@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axum::routing::{get, post};
+use axum::routing::{any, delete, get, patch, post};
 use axum::Router;
 use tower_http::trace::TraceLayer;
 
@@ -17,6 +17,22 @@ pub fn create_router(state: Arc<FarmState>) -> Router {
         .route("/auth/renew", post(routes::auth::renew))
         // Belt-and-braces revocation check for hubs.
         .route("/farm/auth/revoke-check", post(routes::revoke::revoke_check))
+        // Hub management routes.
+        .route(
+            "/farm/hubs",
+            get(routes::hubs::list_hubs).post(routes::hubs::create_hub),
+        )
+        .route("/farm/hubs/{hub_id}", get(routes::hubs::get_hub))
+        .route(
+            "/farm/hubs/{hub_id}/suspend",
+            patch(routes::hubs::suspend_hub),
+        )
+        .route("/farm/hubs/{hub_id}", delete(routes::hubs::delete_hub))
+        // Proxy catch-all — must be last (fallback for all /hub/<id>/... requests).
+        .route(
+            "/hub/{hub_id}/{*path}",
+            any(crate::proxy::proxy_handler),
+        )
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

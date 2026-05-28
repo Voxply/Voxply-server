@@ -11,6 +11,7 @@ use rand::rngs::OsRng;
 use serde_json::{json, Value};
 use sqlx::sqlite::SqlitePoolOptions;
 use voxply_farm::db;
+use voxply_farm::hub_manager::HubManager;
 use voxply_farm::server;
 use voxply_farm::state::FarmState;
 use voxply_farm::token::verify_token;
@@ -43,7 +44,8 @@ async fn setup() -> (TestServer, Arc<FarmState>) {
         .await
         .unwrap();
 
-    let state = Arc::new(FarmState::new(db, keypair, farm_url));
+    let hub_manager = Arc::new(HubManager::new("voxply-hub".to_string(), farm_url.clone()));
+    let state = Arc::new(FarmState::new(db, keypair, farm_url, hub_manager));
     let app = server::create_router(state.clone());
     (TestServer::new(app), state)
 }

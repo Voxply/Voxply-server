@@ -53,5 +53,30 @@ pub async fn run(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await?;
 
+    // Phase 2: per-hub process registry.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS hubs (
+            id                  TEXT PRIMARY KEY,
+            owner_pubkey        TEXT NOT NULL,
+            name                TEXT NOT NULL,
+            description         TEXT,
+            visibility          TEXT NOT NULL DEFAULT 'private'
+                                    CHECK(visibility IN ('public', 'private')),
+            process_port        INTEGER,
+            db_path             TEXT NOT NULL,
+            created_at          INTEGER NOT NULL,
+            suspended_at        INTEGER,
+            suspension_reason   TEXT,
+            deleted_at          INTEGER
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    // Phase 2: admin_pubkey on the farms singleton (first operator who sets it becomes admin).
+    let _ = sqlx::query("ALTER TABLE farms ADD COLUMN admin_pubkey TEXT")
+        .execute(pool)
+        .await;
+
     Ok(())
 }

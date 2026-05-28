@@ -7,6 +7,7 @@ use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::SqlitePoolOptions;
 use voxply_farm::db;
+use voxply_farm::hub_manager::HubManager;
 use voxply_farm::server;
 use voxply_farm::state::FarmState;
 
@@ -49,6 +50,27 @@ fn load_or_create_keypair(path: &Path) -> Result<(SigningKey, bool)> {
             .context("Failed to write farm_identity.json")?;
         Ok((keypair, true))
     }
+}
+
+/// Resolve the path to the voxply-hub binary.
+/// Check for `VOXPLY_HUB_BIN` env var first; fall back to a sibling of the
+/// current executable named `voxply-hub` (or `voxply-hub.exe` on Windows).
+fn resolve_hub_bin() -> String {
+    if let Ok(v) = std::env::var("VOXPLY_HUB_BIN") {
+        return v;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let dir = exe.parent().unwrap_or(Path::new("."));
+        let candidate = dir.join(if cfg!(windows) {
+            "voxply-hub.exe"
+        } else {
+            "voxply-hub"
+        });
+        if candidate.exists() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    "voxply-hub".to_string()
 }
 
 #[tokio::main]
@@ -102,7 +124,13 @@ async fn main() -> Result<()> {
     .execute(&db)
     .await?;
 
-    let state = Arc::new(FarmState::new(db, keypair, farm_url));
+    // Construct the hub manager and re-spawn any existing hubs.
+    let hub_bin = resolve_hub_bin();
+    tracing::info!("Hub binary path: {hub_bin}");
+    let hub_manager = Arc::new(HubManager::new(hub_bin, farm_url.clone()));
+    hub_manager.spawn_all_from_db(&db).await?;
+
+    let state = Arc::new(FarmState::new(db, keypair, farm_url, hub_manager));
 
     let app = server::create_router(state);
     let addr: std::net::SocketAddr = format!("0.0.0.0:{http_port}").parse()?;

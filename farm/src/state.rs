@@ -4,6 +4,8 @@ use ed25519_dalek::SigningKey;
 use sqlx::SqlitePool;
 use tokio::sync::RwLock;
 
+use crate::hub_manager::HubManager;
+
 /// Shared state for the farm process.
 pub struct FarmState {
     /// SQLite connection pool for farm.db.
@@ -15,19 +17,27 @@ pub struct FarmState {
     pub farm_url: String,
     /// Last time (unix secs) we tried to re-fetch the farm pubkey after a
     /// verification failure. Used for rate-limiting the retry logic.
-    /// Not needed in the farm process itself but mirrors the hub's field for
-    /// structural consistency; kept as a placeholder for Phase 2 key-rotation
-    /// notification logic.
     pub last_pubkey_refresh: RwLock<i64>,
+    /// Hub process lifecycle manager. Owns the map of running child processes.
+    pub hub_manager: Arc<HubManager>,
+    /// Shared HTTP client for outbound requests (proxying, health checks).
+    pub http_client: reqwest::Client,
 }
 
 impl FarmState {
-    pub fn new(db: SqlitePool, keypair: SigningKey, farm_url: String) -> Self {
+    pub fn new(
+        db: SqlitePool,
+        keypair: SigningKey,
+        farm_url: String,
+        hub_manager: Arc<HubManager>,
+    ) -> Self {
         Self {
             db,
             keypair: Arc::new(keypair),
             farm_url,
             last_pubkey_refresh: RwLock::new(0),
+            hub_manager,
+            http_client: reqwest::Client::new(),
         }
     }
 
