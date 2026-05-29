@@ -258,7 +258,12 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             post(routes::posts::lock_post).delete(routes::posts::unlock_post),
         )
         // ---- Gaming: game install (Tier 1 minimal) + Tier 2 sessions ----
-        .route("/admin/games", post(routes::games::install_game))
+        .route("/admin/games", post(routes::games::install_game).get(routes::games::admin_list_games))
+        .route("/admin/games/{id}/channels", put(routes::games::set_game_channels))
+        // Farm-aware enable/disable
+        .route("/games/{id}/enable", post(routes::games::enable_game).delete(routes::games::disable_game))
+        // Player-facing enabled games list
+        .route("/games", get(routes::games::list_enabled_games))
         .route(
             "/channels/{channel_id}/game-sessions",
             post(routes::games::create_session),

@@ -128,5 +128,40 @@ pub async fn run(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await;
 
+    // Gaming: farm-level game catalogue.
+    // One row per installed game; the farm admin installs, hubs enable/disable.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS games (
+            id               TEXT PRIMARY KEY,
+            name             TEXT NOT NULL,
+            entry_url        TEXT NOT NULL,
+            description      TEXT,
+            thumbnail_url    TEXT,
+            version          TEXT NOT NULL DEFAULT '1.0.0',
+            author           TEXT,
+            min_players      INTEGER NOT NULL DEFAULT 1,
+            max_players      INTEGER NOT NULL DEFAULT 1,
+            permission_grant TEXT NOT NULL DEFAULT '[]',
+            installed_by     TEXT,
+            installed_at     TEXT
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    // Gaming: per-user-per-game key/value store (personal-axis, follows the user).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS game_kv (
+            game_id     TEXT NOT NULL,
+            user_pubkey TEXT NOT NULL,
+            key         TEXT NOT NULL,
+            value       TEXT NOT NULL,
+            updated_at  TEXT NOT NULL,
+            PRIMARY KEY (game_id, user_pubkey, key)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
     Ok(())
 }

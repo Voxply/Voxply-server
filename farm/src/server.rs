@@ -43,6 +43,21 @@ pub fn create_router(state: Arc<FarmState>) -> Router {
         )
         // Phase 3 — public discovery probe (unauthenticated).
         .route("/farm/public-info", get(routes::admin::public_info))
+        // Gaming — farm-level game catalogue.
+        .route(
+            "/farm/games",
+            post(routes::games::install_game).get(routes::games::list_games),
+        )
+        .route(
+            "/farm/games/{id}",
+            get(routes::games::get_game)
+                .patch(routes::games::patch_game)
+                .delete(routes::games::uninstall_game),
+        )
+        .route(
+            "/farm/games/{id}/kv/{user_pubkey}/{key}",
+            get(routes::games::get_kv).put(routes::games::put_kv),
+        )
         // Proxy catch-all — must be last (fallback for all /hub/<id>/... requests).
         .route(
             "/hub/{hub_id}/{*path}",

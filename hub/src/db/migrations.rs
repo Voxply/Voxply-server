@@ -1498,6 +1498,34 @@ pub async fn run(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await?;
 
+    // ---- Task #17: Gaming — hub-side enable/disable of farm games ----
+
+    // One row per game enabled on this hub (hub admin with manage_games enables).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS enabled_games (
+            game_id     TEXT PRIMARY KEY,
+            enabled_at  TEXT NOT NULL,
+            enabled_by  TEXT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    // Optional per-channel scope: empty = enabled in all channels; any rows = only those channels.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS channel_games (
+            channel_id TEXT NOT NULL,
+            game_id    TEXT NOT NULL,
+            PRIMARY KEY (channel_id, game_id)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    // Add manage_games permission to the builtin-owner role so hub owners can enable games.
+    sqlx::query("INSERT OR IGNORE INTO role_permissions (role_id, permission) VALUES ('builtin-owner', 'manage_games')")
+        .execute(pool).await?;
+
     tracing::info!("Database migrations complete");
     Ok(())
 }

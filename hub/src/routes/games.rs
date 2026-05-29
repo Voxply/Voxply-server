@@ -579,3 +579,397 @@ fn chrono_now() -> String {
         .as_secs();
     secs.to_string()
 }
+
+// ===========================================================================
+// Farm-aware Tier 1 enable/disable routes
+// ===========================================================================
+//
+// When the hub is paired with a farm (`state.farm_url` is `Some`), hub admins
+// enable farm-installed games on this hub.  Enabling fetches the manifest from
+// the farm and caches the essential fields in `hub_games`, then writes a row
+// in `enabled_games`.  The Activities button and `GET /games` list only
+// enabled games.
+//
+// Routes:
+//   POST   /games/:id/enable                — hub admin, manage_games
+//   DELETE /games/:id/enable                — hub admin, manage_games
+//   GET    /games                           — member (player-facing; enabled + channel-scoped)
+//   PUT    /admin/games/:id/channels        — hub admin, manage_games
+//   GET    /admin/games                     — hub admin, manage_games (full inventory)
+
+// ---------------------------------------------------------------------------
+// Shared manifest shape returned by the farm's GET /farm/games/:id
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+struct FarmGameManifest {
+    id: String,
+    name: String,
+    entry_url: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    thumbnail_url: Option<String>,
+    #[serde(default = "default_version")]
+    version: String,
+    #[serde(default)]
+    author: Option<String>,
+    #[serde(default = "default_one")]
+    min_players: i64,
+    #[serde(default = "default_one")]
+    max_players: i64,
+}
+
+fn default_version() -> String {
+    "1.0.0".to_string()
+}
+
+fn default_one() -> i64 {
+    1
+}
+
+// ---------------------------------------------------------------------------
+// POST /games/:id/enable
+// ---------------------------------------------------------------------------
+
+pub async fn enable_game(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(game_id): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let perms = permissions::user_permissions(&state.db, &user.public_key).await?;
+    perms.require(permissions::MANAGE_GAMES)?;
+
+    // Fetch manifest from the farm and cache it into hub_games.
+    let manifest: FarmGameManifest = match &state.farm_url {
+        None => {
+            // Un-farmed hub: the game must already be in hub_games (installed locally).
+            let exists: Option<String> =
+                sqlx::query_scalar("SELECT id FROM hub_games WHERE id = ?")
+                    .bind(&game_id)
+                    .fetch_optional(&state.db)
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+            if exists.is_none() {
+                return Err((StatusCode::NOT_FOUND, "Game not installed on this hub".to_string()));
+            }
+            // Synthesise a manifest from the local row so we can skip the upsert below.
+            let row: (String, String, String, Option<String>, Option<String>, String, Option<String>, i64, i64) =
+                sqlx::query_as(
+                    "SELECT id, name, entry_url, description, thumbnail_url, version, author, min_players, max_players FROM hub_games WHERE id = ?",
+                )
+                .bind(&game_id)
+                .fetch_one(&state.db)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+            FarmGameManifest {
+                id: row.0,
+                name: row.1,
+                entry_url: row.2,
+                description: row.3,
+                thumbnail_url: row.4,
+                version: row.5,
+                author: row.6,
+                min_players: row.7,
+                max_players: row.8,
+            }
+        }
+        Some(farm_url) => {
+            let url = format!("{farm_url}/farm/games/{game_id}");
+            let resp = state
+                .http_client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Farm unreachable: {e}")))?;
+            if resp.status().as_u16() == 404 {
+                return Err((StatusCode::NOT_FOUND, "Game not found on farm".to_string()));
+            }
+            if !resp.status().is_success() {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    format!("Farm returned {}", resp.status()),
+                ));
+            }
+            resp.json::<FarmGameManifest>()
+                .await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Invalid farm response: {e}")))?
+        }
+    };
+
+    let now = chrono_now();
+
+    // Upsert into hub_games (cache from farm).
+    sqlx::query(
+        "INSERT INTO hub_games
+             (id, name, description, version, entry_url, thumbnail_url, author,
+              min_players, max_players, installed_by, installed_at, manifest_url)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '')
+         ON CONFLICT(id) DO UPDATE SET
+             name          = excluded.name,
+             description   = excluded.description,
+             version       = excluded.version,
+             entry_url     = excluded.entry_url,
+             thumbnail_url = excluded.thumbnail_url,
+             author        = excluded.author,
+             min_players   = excluded.min_players,
+             max_players   = excluded.max_players",
+    )
+    .bind(&manifest.id)
+    .bind(&manifest.name)
+    .bind(&manifest.description)
+    .bind(&manifest.version)
+    .bind(&manifest.entry_url)
+    .bind(&manifest.thumbnail_url)
+    .bind(&manifest.author)
+    .bind(manifest.min_players)
+    .bind(manifest.max_players)
+    .bind(&user.public_key)
+    .bind(&now)
+    .execute(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+
+    // Upsert enabled_games row.
+    sqlx::query(
+        "INSERT INTO enabled_games (game_id, enabled_at, enabled_by)
+         VALUES (?, ?, ?)
+         ON CONFLICT(game_id) DO UPDATE SET
+             enabled_at = excluded.enabled_at,
+             enabled_by = excluded.enabled_by",
+    )
+    .bind(&game_id)
+    .bind(&now)
+    .bind(&user.public_key)
+    .execute(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// DELETE /games/:id/enable
+// ---------------------------------------------------------------------------
+
+pub async fn disable_game(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(game_id): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let perms = permissions::user_permissions(&state.db, &user.public_key).await?;
+    perms.require(permissions::MANAGE_GAMES)?;
+
+    let rows = sqlx::query("DELETE FROM enabled_games WHERE game_id = ?")
+        .bind(&game_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?
+        .rows_affected();
+
+    if rows == 0 {
+        return Err((StatusCode::NOT_FOUND, "Game not enabled on this hub".to_string()));
+    }
+
+    // Remove per-channel scope entries for this game too.
+    let _ = sqlx::query("DELETE FROM channel_games WHERE game_id = ?")
+        .bind(&game_id)
+        .execute(&state.db)
+        .await;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// GET /games  (player-facing — enabled + channel-scoped)
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize)]
+pub struct EnabledGameEntry {
+    pub id: String,
+    pub name: String,
+    pub entry_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumbnail_url: Option<String>,
+    pub version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    pub min_players: i64,
+    pub max_players: i64,
+}
+
+#[derive(serde::Serialize)]
+pub struct ListEnabledGamesResponse {
+    pub games: Vec<EnabledGameEntry>,
+}
+
+pub async fn list_enabled_games(
+    State(state): State<Arc<AppState>>,
+    _user: AuthUser,
+) -> Result<Json<ListEnabledGamesResponse>, (StatusCode, String)> {
+    // Return all hub-enabled games. Channel-scoped filtering is done client-side
+    // (the client knows which channel is open and can call with a channel_id param
+    // in the future; for now we return the full enabled list and let the client
+    // apply the channel restriction using the /admin/games/:id/channels data).
+    let rows: Vec<(String, String, String, Option<String>, Option<String>, String, Option<String>, i64, i64)> = sqlx::query_as(
+        "SELECT g.id, g.name, g.entry_url, g.description, g.thumbnail_url, g.version, g.author,
+                g.min_players, g.max_players
+         FROM hub_games g
+         INNER JOIN enabled_games e ON e.game_id = g.id
+         ORDER BY g.name",
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+
+    let games = rows
+        .into_iter()
+        .map(|(id, name, entry_url, description, thumbnail_url, version, author, min_players, max_players)| {
+            EnabledGameEntry {
+                id,
+                name,
+                entry_url,
+                description,
+                thumbnail_url,
+                version,
+                author,
+                min_players,
+                max_players,
+            }
+        })
+        .collect();
+
+    Ok(Json(ListEnabledGamesResponse { games }))
+}
+
+// ---------------------------------------------------------------------------
+// PUT /admin/games/:id/channels   body: { channel_ids: [String] }
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+pub struct SetChannelScopeRequest {
+    pub channel_ids: Vec<String>,
+}
+
+pub async fn set_game_channels(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(game_id): Path<String>,
+    Json(req): Json<SetChannelScopeRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let perms = permissions::user_permissions(&state.db, &user.public_key).await?;
+    perms.require(permissions::MANAGE_GAMES)?;
+
+    // Game must be enabled on this hub.
+    let enabled: Option<String> =
+        sqlx::query_scalar("SELECT game_id FROM enabled_games WHERE game_id = ?")
+            .bind(&game_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+    if enabled.is_none() {
+        return Err((StatusCode::NOT_FOUND, "Game not enabled on this hub".to_string()));
+    }
+
+    // Replace channel scope atomically: delete old rows, insert new ones.
+    sqlx::query("DELETE FROM channel_games WHERE game_id = ?")
+        .bind(&game_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+
+    for channel_id in &req.channel_ids {
+        sqlx::query(
+            "INSERT OR IGNORE INTO channel_games (channel_id, game_id) VALUES (?, ?)",
+        )
+        .bind(channel_id)
+        .bind(&game_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// GET /admin/games  (manage_games — full inventory with channel scope)
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize)]
+pub struct AdminGameEntry {
+    pub id: String,
+    pub name: String,
+    pub entry_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumbnail_url: Option<String>,
+    pub version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    pub min_players: i64,
+    pub max_players: i64,
+    pub enabled: bool,
+    pub enabled_by: Option<String>,
+    pub enabled_at: Option<String>,
+    /// Channel IDs this game is restricted to. Empty vec = all channels.
+    pub channel_scope: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct AdminListGamesResponse {
+    pub games: Vec<AdminGameEntry>,
+}
+
+pub async fn admin_list_games(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+) -> Result<Json<AdminListGamesResponse>, (StatusCode, String)> {
+    let perms = permissions::user_permissions(&state.db, &user.public_key).await?;
+    perms.require(permissions::MANAGE_GAMES)?;
+
+    let rows: Vec<(String, String, String, Option<String>, Option<String>, String, Option<String>, i64, i64, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT g.id, g.name, g.entry_url, g.description, g.thumbnail_url, g.version, g.author,
+                g.min_players, g.max_players,
+                e.enabled_by, e.enabled_at
+         FROM hub_games g
+         LEFT JOIN enabled_games e ON e.game_id = g.id
+         ORDER BY g.name",
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+
+    let mut games = Vec::with_capacity(rows.len());
+    for (id, name, entry_url, description, thumbnail_url, version, author, min_players, max_players, enabled_by, enabled_at) in rows {
+        let enabled = enabled_by.is_some();
+        let channel_scope: Vec<String> = sqlx::query_scalar(
+            "SELECT channel_id FROM channel_games WHERE game_id = ? ORDER BY channel_id",
+        )
+        .bind(&id)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+
+        games.push(AdminGameEntry {
+            id,
+            name,
+            entry_url,
+            description,
+            thumbnail_url,
+            version,
+            author,
+            min_players,
+            max_players,
+            enabled,
+            enabled_by,
+            enabled_at,
+            channel_scope,
+        });
+    }
+
+    Ok(Json(AdminListGamesResponse { games }))
+}
