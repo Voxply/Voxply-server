@@ -9,7 +9,9 @@ use voxply_hub::auth::models::{ChallengeResponse, VerifyResponse};
 use voxply_hub::db;
 use voxply_hub::federation::client::FederationClient;
 use voxply_hub::routes::chat_models::ChannelResponse;
-use voxply_hub::routes::moderation_models::{BanResponse, MuteResponse};
+use voxply_hub::routes::moderation_models::{
+    BanResponse, ChannelBanByPubkeyResponse, ChannelVoiceMuteResponse, RaiseHandResponse,
+};
 use voxply_hub::server;
 use voxply_hub::state::AppState;
 use voxply_identity::Identity;
@@ -511,5 +513,320 @@ async fn talk_power_blocks_low_priority_user() {
 
     // Owner can still join (priority is 999999)
     let frame = ws_voice_join_and_recv(&hub_url, &owner_token, &channel.id).await;
+    assert_eq!(frame["type"], "voice_joined");
+}
+
+// ---------------------------------------------------------------------------
+// Task #6 — Channel bans at /channels/:id/bans (pubkey field)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn channel_ban_v2_blocks_messages_and_list() {
+    let server = setup().await;
+
+    let owner = Identity::generate();
+    let owner_token = authenticate(&server, &owner).await;
+    let user2 = Identity::generate();
+    let token2 = authenticate(&server, &user2).await;
+
+    let resp = server
+        .post("/channels")
+        .authorization_bearer(&owner_token)
+        .json(&json!({ "name": "testchan" }))
+        .await;
+    let channel: ChannelResponse = resp.json();
+
+    // user2 can post before ban
+    server
+        .post(&format!("/channels/{}/messages", channel.id))
+        .authorization_bearer(&token2)
+        .json(&json!({ "content": "hello" }))
+        .await
+        .assert_status(axum::http::StatusCode::CREATED);
+
+    // Ban user2 via new route
+    let resp = server
+        .post(&format!("/channels/{}/bans", channel.id))
+        .authorization_bearer(&owner_token)
+        .json(&json!({ "pubkey": user2.public_key_hex() }))
+        .await;
+    resp.assert_status(axum::http::StatusCode::CREATED);
+    let ban: ChannelBanByPubkeyResponse = resp.json();
+    assert_eq!(ban.pubkey, user2.public_key_hex());
+    assert_eq!(ban.channel_id, channel.id);
+
+    // user2 can't post to that channel
+    server
+        .post(&format!("/channels/{}/messages", channel.id))
+        .authorization_bearer(&token2)
+        .json(&json!({ "content": "blocked" }))
+        .await
+        .assert_status(axum::http::StatusCode::FORBIDDEN);
+
+    // List bans
+    let resp = server
+        .get(&format!("/channels/{}/bans", channel.id))
+        .authorization_bearer(&owner_token)
+        .await;
+    resp.assert_status_ok();
+    let bans: Vec<ChannelBanByPubkeyResponse> = resp.json();
+    assert_eq!(bans.len(), 1);
+    assert_eq!(bans[0].pubkey, user2.public_key_hex());
+
+    // Unban
+    server
+        .delete(&format!("/channels/{}/bans/{}", channel.id, user2.public_key_hex()))
+        .authorization_bearer(&owner_token)
+        .await
+        .assert_status(axum::http::StatusCode::NO_CONTENT);
+
+    // user2 can post again
+    server
+        .post(&format!("/channels/{}/messages", channel.id))
+        .authorization_bearer(&token2)
+        .json(&json!({ "content": "back" }))
+        .await
+        .assert_status(axum::http::StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn channel_ban_v2_rejected_without_permission() {
+    let server = setup().await;
+
+    let owner = Identity::generate();
+    let owner_token = authenticate(&server, &owner).await;
+    let user2 = Identity::generate();
+    let token2 = authenticate(&server, &user2).await;
+
+    let resp = server
+        .post("/channels")
+        .authorization_bearer(&owner_token)
+        .json(&json!({ "name": "perm-test-chan" }))
+        .await;
+    let channel: ChannelResponse = resp.json();
+
+    // user2 (only @everyone) tries to ban owner via new route — should be 403
+    server
+        .post(&format!("/channels/{}/bans", channel.id))
+        .authorization_bearer(&token2)
+        .json(&json!({ "pubkey": owner.public_key_hex() }))
+        .await
+        .assert_status(axum::http::StatusCode::FORBIDDEN);
+}
+
+// ---------------------------------------------------------------------------
+// Task #7 — Per-channel voice mutes at /channels/:id/voice-mutes
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn channel_voice_mute_blocks_voice_join() {
+    let (hub_url, _state) = spawn_real_hub().await;
+    let client = reqwest::Client::new();
+
+    let owner = Identity::generate();
+    let owner_token = http_authenticate(&hub_url, &owner).await;
+
+    let victim = Identity::generate();
+    let victim_token = http_authenticate(&hub_url, &victim).await;
+
+    let channel: ChannelResponse = client
+        .post(format!("{hub_url}/channels"))
+        .bearer_auth(&owner_token)
+        .json(&json!({ "name": "voice-ch" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // Mute victim in this channel
+    let resp = client
+        .post(format!("{hub_url}/channels/{}/voice-mutes", channel.id))
+        .bearer_auth(&owner_token)
+        .json(&json!({ "pubkey": victim.public_key_hex() }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 201);
+    let mute: ChannelVoiceMuteResponse = resp.json().await.unwrap();
+    assert_eq!(mute.pubkey, victim.public_key_hex());
+
+    // Victim can't join voice in that channel
+    let frame = ws_voice_join_and_recv(&hub_url, &victim_token, &channel.id).await;
+    assert_eq!(frame["type"], "error");
+    assert_eq!(frame["context"], "voice_join");
+    assert!(frame["message"].as_str().unwrap().contains("muted"));
+
+    // List mutes
+    let mutes: Vec<ChannelVoiceMuteResponse> = client
+        .get(format!("{hub_url}/channels/{}/voice-mutes", channel.id))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(mutes.len(), 1);
+    assert_eq!(mutes[0].pubkey, victim.public_key_hex());
+
+    // Unmute
+    client
+        .delete(format!(
+            "{hub_url}/channels/{}/voice-mutes/{}",
+            channel.id,
+            victim.public_key_hex()
+        ))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap();
+
+    // Victim can join again
+    let frame = ws_voice_join_and_recv(&hub_url, &victim_token, &channel.id).await;
+    assert_eq!(frame["type"], "voice_joined");
+}
+
+// ---------------------------------------------------------------------------
+// Task #8 — Talk power: PATCH /channels/:id min_talk_power + raise-hand
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn patch_channel_sets_min_talk_power() {
+    let server = setup().await;
+
+    let owner = Identity::generate();
+    let owner_token = authenticate(&server, &owner).await;
+
+    let resp = server
+        .post("/channels")
+        .authorization_bearer(&owner_token)
+        .json(&json!({ "name": "vchan" }))
+        .await;
+    let channel: ChannelResponse = resp.json();
+
+    // PATCH to set min_talk_power
+    server
+        .patch(&format!("/channels/{}", channel.id))
+        .authorization_bearer(&owner_token)
+        .json(&json!({ "min_talk_power": 50 }))
+        .await
+        .assert_status_ok();
+
+    // Verify via direct DB check is not needed — the WS enforcement test proves it works
+}
+
+#[tokio::test]
+async fn raise_hand_and_lower_hand_flow() {
+    let server = setup().await;
+
+    let owner = Identity::generate();
+    let owner_token = authenticate(&server, &owner).await;
+    let user2 = Identity::generate();
+    let token2 = authenticate(&server, &user2).await;
+
+    let resp = server
+        .post("/channels")
+        .authorization_bearer(&owner_token)
+        .json(&json!({ "name": "handchan" }))
+        .await;
+    let channel: ChannelResponse = resp.json();
+
+    // user2 raises hand
+    let resp = server
+        .post(&format!("/channels/{}/raise-hand", channel.id))
+        .authorization_bearer(&token2)
+        .await;
+    resp.assert_status(axum::http::StatusCode::CREATED);
+    let rh: RaiseHandResponse = resp.json();
+    assert_eq!(rh.pubkey, user2.public_key_hex());
+    assert_eq!(rh.channel_id, channel.id);
+
+    // List raised hands (admin)
+    let resp = server
+        .get(&format!("/channels/{}/raise-hands", channel.id))
+        .authorization_bearer(&owner_token)
+        .await;
+    resp.assert_status_ok();
+    let hands: Vec<RaiseHandResponse> = resp.json();
+    assert_eq!(hands.len(), 1);
+    assert_eq!(hands[0].pubkey, user2.public_key_hex());
+
+    // Admin lowers hand
+    server
+        .delete(&format!(
+            "/channels/{}/raise-hand/{}",
+            channel.id,
+            user2.public_key_hex()
+        ))
+        .authorization_bearer(&owner_token)
+        .await
+        .assert_status(axum::http::StatusCode::NO_CONTENT);
+
+    // List should now be empty
+    let resp = server
+        .get(&format!("/channels/{}/raise-hands", channel.id))
+        .authorization_bearer(&owner_token)
+        .await;
+    let hands: Vec<RaiseHandResponse> = resp.json();
+    assert!(hands.is_empty());
+}
+
+#[tokio::test]
+async fn raise_hand_allows_voice_join_below_threshold() {
+    let (hub_url, state) = spawn_real_hub().await;
+    let client = reqwest::Client::new();
+
+    let owner = Identity::generate();
+    let owner_token = http_authenticate(&hub_url, &owner).await;
+    let user2 = Identity::generate();
+    let user2_token = http_authenticate(&hub_url, &user2).await;
+
+    let channel: ChannelResponse = client
+        .post(format!("{hub_url}/channels"))
+        .bearer_auth(&owner_token)
+        .json(&json!({ "name": "tp-hand-chan" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // Set min_talk_power on the channel via PATCH
+    client
+        .patch(format!("{hub_url}/channels/{}", channel.id))
+        .bearer_auth(&owner_token)
+        .json(&json!({ "min_talk_power": 100 }))
+        .send()
+        .await
+        .unwrap();
+
+    // Confirm min_talk_power was written to the channels table
+    let stored: i64 = sqlx::query_scalar(
+        "SELECT min_talk_power FROM channels WHERE id = ?",
+    )
+    .bind(&channel.id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(stored, 100);
+
+    // user2 (priority 0) is blocked without hand raised
+    let frame = ws_voice_join_and_recv(&hub_url, &user2_token, &channel.id).await;
+    assert_eq!(frame["type"], "error");
+    assert!(frame["message"].as_str().unwrap().contains("priority"));
+
+    // user2 raises hand
+    client
+        .post(format!("{hub_url}/channels/{}/raise-hand", channel.id))
+        .bearer_auth(&user2_token)
+        .send()
+        .await
+        .unwrap();
+
+    // user2 can now join voice
+    let frame = ws_voice_join_and_recv(&hub_url, &user2_token, &channel.id).await;
     assert_eq!(frame["type"], "voice_joined");
 }

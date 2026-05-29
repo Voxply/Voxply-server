@@ -4,6 +4,8 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 
+use uuid::Uuid;
+
 use crate::auth::middleware::AuthUser;
 use crate::permissions::{self, ADMIN, BAN_MEMBERS, KICK_MEMBERS, MUTE_MEMBERS, TIMEOUT_MEMBERS};
 use crate::routes::moderation_models::*;
@@ -534,6 +536,299 @@ struct VoiceMuteRow {
 }
 
 // --- Helpers for enforcement (used by other modules) ---
+
+// --- Channel-scoped bans (routes under /channels/:id/bans, pubkey field) ---
+
+pub async fn channel_ban_v2(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(channel_id): Path<String>,
+    Json(req): Json<ChannelBanByPubkeyRequest>,
+) -> Result<(StatusCode, Json<ChannelBanByPubkeyResponse>), (StatusCode, String)> {
+    require_can_moderate(&state, &user.public_key, &req.pubkey, BAN_MEMBERS).await?;
+
+    let now = crate::auth::handlers::unix_timestamp().to_string();
+
+    sqlx::query(
+        "INSERT OR REPLACE INTO channel_bans (channel_id, target_public_key, banned_by, reason, created_at) VALUES (?, ?, ?, NULL, ?)",
+    )
+    .bind(&channel_id)
+    .bind(&req.pubkey)
+    .bind(&user.public_key)
+    .bind(&now)
+    .execute(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(ChannelBanByPubkeyResponse {
+            channel_id,
+            pubkey: req.pubkey,
+            banned_by: user.public_key,
+            banned_at: now,
+        }),
+    ))
+}
+
+pub async fn channel_unban_v2(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path((channel_id, pubkey)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let perms = permissions::user_permissions(&state.db, &user.public_key).await?;
+    perms.require(BAN_MEMBERS)?;
+
+    sqlx::query("DELETE FROM channel_bans WHERE channel_id = ? AND target_public_key = ?")
+        .bind(&channel_id)
+        .bind(&pubkey)
+        .execute(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn list_channel_bans_v2(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(channel_id): Path<String>,
+) -> Result<Json<Vec<ChannelBanByPubkeyResponse>>, (StatusCode, String)> {
+    let perms = permissions::user_permissions(&state.db, &user.public_key).await?;
+    perms.require(BAN_MEMBERS)?;
+
+    let rows = sqlx::query_as::<_, ChannelBanRow>(
+        "SELECT channel_id, target_public_key, banned_by, reason, created_at
+         FROM channel_bans WHERE channel_id = ? ORDER BY created_at DESC",
+    )
+    .bind(&channel_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+
+    Ok(Json(
+        rows.into_iter()
+            .map(|r| ChannelBanByPubkeyResponse {
+                channel_id: r.channel_id,
+                pubkey: r.target_public_key,
+                banned_by: r.banned_by,
+                banned_at: r.created_at.to_string(),
+            })
+            .collect(),
+    ))
+}
+
+// --- Per-channel voice mutes ---
+
+pub async fn channel_voice_mute(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(channel_id): Path<String>,
+    Json(req): Json<ChannelVoiceMuteRequest>,
+) -> Result<(StatusCode, Json<ChannelVoiceMuteResponse>), (StatusCode, String)> {
+    require_can_moderate(&state, &user.public_key, &req.pubkey, MUTE_MEMBERS).await?;
+
+    let now = crate::auth::handlers::unix_timestamp().to_string();
+
+    sqlx::query(
+        "INSERT OR REPLACE INTO channel_voice_mutes (channel_id, pubkey, muted_by, muted_at) VALUES (?, ?, ?, ?)",
+    )
+    .bind(&channel_id)
+    .bind(&req.pubkey)
+    .bind(&user.public_key)
+    .bind(&now)
+    .execute(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(ChannelVoiceMuteResponse {
+            channel_id,
+            pubkey: req.pubkey,
+            muted_by: user.public_key,
+            muted_at: now,
+        }),
+    ))
+}
+
+pub async fn channel_voice_unmute(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path((channel_id, pubkey)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let perms = permissions::user_permissions(&state.db, &user.public_key).await?;
+    perms.require(MUTE_MEMBERS)?;
+
+    sqlx::query(
+        "DELETE FROM channel_voice_mutes WHERE channel_id = ? AND pubkey = ?",
+    )
+    .bind(&channel_id)
+    .bind(&pubkey)
+    .execute(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn list_channel_voice_mutes(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(channel_id): Path<String>,
+) -> Result<Json<Vec<ChannelVoiceMuteResponse>>, (StatusCode, String)> {
+    let perms = permissions::user_permissions(&state.db, &user.public_key).await?;
+    perms.require(MUTE_MEMBERS)?;
+
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        channel_id: String,
+        pubkey: String,
+        muted_by: String,
+        muted_at: String,
+    }
+
+    let rows = sqlx::query_as::<_, Row>(
+        "SELECT channel_id, pubkey, muted_by, muted_at FROM channel_voice_mutes WHERE channel_id = ? ORDER BY muted_at DESC",
+    )
+    .bind(&channel_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+
+    Ok(Json(
+        rows.into_iter()
+            .map(|r| ChannelVoiceMuteResponse {
+                channel_id: r.channel_id,
+                pubkey: r.pubkey,
+                muted_by: r.muted_by,
+                muted_at: r.muted_at,
+            })
+            .collect(),
+    ))
+}
+
+// --- Raise-hand ---
+
+pub async fn raise_hand(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(channel_id): Path<String>,
+) -> Result<(StatusCode, Json<RaiseHandResponse>), (StatusCode, String)> {
+    let id = Uuid::new_v4().to_string();
+    let now = crate::auth::handlers::unix_timestamp().to_string();
+
+    sqlx::query(
+        "INSERT OR REPLACE INTO raise_hand_requests (id, channel_id, pubkey, requested_at) VALUES (?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(&channel_id)
+    .bind(&user.public_key)
+    .bind(&now)
+    .execute(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(RaiseHandResponse {
+            id,
+            channel_id,
+            pubkey: user.public_key,
+            requested_at: now,
+        }),
+    ))
+}
+
+pub async fn lower_hand(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path((channel_id, pubkey)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    // User can lower their own hand; admin can lower anyone's
+    if pubkey != user.public_key {
+        let perms = permissions::user_permissions(&state.db, &user.public_key).await?;
+        perms.require(MUTE_MEMBERS)?;
+    }
+
+    sqlx::query(
+        "DELETE FROM raise_hand_requests WHERE channel_id = ? AND pubkey = ?",
+    )
+    .bind(&channel_id)
+    .bind(&pubkey)
+    .execute(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn list_raise_hands(
+    State(state): State<Arc<AppState>>,
+    _user: AuthUser,
+    Path(channel_id): Path<String>,
+) -> Result<Json<Vec<RaiseHandResponse>>, (StatusCode, String)> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        id: String,
+        channel_id: String,
+        pubkey: String,
+        requested_at: String,
+    }
+
+    let rows = sqlx::query_as::<_, Row>(
+        "SELECT id, channel_id, pubkey, requested_at FROM raise_hand_requests WHERE channel_id = ? ORDER BY requested_at ASC",
+    )
+    .bind(&channel_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+
+    Ok(Json(
+        rows.into_iter()
+            .map(|r| RaiseHandResponse {
+                id: r.id,
+                channel_id: r.channel_id,
+                pubkey: r.pubkey,
+                requested_at: r.requested_at,
+            })
+            .collect(),
+    ))
+}
+
+// --- Enforcement helpers ---
+
+pub async fn is_channel_voice_muted(
+    db: &sqlx::SqlitePool,
+    channel_id: &str,
+    pubkey: &str,
+) -> Result<bool, (StatusCode, String)> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM channel_voice_mutes WHERE channel_id = ? AND pubkey = ?",
+    )
+    .bind(channel_id)
+    .bind(pubkey)
+    .fetch_one(db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+    Ok(count > 0)
+}
+
+pub async fn has_raised_hand(
+    db: &sqlx::SqlitePool,
+    channel_id: &str,
+    pubkey: &str,
+) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM raise_hand_requests WHERE channel_id = ? AND pubkey = ?",
+    )
+    .bind(channel_id)
+    .bind(pubkey)
+    .fetch_one(db)
+    .await
+    .unwrap_or(0)
+        > 0
+}
 
 pub async fn is_banned(db: &sqlx::SqlitePool, public_key: &str) -> Result<bool, (StatusCode, String)> {
     let count: i64 = sqlx::query_scalar(

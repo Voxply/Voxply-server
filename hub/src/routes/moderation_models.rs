@@ -80,3 +80,43 @@ pub struct TalkPowerResponse {
     pub channel_id: String,
     pub min_talk_power: i64,
 }
+
+// --- Channel-scoped ban (pubkey field, routes under /channels/:id/bans) ---
+
+#[derive(Deserialize)]
+pub struct ChannelBanByPubkeyRequest {
+    pub pubkey: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ChannelBanByPubkeyResponse {
+    pub channel_id: String,
+    pub pubkey: String,
+    pub banned_by: String,
+    pub banned_at: String,
+}
+
+// --- Per-channel voice mute ---
+
+#[derive(Deserialize)]
+pub struct ChannelVoiceMuteRequest {
+    pub pubkey: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ChannelVoiceMuteResponse {
+    pub channel_id: String,
+    pub pubkey: String,
+    pub muted_by: String,
+    pub muted_at: String,
+}
+
+// --- Raise-hand ---
+
+#[derive(Serialize, Deserialize)]
+pub struct RaiseHandResponse {
+    pub id: String,
+    pub channel_id: String,
+    pub pubkey: String,
+    pub requested_at: String,
+}

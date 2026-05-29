@@ -248,12 +248,16 @@ pub async fn update_channel(
 
     let changing_structure = req.name.is_some() || req.description.is_some() || req.parent_id.is_some();
     let changing_appearance = req.icon.is_some() || req.color.is_some() || req.custom_icon_svg.is_some();
+    let changing_talk_power = req.min_talk_power.is_some();
 
     if changing_structure {
         perms.require(permissions::MANAGE_CHANNELS)?;
     }
     if changing_appearance {
         perms.require(permissions::MANAGE_CHANNEL_ICONS)?;
+    }
+    if changing_talk_power {
+        perms.require(permissions::ADMIN)?;
     }
 
     if let Some(parent_option) = &req.parent_id {
@@ -317,7 +321,8 @@ pub async fn update_channel(
         || req.icon.is_some()
         || req.color.is_some()
         || req.custom_icon_svg.is_some()
-        || req.parent_id.is_some();
+        || req.parent_id.is_some()
+        || req.min_talk_power.is_some();
 
     if needs_update {
         let mut qb = sqlx::QueryBuilder::new("UPDATE channels SET ");
@@ -341,6 +346,10 @@ pub async fn update_channel(
         if let Some(parent_option) = &req.parent_id {
             sep.push("parent_id = ");
             sep.push_bind_unseparated(parent_option.as_deref());
+        }
+        if let Some(mtp) = req.min_talk_power {
+            sep.push("min_talk_power = ");
+            sep.push_bind_unseparated(mtp);
         }
         qb.push(" WHERE id = ");
         qb.push_bind(&channel_id);

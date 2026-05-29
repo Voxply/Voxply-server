@@ -1058,6 +1058,48 @@ pub async fn run(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await?;
 
+    // ---- Feature: Moderation enhancements ----
+
+    // min_talk_power on channels (0 = anyone can talk in voice)
+    let _ = sqlx::query(
+        "ALTER TABLE channels ADD COLUMN min_talk_power INTEGER NOT NULL DEFAULT 0",
+    )
+    .execute(pool)
+    .await;
+
+    // talk_power on roles (0 = no elevated talk power)
+    let _ = sqlx::query(
+        "ALTER TABLE roles ADD COLUMN talk_power INTEGER NOT NULL DEFAULT 0",
+    )
+    .execute(pool)
+    .await;
+
+    // Per-channel voice mutes (channel_id + pubkey PK, distinct from hub-wide voice_mutes)
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS channel_voice_mutes (
+            channel_id TEXT NOT NULL,
+            pubkey     TEXT NOT NULL,
+            muted_by   TEXT NOT NULL,
+            muted_at   TEXT NOT NULL,
+            PRIMARY KEY (channel_id, pubkey)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    // Raise-hand requests for users below the min_talk_power threshold
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS raise_hand_requests (
+            id           TEXT PRIMARY KEY,
+            channel_id   TEXT NOT NULL,
+            pubkey       TEXT NOT NULL,
+            requested_at TEXT NOT NULL,
+            UNIQUE (channel_id, pubkey)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
     // ---- Feature: Forum channel type ----
     // channel_type discriminant: 'text' (default) or 'forum'.
     let _ = sqlx::query(

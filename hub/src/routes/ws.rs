@@ -270,12 +270,13 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, public_key: Stri
                                 subscribed.remove(&channel_id);
                             }
                             Ok(WsClientMessage::VoiceJoin { channel_id, udp_port }) => {
-                                let is_muted = crate::routes::moderation::is_voice_muted(
+                                // Hub-wide voice mute check (existing behaviour).
+                                let is_hub_muted = crate::routes::moderation::is_voice_muted(
                                     &state.db, &public_key,
                                 )
                                 .await
                                 .unwrap_or(false);
-                                if is_muted {
+                                if is_hub_muted {
                                     let err = WsServerMessage::Error {
                                         context: "voice_join".to_string(),
                                         message: "You are voice-muted on this hub.".to_string(),
@@ -286,31 +287,90 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, public_key: Stri
                                     continue;
                                 }
 
+                                // Per-channel voice mute check.
+                                let is_ch_muted = crate::routes::moderation::is_channel_voice_muted(
+                                    &state.db, &channel_id, &public_key,
+                                )
+                                .await
+                                .unwrap_or(false);
+                                if is_ch_muted {
+                                    let err = WsServerMessage::Error {
+                                        context: "voice_join".to_string(),
+                                        message: "You are voice-muted in this channel.".to_string(),
+                                    };
+                                    let _ = ws_tx
+                                        .send(Message::Text(serde_json::to_string(&err).unwrap().into()))
+                                        .await;
+                                    continue;
+                                }
+
+                                // Talk-power check: read min_talk_power from channels row (new
+                                // column) and fall back to channel_settings for older rows.
                                 let min_talk_power: i64 = sqlx::query_scalar(
-                                    "SELECT min_talk_power FROM channel_settings WHERE channel_id = ?",
+                                    "SELECT COALESCE(min_talk_power, 0) FROM channels WHERE id = ?",
                                 )
                                 .bind(&channel_id)
                                 .fetch_optional(&state.db)
                                 .await
                                 .ok()
                                 .flatten()
-                                .unwrap_or(0);
+                                .unwrap_or_else(|| {
+                                    // fall back to legacy channel_settings table
+                                    0i64
+                                });
+                                // Also check legacy channel_settings table if channels row gives 0.
+                                let min_talk_power = if min_talk_power == 0 {
+                                    sqlx::query_scalar::<_, i64>(
+                                        "SELECT min_talk_power FROM channel_settings WHERE channel_id = ?",
+                                    )
+                                    .bind(&channel_id)
+                                    .fetch_optional(&state.db)
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or(0)
+                                } else {
+                                    min_talk_power
+                                };
 
                                 if min_talk_power > 0 {
-                                    let perms = crate::permissions::user_permissions(
+                                    // Get the user's maximum talk_power from their assigned roles.
+                                    let user_talk_power: i64 = sqlx::query_scalar(
+                                        "SELECT COALESCE(MAX(r.talk_power), 0)
+                                         FROM roles r
+                                         INNER JOIN user_roles ur ON r.id = ur.role_id
+                                         WHERE ur.user_public_key = ?",
+                                    )
+                                    .bind(&public_key)
+                                    .fetch_optional(&state.db)
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or(0);
+
+                                    // Also use max_priority as a legacy fallback (owner has 999999).
+                                    let user_priority = crate::permissions::user_permissions(
                                         &state.db, &public_key,
                                     )
-                                    .await;
-                                    let user_priority = perms
-                                        .as_ref()
-                                        .map(|p| p.max_priority)
-                                        .unwrap_or(0);
-                                    if user_priority < min_talk_power {
+                                    .await
+                                    .as_ref()
+                                    .map(|p| p.max_priority)
+                                    .unwrap_or(0);
+
+                                    let effective_power = user_talk_power.max(user_priority);
+
+                                    // User passes if their effective power meets the threshold
+                                    // OR if they have an active raise-hand request.
+                                    let hand_raised = crate::routes::moderation::has_raised_hand(
+                                        &state.db, &channel_id, &public_key,
+                                    ).await;
+
+                                    if effective_power < min_talk_power && !hand_raised {
                                         let err = WsServerMessage::Error {
                                             context: "voice_join".to_string(),
                                             message: format!(
-                                                "This channel requires role priority {} to talk; you have {}.",
-                                                min_talk_power, user_priority
+                                                "This channel requires talk priority {}; you have {}. Raise your hand to request access.",
+                                                min_talk_power, effective_power
                                             ),
                                         };
                                         let _ = ws_tx

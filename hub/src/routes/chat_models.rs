@@ -47,6 +47,10 @@ pub struct UpdateChannelRequest {
     pub color: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_some")]
     pub custom_icon_svg: Option<Option<String>>,
+    /// Minimum role talk_power needed to transmit audio in this channel.
+    /// 0 = no restriction. When set, requires ADMIN permission.
+    #[serde(default)]
+    pub min_talk_power: Option<i64>,
 }
 
 /// Lets us distinguish "field missing" from "field explicitly null" in JSON.
