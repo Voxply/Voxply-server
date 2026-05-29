@@ -1,0 +1,16 @@
+# Normalise line endings to LF on commit, checkout as-is on Windows.
+* text=auto
+
+# Rust source must always be UTF-8 — never let Git re-encode it.
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.sql text eol=lf
+
+# Binaries — no line-ending conversion.
+*.png binary
+*.jpg binary
+*.ico binary
