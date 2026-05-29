@@ -49,42 +49,59 @@ fn tls_config_from_env() -> Option<TlsConfig> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Optional Sentry error reporting. Initialise before the tracing subscriber
-    // so the sentry layer can forward ERROR-level events as breadcrumbs/errors.
-    // No-op when the env var is unset or empty.
-    let _sentry_guard = std::env::var("VOXPLY_SENTRY_DSN")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(|dsn| {
-            sentry::init((
-                dsn.as_str(),
-                sentry::ClientOptions {
-                    release: sentry::release_name!(),
-                    ..Default::default()
-                },
-            ))
-        });
-
     let json_logs = std::env::var("VOXPLY_LOG_FORMAT")
         .map(|v| v.to_lowercase() == "json")
         .unwrap_or(false);
 
+    // Optional OpenTelemetry OTLP trace export.
+    // Set VOXPLY_OTLP_ENDPOINT to any OTLP-compatible collector
+    // (Grafana Tempo, Jaeger, Honeycomb, Datadog, etc.).
+    // No-op when the variable is unset or empty.
+    let otlp_provider = std::env::var("VOXPLY_OTLP_ENDPOINT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .and_then(|endpoint| {
+            use opentelemetry_otlp::WithExportConfig;
+            let exporter = opentelemetry_otlp::SpanExporter::builder()
+                .with_http()
+                .with_endpoint(&endpoint)
+                .build()
+                .ok()?;
+            let provider = opentelemetry_sdk::trace::TracerProvider::builder()
+                .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+                .with_resource(opentelemetry_sdk::Resource::new(vec![
+                    opentelemetry::KeyValue::new(
+                        "service.name",
+                        env!("CARGO_PKG_NAME"),
+                    ),
+                ]))
+                .build();
+            opentelemetry::global::set_tracer_provider(provider.clone());
+            Some(provider)
+        });
+
     use tracing_subscriber::prelude::*;
-    let sentry_layer = sentry::integrations::tracing::layer();
+    let otel_layer = otlp_provider.as_ref().map(|provider| {
+        use opentelemetry::trace::TracerProvider as _;
+        tracing_opentelemetry::layer().with_tracer(
+            provider.tracer(env!("CARGO_PKG_NAME"))
+        )
+    });
+
     if json_logs {
         tracing_subscriber::registry()
-            .with(sentry_layer)
+            .with(otel_layer)
             .with(tracing_subscriber::fmt::layer().json())
             .init();
     } else {
         tracing_subscriber::registry()
-            .with(sentry_layer)
+            .with(otel_layer)
             .with(tracing_subscriber::fmt::layer())
             .init();
     }
 
-    if _sentry_guard.is_some() {
-        tracing::info!("Sentry error reporting enabled (DSN configured)");
+    if otlp_provider.is_some() {
+        tracing::info!("OpenTelemetry OTLP trace export enabled");
     }
 
     // Subcommand dispatch. `voxply-hub migrate` runs migrations and exits
@@ -262,6 +279,10 @@ async fn main() -> Result<()> {
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
         .await?;
+    }
+
+    if let Some(provider) = otlp_provider {
+        let _ = provider.shutdown();
     }
 
     Ok(())

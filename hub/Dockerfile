@@ -43,6 +43,6 @@ ENV VOXPLY_VOICE_UDP_PORT=3001
 # ENV VOXPLY_TLS_KEY=/certs/privkey.pem
 # ENV VOXPLY_FARM_URL=http://farm:4000
 # ENV VOXPLY_LOG_FORMAT=json
-# ENV VOXPLY_SENTRY_DSN=
+# ENV VOXPLY_OTLP_ENDPOINT=http://otel-collector:4318
 
 ENTRYPOINT ["/usr/local/bin/voxply-hub"]

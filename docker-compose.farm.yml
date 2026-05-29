@@ -21,7 +21,7 @@ services:
       # Must match the URL clients and hubs use to reach the farm externally:
       VOXPLY_FARM_URL: "${VOXPLY_FARM_URL:-http://localhost:4000}"
       # VOXPLY_LOG_FORMAT: json
-      # VOXPLY_SENTRY_DSN: https://...@sentry.io/...
+      # VOXPLY_OTLP_ENDPOINT: http://otel-collector:4318
     restart: unless-stopped
 
   hub:
@@ -43,7 +43,7 @@ services:
       # VOXPLY_TLS_CERT: /certs/fullchain.pem
       # VOXPLY_TLS_KEY: /certs/privkey.pem
       # VOXPLY_LOG_FORMAT: json
-      # VOXPLY_SENTRY_DSN: https://...@sentry.io/...
+      # VOXPLY_OTLP_ENDPOINT: http://otel-collector:4318
     depends_on:
       - farm
     restart: unless-stopped

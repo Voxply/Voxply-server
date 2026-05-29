@@ -28,8 +28,8 @@ services:
       # VOXPLY_TLS_KEY: /certs/privkey.pem
       # Uncomment for structured JSON logs:
       # VOXPLY_LOG_FORMAT: json
-      # Uncomment for Sentry error reporting:
-      # VOXPLY_SENTRY_DSN: https://...@sentry.io/...
+      # Uncomment to export traces via OTLP (Grafana Tempo, Jaeger, Honeycomb, etc.):
+      # VOXPLY_OTLP_ENDPOINT: http://otel-collector:4318
     restart: unless-stopped
 
 volumes:

@@ -39,6 +39,6 @@ ENV VOXPLY_FARM_HTTP_PORT=4000
 # Path to the hub binary for auto-spawning hubs (Phase 3).
 # ENV VOXPLY_HUB_BIN=/usr/local/bin/voxply-hub
 # ENV VOXPLY_LOG_FORMAT=json
-# ENV VOXPLY_SENTRY_DSN=
+# ENV VOXPLY_OTLP_ENDPOINT=http://otel-collector:4318
 
 ENTRYPOINT ["/usr/local/bin/voxply-farm"]
