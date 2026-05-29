@@ -133,34 +133,35 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, public_key: Stri
     // Push in-progress screen shares to this client.
     {
         let shares = state.screen_shares.read().await;
-        for channel_id in &subscribed {
-            if let Some(active) = shares.get(channel_id) {
-                for (stream_id, meta) in &active.streams {
-                    if meta.started_at >= chat_rx_since {
-                        continue;
-                    }
-                    let started = WsServerMessage::ScreenShareStarted {
-                        channel_id: channel_id.clone(),
+        for ((ch_id, _sharer), active) in shares.iter() {
+            if !subscribed.contains(ch_id) {
+                continue;
+            }
+            for (stream_id, meta) in &active.streams {
+                if meta.started_at >= chat_rx_since {
+                    continue;
+                }
+                let started = WsServerMessage::ScreenShareStarted {
+                    channel_id: ch_id.clone(),
+                    stream_id: stream_id.clone(),
+                    sharer_pubkey: meta.sharer_pubkey.clone(),
+                    kind: meta.kind.clone(),
+                    mime: meta.mime.clone(),
+                    has_audio: meta.has_audio,
+                };
+                let json = serde_json::to_string(&started).unwrap();
+                let _ = ws_tx.send(Message::Text(json.into())).await;
+                if let Some(init_bytes) = &meta.init_chunk {
+                    let chunk_envelope = WsServerMessage::ScreenShareChunkOut {
+                        channel_id: ch_id.clone(),
                         stream_id: stream_id.clone(),
                         sharer_pubkey: meta.sharer_pubkey.clone(),
-                        kind: meta.kind.clone(),
-                        mime: meta.mime.clone(),
-                        has_audio: meta.has_audio,
+                        seq: 0,
+                        is_init: true,
                     };
-                    let json = serde_json::to_string(&started).unwrap();
+                    let json = serde_json::to_string(&chunk_envelope).unwrap();
                     let _ = ws_tx.send(Message::Text(json.into())).await;
-                    if let Some(init_bytes) = &meta.init_chunk {
-                        let chunk_envelope = WsServerMessage::ScreenShareChunkOut {
-                            channel_id: channel_id.clone(),
-                            stream_id: stream_id.clone(),
-                            sharer_pubkey: meta.sharer_pubkey.clone(),
-                            seq: 0,
-                            is_init: true,
-                        };
-                        let json = serde_json::to_string(&chunk_envelope).unwrap();
-                        let _ = ws_tx.send(Message::Text(json.into())).await;
-                        let _ = ws_tx.send(Message::Binary(init_bytes.to_vec().into())).await;
-                    }
+                    let _ = ws_tx.send(Message::Binary(init_bytes.to_vec().into())).await;
                 }
             }
         }
@@ -190,6 +191,15 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, public_key: Stri
                                     if vtp != &public_key {
                                         continue;
                                     }
+                                }
+                            }
+                            // v2 signaling envelopes are targeted: only deliver to to_pubkey.
+                            if let crate::routes::chat_models::ChatEvent::ScreenShareSignal {
+                                to_pubkey, ..
+                            } = &event
+                            {
+                                if to_pubkey != &public_key {
+                                    continue;
                                 }
                             }
                             let json = pre_json.to_string();
@@ -229,7 +239,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, public_key: Stri
                                 let newly_subscribed = subscribed.insert(channel_id.clone());
                                 if !newly_subscribed { continue; }
                                 let shares = state.screen_shares.read().await;
-                                if let Some(active) = shares.get(&channel_id) {
+                                for ((ch_id, _sharer), active) in shares.iter() {
+                                    if ch_id != &channel_id {
+                                        continue;
+                                    }
                                     for (stream_id, meta) in &active.streams {
                                         let started = WsServerMessage::ScreenShareStarted {
                                             channel_id: channel_id.clone(),
@@ -516,29 +529,32 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, public_key: Stri
                                 });
                             }
 
-                            Ok(WsClientMessage::ScreenShareStart { channel_id, stream_id, kind, mime, has_audio }) => {
+                            Ok(WsClientMessage::ScreenShareStart { channel_id, stream_id, kind, mime, has_audio, .. }) => {
+                                // Enforce max 1 sharer per channel (default; flip config to allow more).
                                 {
                                     let shares = state.screen_shares.read().await;
-                                    if let Some(active) = shares.get(&channel_id) {
-                                        let other_sharer = active.streams.values()
-                                            .any(|m| m.sharer_pubkey != public_key);
-                                        if other_sharer {
-                                            let err = WsServerMessage::Error {
-                                                context: "screen_share".to_string(),
-                                                message: "Someone else is already sharing in this channel.".to_string(),
-                                            };
-                                            let _ = ws_tx
-                                                .send(Message::Text(serde_json::to_string(&err).unwrap().into()))
-                                                .await;
-                                            continue;
-                                        }
+                                    let other_sharer = shares.iter().any(|((ch, sharer), _)| {
+                                        ch == &channel_id && sharer != &public_key
+                                    });
+                                    if other_sharer {
+                                        let err = WsServerMessage::Error {
+                                            context: "screen_share".to_string(),
+                                            message: "Someone else is already sharing in this channel.".to_string(),
+                                        };
+                                        let _ = ws_tx
+                                            .send(Message::Text(serde_json::to_string(&err).unwrap().into()))
+                                            .await;
+                                        continue;
                                     }
                                 }
                                 {
                                     let mut shares = state.screen_shares.write().await;
-                                    let active = shares.entry(channel_id.clone()).or_insert_with(|| ActiveShare {
-                                        streams: std::collections::HashMap::new(),
-                                    });
+                                    let active = shares
+                                        .entry((channel_id.clone(), public_key.clone()))
+                                        .or_insert_with(|| ActiveShare {
+                                            streams: std::collections::HashMap::new(),
+                                            viewers: std::collections::HashSet::new(),
+                                        });
                                     active.streams.insert(stream_id.clone(), crate::state::ScreenStreamMeta {
                                         kind: kind.clone(),
                                         mime: mime.clone(),
@@ -579,10 +595,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, public_key: Stri
                             Ok(WsClientMessage::ScreenShareStop { channel_id, stream_id }) => {
                                 {
                                     let mut shares = state.screen_shares.write().await;
-                                    if let Some(active) = shares.get_mut(&channel_id) {
+                                    let key = (channel_id.clone(), public_key.clone());
+                                    if let Some(active) = shares.get_mut(&key) {
                                         active.streams.remove(&stream_id);
                                         if active.streams.is_empty() {
-                                            shares.remove(&channel_id);
+                                            shares.remove(&key);
                                         }
                                     }
                                 }
@@ -602,6 +619,145 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, public_key: Stri
                                     );
                                     let _ = state.chat_tx.send((ev, json));
                                 }
+                            }
+
+                            // ---- Screen share v2: WebRTC signaling ----
+
+                            Ok(WsClientMessage::ScreenShareViewerJoin { channel_id, stream_id }) => {
+                                // Validate: stream exists.
+                                let share_exists = {
+                                    let shares = state.screen_shares.read().await;
+                                    shares.iter().any(|((ch, _), active)| {
+                                        ch == &channel_id && active.streams.contains_key(&stream_id)
+                                    })
+                                };
+                                if !share_exists {
+                                    let err = WsServerMessage::Error {
+                                        context: "screen_share_viewer_join".to_string(),
+                                        message: "No active share with that stream_id in this channel.".to_string(),
+                                    };
+                                    let _ = ws_tx
+                                        .send(Message::Text(serde_json::to_string(&err).unwrap().into()))
+                                        .await;
+                                    continue;
+                                }
+                                // Record viewer and find sharer.
+                                let sharer_pubkey: Option<String> = {
+                                    let mut shares = state.screen_shares.write().await;
+                                    shares.iter_mut()
+                                        .find(|((ch, _), active)| {
+                                            ch == &channel_id && active.streams.contains_key(&stream_id)
+                                        })
+                                        .map(|((_, sharer), active)| {
+                                            active.viewers.insert(public_key.clone());
+                                            sharer.clone()
+                                        })
+                                };
+                                if let Some(sharer) = sharer_pubkey {
+                                    let msg = WsServerMessage::ScreenShareViewerJoined {
+                                        channel_id: channel_id.clone(),
+                                        stream_id: stream_id.clone(),
+                                        from_pubkey: public_key.clone(),
+                                    };
+                                    send_v2_signal(&state, channel_id, sharer, msg);
+                                }
+                            }
+
+                            Ok(WsClientMessage::ScreenShareViewerLeave { channel_id, stream_id }) => {
+                                let sharer_pubkey: Option<String> = {
+                                    let mut shares = state.screen_shares.write().await;
+                                    shares.iter_mut()
+                                        .find(|((ch, _), active)| {
+                                            ch == &channel_id && active.streams.contains_key(&stream_id)
+                                        })
+                                        .map(|((_, sharer), active)| {
+                                            active.viewers.remove(&public_key);
+                                            sharer.clone()
+                                        })
+                                };
+                                if let Some(sharer) = sharer_pubkey {
+                                    send_v2_signal(
+                                        &state,
+                                        channel_id.clone(),
+                                        sharer,
+                                        WsServerMessage::ScreenShareViewerLeft {
+                                            channel_id,
+                                            stream_id,
+                                            from_pubkey: public_key.clone(),
+                                        },
+                                    );
+                                }
+                            }
+
+                            Ok(WsClientMessage::ScreenShareOffer { channel_id, to_pubkey, stream_id, sdp }) => {
+                                // Sender must be the sharer for this stream.
+                                let share_exists = {
+                                    let shares = state.screen_shares.read().await;
+                                    shares.get(&(channel_id.clone(), public_key.clone()))
+                                        .map(|a| a.streams.contains_key(&stream_id))
+                                        .unwrap_or(false)
+                                };
+                                if !share_exists { continue; }
+                                send_v2_signal(
+                                    &state,
+                                    channel_id.clone(),
+                                    to_pubkey.clone(),
+                                    WsServerMessage::ScreenShareOfferIn {
+                                        channel_id,
+                                        to_pubkey: to_pubkey.clone(),
+                                        stream_id,
+                                        sdp,
+                                        from_pubkey: public_key.clone(),
+                                    },
+                                );
+                            }
+
+                            Ok(WsClientMessage::ScreenShareAnswer { channel_id, to_pubkey, stream_id, sdp }) => {
+                                // Sender is a viewer; to_pubkey is the sharer.
+                                let share_exists = {
+                                    let shares = state.screen_shares.read().await;
+                                    shares.get(&(channel_id.clone(), to_pubkey.clone()))
+                                        .map(|a| a.streams.contains_key(&stream_id))
+                                        .unwrap_or(false)
+                                };
+                                if !share_exists { continue; }
+                                send_v2_signal(
+                                    &state,
+                                    channel_id.clone(),
+                                    to_pubkey.clone(),
+                                    WsServerMessage::ScreenShareAnswerIn {
+                                        channel_id,
+                                        to_pubkey: to_pubkey.clone(),
+                                        stream_id,
+                                        sdp,
+                                        from_pubkey: public_key.clone(),
+                                    },
+                                );
+                            }
+
+                            Ok(WsClientMessage::ScreenShareIce { channel_id, to_pubkey, stream_id, candidate }) => {
+                                let share_exists = {
+                                    let shares = state.screen_shares.read().await;
+                                    shares.get(&(channel_id.clone(), public_key.clone()))
+                                        .map(|a| a.streams.contains_key(&stream_id))
+                                        .unwrap_or(false)
+                                    || shares.get(&(channel_id.clone(), to_pubkey.clone()))
+                                        .map(|a| a.streams.contains_key(&stream_id))
+                                        .unwrap_or(false)
+                                };
+                                if !share_exists { continue; }
+                                send_v2_signal(
+                                    &state,
+                                    channel_id.clone(),
+                                    to_pubkey.clone(),
+                                    WsServerMessage::ScreenShareIceIn {
+                                        channel_id,
+                                        to_pubkey: to_pubkey.clone(),
+                                        stream_id,
+                                        candidate,
+                                        from_pubkey: public_key.clone(),
+                                    },
+                                );
                             }
 
                             Ok(WsClientMessage::Resume { since_seq }) => {
@@ -707,7 +863,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, public_key: Stri
                             let chunk_bytes = bytes::Bytes::from(data.to_vec());
                             if is_init {
                                 let mut shares = state.screen_shares.write().await;
-                                if let Some(active) = shares.get_mut(&ch_id) {
+                                let key = (ch_id.clone(), public_key.clone());
+                                if let Some(active) = shares.get_mut(&key) {
                                     if let Some(meta) = active.streams.get_mut(&st_id) {
                                         meta.init_chunk = Some(chunk_bytes.clone());
                                     }
@@ -810,10 +967,12 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, public_key: Stri
     }
     {
         let mut shares = state.screen_shares.write().await;
+        // Remove any share keyed by this user as sharer.
+        shares.retain(|(_, sharer), _| sharer != &public_key);
+        // Also remove this user from any viewer set (in case they left mid-negotiation).
         for active in shares.values_mut() {
-            active.streams.retain(|_, meta| meta.sharer_pubkey != public_key);
+            active.viewers.remove(&public_key);
         }
-        shares.retain(|_, active| !active.streams.is_empty());
     }
     if is_bot {
         state.bot_sessions.write().await.remove(&public_key);
@@ -847,6 +1006,23 @@ async fn leave_voice(state: &AppState, public_key: &str, channel_id: &str) {
             public_key: public_key.to_string(),
         },
     ));
+}
+
+/// Broadcast a v2 signaling envelope via `chat_tx` using `ChatEvent::ScreenShareSignal`
+/// so the WS dispatch loop delivers it only to `to_pubkey`.
+fn send_v2_signal(
+    state: &AppState,
+    channel_id: String,
+    to_pubkey: String,
+    msg: WsServerMessage,
+) {
+    let ev = crate::routes::chat_models::ChatEvent::ScreenShareSignal {
+        channel_id,
+        to_pubkey,
+    };
+    let json: std::sync::Arc<str> =
+        std::sync::Arc::from(serde_json::to_string(&msg).unwrap().as_str());
+    let _ = state.chat_tx.send((ev, json));
 }
 
 async fn get_voice_participants(state: &AppState, channel_id: &str) -> Vec<VoiceParticipantInfo> {

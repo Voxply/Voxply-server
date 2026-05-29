@@ -140,6 +140,33 @@ pub async fn send_dm(
         return Err((StatusCode::FORBIDDEN, "Not a member of this conversation".to_string()));
     }
 
+    // Block check: if any recipient has blocked the sender, return a success-shaped
+    // response (200 OK with a placeholder) so the sender cannot detect the block.
+    for m in &members {
+        if m.public_key == user.public_key {
+            continue;
+        }
+        if crate::routes::identity::is_dm_blocked(&state.db, &m.public_key, &user.public_key).await {
+            // Return success-shaped 200; nothing is stored or broadcast.
+            let now = crate::auth::handlers::unix_timestamp();
+            return Ok((
+                StatusCode::CREATED,
+                Json(DmMessageResponse {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    conversation_id,
+                    sender: user.public_key,
+                    sender_name: None,
+                    content: req.content,
+                    created_at: now,
+                    attachments: req.attachments,
+                    delivery_failed: false,
+                    is_encrypted: false,
+                    encrypted_envelope: None,
+                }),
+            ));
+        }
+    }
+
     let conv_type: String = sqlx::query_scalar("SELECT conv_type FROM conversations WHERE id = ?")
         .bind(&conversation_id)
         .fetch_optional(&state.db)
@@ -478,6 +505,17 @@ pub async fn receive_federated_dm(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
     if exists.is_some() {
         return Ok(StatusCode::OK);
+    }
+
+    // Block check for federated inbound DM: if any local recipient has blocked the sender,
+    // return 200 (success-shaped) so the sending hub cannot detect the block.
+    for member_key in &req.members {
+        if member_key == &req.sender {
+            continue;
+        }
+        if crate::routes::identity::is_dm_blocked(&state.db, member_key, &req.sender).await {
+            return Ok(StatusCode::OK);
+        }
     }
 
     // Auto-create the conversation on this hub if this is the first time we've seen it.

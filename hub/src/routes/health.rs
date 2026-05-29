@@ -76,6 +76,7 @@ pub async fn info(State(state): State<Arc<AppState>>) -> Json<InfoResponse> {
         nsfw,
         badges,
         cert_requirement,
+        screen_share_v2: true,
     })
 }
 
@@ -117,4 +118,7 @@ pub struct InfoResponse {
     /// Clients read this pre-auth to know which certs to present.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cert_requirement: Option<CertRequirement>,
+    /// Signals to clients that this hub supports WebRTC screen-share v2
+    /// signaling (SDP/ICE relay). Always true on this build.
+    pub screen_share_v2: bool,
 }

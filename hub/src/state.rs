@@ -59,10 +59,17 @@ pub struct ScreenStreamMeta {
     pub started_at: Instant,
 }
 
-/// All active streams in one channel.
+/// All active streams for one (channel, sharer) pair.
+///
+/// The map is re-keyed to `(channel_id, sharer_pubkey)` for v2 multi-sharer
+/// forward-compatibility (§5 of screen-share-webrtc.md). The runtime still
+/// enforces max_sharers_per_channel = 1 via the existing "other_sharer" check.
 pub struct ActiveShare {
     /// stream_id → metadata
     pub streams: HashMap<String, ScreenStreamMeta>,
+    /// Set of viewer pubkeys currently negotiating or watching this share.
+    /// Used for join/leave routing and WS-disconnect cleanup.
+    pub viewers: HashSet<String>,
 }
 
 /// A screen-share chunk broadcast to all WS connections.
@@ -117,9 +124,11 @@ pub struct AppState {
     pub dm_tx: broadcast::Sender<DmEvent>,
     // Online users: public_key set (updated by WS connect/disconnect)
     pub online_users: RwLock<std::collections::HashSet<String>>,
-    /// Active screen-share sessions: channel_id → ActiveShare.
+    /// Active screen-share sessions: (channel_id, sharer_pubkey) → ActiveShare.
+    /// Re-keyed in v2 to support multiple concurrent sharers per channel
+    /// (gated by max_sharers_per_channel config, default 1 as before).
     /// In-memory only — cleared on process restart.
-    pub screen_shares: RwLock<HashMap<String, ActiveShare>>,
+    pub screen_shares: RwLock<HashMap<(String, String), ActiveShare>>,
     /// Broadcast channel carrying binary chunk events to all WS connections.
     pub screen_share_tx: broadcast::Sender<ScreenChunkEvent>,
     /// Active bot WS sessions: bot_pubkey → mpsc sender for pre-serialised

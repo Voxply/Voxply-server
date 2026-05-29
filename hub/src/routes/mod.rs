@@ -35,3 +35,4 @@ pub mod post_models;
 pub mod posts;
 pub mod tags;
 pub mod games;
+pub mod recovery;

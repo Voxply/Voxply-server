@@ -1435,6 +1435,69 @@ pub async fn run(pool: &SqlitePool) -> Result<()> {
     sqlx::query("INSERT OR IGNORE INTO role_permissions (role_id, permission) VALUES ('builtin-everyone', 'start_game')")
         .execute(pool).await?;
 
+    // ---- Task #24: Recovery contacts ----
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS recovery_settings (
+            owner_pubkey  TEXT PRIMARY KEY,
+            threshold     INTEGER NOT NULL DEFAULT 1,
+            created_at    INTEGER NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS recovery_contacts (
+            owner_pubkey   TEXT NOT NULL,
+            contact_pubkey TEXT NOT NULL,
+            created_at     INTEGER NOT NULL,
+            PRIMARY KEY (owner_pubkey, contact_pubkey)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS key_rotation_requests (
+            id          TEXT PRIMARY KEY,
+            old_pubkey  TEXT NOT NULL,
+            new_pubkey  TEXT NOT NULL,
+            reason      TEXT,
+            status      TEXT NOT NULL DEFAULT 'pending',
+            created_at  INTEGER NOT NULL,
+            decided_at  INTEGER,
+            decided_by  TEXT
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS rotation_attestations (
+            id              TEXT PRIMARY KEY,
+            request_id      TEXT NOT NULL,
+            attester_pubkey TEXT NOT NULL,
+            signature       TEXT NOT NULL,
+            attested_at     INTEGER NOT NULL,
+            UNIQUE (request_id, attester_pubkey)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    // ---- Task #25: DM block enforcement ----
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS dm_blocks (
+            owner_pubkey   TEXT NOT NULL,
+            blocked_pubkey TEXT NOT NULL,
+            PRIMARY KEY (owner_pubkey, blocked_pubkey)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
     tracing::info!("Database migrations complete");
     Ok(())
 }

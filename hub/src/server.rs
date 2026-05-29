@@ -277,6 +277,24 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/game-sessions/{session_id}",
             delete(routes::games::end_session),
         )
+        // ---- Recovery contacts (Task #24) ----
+        .route(
+            "/recovery/contacts",
+            put(routes::recovery::put_contacts).get(routes::recovery::get_contacts),
+        )
+        .route(
+            "/recovery/contacts/{pubkey}",
+            delete(routes::recovery::delete_contact),
+        )
+        .route("/recovery/rotate-key", post(routes::recovery::post_rotate_key))
+        .route("/admin/recovery/pending", get(routes::recovery::admin_list_pending))
+        .route("/admin/recovery/{id}/approve", post(routes::recovery::admin_approve))
+        .route("/admin/recovery/{id}/deny", post(routes::recovery::admin_deny))
+        // ---- DM block set (Task #25) ----
+        .route(
+            "/identity/dm-blocks",
+            put(routes::identity::put_dm_blocks).get(routes::identity::get_dm_blocks),
+        )
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

@@ -4,9 +4,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
+use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use voxply_identity::{HomeHubList, RevocationEntry, SignedPrefsBlob, SubkeyCert};
 
+use crate::auth::middleware::AuthUser;
 use crate::state::AppState;
 
 fn now_secs() -> i64 {
@@ -308,4 +310,73 @@ pub async fn put_prefs(
     .map_err(db_err)?;
 
     Ok(StatusCode::OK)
+}
+
+// ---------------------------------------------------------------------------
+// DM block set (Task #25)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct DmBlocksRequest {
+    pub pubkeys: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct DmBlocksResponse {
+    pub pubkeys: Vec<String>,
+}
+
+/// PUT /identity/dm-blocks — replace the caller's DM-block set.
+pub async fn put_dm_blocks(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Json(req): Json<DmBlocksRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    sqlx::query("DELETE FROM dm_blocks WHERE owner_pubkey = ?")
+        .bind(&user.public_key)
+        .execute(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+
+    for pk in &req.pubkeys {
+        sqlx::query(
+            "INSERT OR IGNORE INTO dm_blocks (owner_pubkey, blocked_pubkey) VALUES (?, ?)",
+        )
+        .bind(&user.public_key)
+        .bind(pk)
+        .execute(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+    }
+
+    Ok(StatusCode::OK)
+}
+
+/// GET /identity/dm-blocks — read the caller's current DM-block set.
+pub async fn get_dm_blocks(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+) -> Result<Json<DmBlocksResponse>, (StatusCode, String)> {
+    let pubkeys: Vec<String> =
+        sqlx::query_scalar("SELECT blocked_pubkey FROM dm_blocks WHERE owner_pubkey = ?")
+            .bind(&user.public_key)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+
+    Ok(Json(DmBlocksResponse { pubkeys }))
+}
+
+/// Helper: check whether `sender` is in `recipient`'s DM-block set.
+/// Returns false on any DB error so the caller degrades safely.
+pub async fn is_dm_blocked(db: &sqlx::SqlitePool, recipient: &str, sender: &str) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM dm_blocks WHERE owner_pubkey = ? AND blocked_pubkey = ?",
+    )
+    .bind(recipient)
+    .bind(sender)
+    .fetch_one(db)
+    .await
+    .unwrap_or(0)
+        > 0
 }
