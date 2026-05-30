@@ -27,7 +27,7 @@ sha2 = "0.10"
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
 voxply-identity = { path = "../identity" }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 futures-util = "0.3"
 opentelemetry        = { workspace = true }
 opentelemetry_sdk    = { workspace = true }
