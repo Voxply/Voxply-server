@@ -21,6 +21,10 @@ pub struct CreateChannelRequest {
     /// Defaults to `"{user}'s room"` when absent (see temp-voice-channels.md §2).
     #[serde(default)]
     pub spawner_name_template: Option<String>,
+    /// NSFW flag for this channel specifically (as opposed to the hub-wide
+    /// `nsfw` flag surfaced on `/info`). Defaults to false.
+    #[serde(default)]
+    pub nsfw: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -62,6 +66,10 @@ pub struct ChannelResponse {
     /// non-forum channels.
     #[serde(default)]
     pub forum_require_tag: bool,
+    /// NSFW flag for this channel specifically (as opposed to the hub-wide
+    /// `nsfw` flag surfaced on `/info`).
+    #[serde(default)]
+    pub nsfw: bool,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -98,6 +106,10 @@ pub struct UpdateChannelRequest {
     /// so absent = unchanged, `Some(bool)` = set.
     #[serde(default)]
     pub forum_require_tag: Option<bool>,
+    /// Per-channel NSFW toggle. No null-clear state needed -- the column is
+    /// a plain `NOT NULL BOOLEAN`, so absent = unchanged, `Some(bool)` = set.
+    #[serde(default)]
+    pub nsfw: Option<bool>,
 }
 
 /// Lets us distinguish "field missing" from "field explicitly null" in JSON.

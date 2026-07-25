@@ -1893,6 +1893,13 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     .execute(pool)
     .await;
 
+    // Per-channel NSFW flag, letting part of a hub be marked NSFW instead of
+    // only the whole hub (the hub-wide `nsfw` flag surfaced on `/info`).
+    // Default off.
+    let _ = sqlx::query("ALTER TABLE channels ADD COLUMN nsfw BOOLEAN NOT NULL DEFAULT FALSE")
+        .execute(pool)
+        .await;
+
     // Admin-only local label for an external bot row (bots.md §4 "Admin UI"):
     // set at invite time via `POST /bots`, surfaced on `GET /admin/bots/external`.
     // Distinct from `bot_profiles.name`, which the bot operator controls.

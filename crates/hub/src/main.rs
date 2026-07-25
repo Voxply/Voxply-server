@@ -273,19 +273,14 @@ async fn run_doctor() -> bool {
                         .trim_start_matches("https://")
                         .trim_start_matches("http://")
                         .trim_end_matches('/');
-                    match Identity::load(Path::new("hub_identity.json")) {
-                        Ok(identity) => {
-                            println!(
-                            "INFO  hub owner: none yet — first-boot invite wavvon://{host}/i/{}/{code}",
-                            identity.public_key_hex()
-                        );
-                        }
-                        Err(_) => {
-                            println!(
-                            "INFO  hub owner: none yet — first-boot invite https://{host}/join/{code}"
-                        );
-                        }
-                    }
+                    let scheme = if host.starts_with("localhost") || host.starts_with("127.") {
+                        "http"
+                    } else {
+                        "https"
+                    };
+                    println!(
+                        "INFO  hub owner: none yet — first-boot invite {scheme}://{host}/join/{code}"
+                    );
                 }
                 Ok(None) => {
                     println!("PASS  hub owner: already assigned");
@@ -903,9 +898,9 @@ async fn main() -> Result<()> {
 
         // Fresh hubs default to invite_only=true (task #31), which would
         // otherwise leave no invite-free path for anyone to become owner.
-        // Mint (or reuse) the one-time owner-granting invite and print both
-        // link forms so the operator has a concrete way in. No-op once the
-        // hub already has a real user — see maybe_mint_first_boot_owner_invite.
+        // Mint (or reuse) the one-time owner-granting invite and print the
+        // plain /join link so the operator has a concrete way in. No-op once
+        // the hub already has a real user — see maybe_mint_first_boot_owner_invite.
         match wavvon_hub::routes::invites::maybe_mint_first_boot_owner_invite(&db).await {
             Ok(Some(code)) => {
                 // The /join link must be copy-pasteable: an explicit scheme in
@@ -924,11 +919,7 @@ async fn main() -> Result<()> {
                     .trim_start_matches("https://")
                     .trim_start_matches("http://")
                     .trim_end_matches('/');
-                let serial = hub_identity.public_key_hex();
-                tracing::warn!(
-                    "First-boot owner invite: wavvon://{host}/i/{serial}/{code}  \
-                     (or {join_scheme}://{host}/join/{code})"
-                );
+                tracing::warn!("First-boot owner invite: {join_scheme}://{host}/join/{code}");
             }
             Ok(None) => {}
             Err((_, e)) => {
