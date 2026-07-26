@@ -220,6 +220,30 @@ async fn wait_for(rx: &mut WsStream, want: &str) -> Value {
     .unwrap_or_else(|_| panic!("`{want}` not received within 15s"))
 }
 
+/// Asserts that `want` does NOT arrive on `rx` within a short grace window.
+/// Any other frame type is drained and ignored.
+async fn assert_not_received(rx: &mut WsStream, want: &str) {
+    let outcome = tokio::time::timeout(std::time::Duration::from_millis(800), async {
+        loop {
+            match rx.next().await {
+                Some(Ok(TsMessage::Text(raw))) => {
+                    let v: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+                    if v.get("type").and_then(|t| t.as_str()) == Some(want) {
+                        return v;
+                    }
+                }
+                Some(Ok(_)) => continue,
+                other => panic!("WS stream ended unexpectedly: {other:?}"),
+            }
+        }
+    })
+    .await;
+    assert!(
+        outcome.is_err(),
+        "expected no `{want}` within the grace window, but got one: {outcome:?}"
+    );
+}
+
 /// Happy path: a member holding `role_id` is in voice, another whisperer
 /// starts a whisper targeted at that role, and the role holder receives
 /// `voice_whisper_started` over their WS connection -- proving the role was
@@ -282,6 +306,153 @@ async fn role_targeted_whisper_reaches_ws_role_holder() {
     assert!(
         resolved.contains(&listener_pk),
         "role member should be resolved into whisper_target_pubkeys"
+    );
+
+    let _ = w_tx.send(TsMessage::Close(None)).await;
+    let _ = l_tx.send(TsMessage::Close(None)).await;
+}
+
+async fn join_voice(tx: &mut WsSink, rx: &mut WsStream, channel_id: &str) {
+    send_ws(tx, json!({ "type": "subscribe", "channel_id": channel_id })).await;
+    send_ws(
+        tx,
+        json!({ "type": "voice_join", "channel_id": channel_id, "udp_port": 0 }),
+    )
+    .await;
+    wait_for(rx, "voice_joined").await;
+}
+
+/// Live re-resolution diff on voice join/leave (whisper.md "New WS
+/// envelopes"): a whisperer targets a channel before anyone else is in it;
+/// a listener already present in the channel gets `voice_whisper_started`
+/// straight away, then a late joiner to that same target channel gets its
+/// own `voice_whisper_started` on join, without the already-resolved
+/// listener getting a duplicate push. When the late joiner leaves voice,
+/// they get `voice_whisper_stopped` and the original listener again gets
+/// nothing.
+#[tokio::test]
+async fn channel_target_whisper_notifies_late_joiner_and_leaver() {
+    let (base, state, _guard) = start_hub().await;
+    let owner = Identity::generate();
+    let owner_token = authenticate_http(&base, &owner).await;
+    let ch = create_channel(&base, &owner_token, "whisper-latejoin-ch").await;
+
+    let whisperer = Identity::generate();
+    let whisperer_token = authenticate_http(&base, &whisperer).await;
+    let whisperer_pk = whisperer.public_key_hex();
+
+    let listener = Identity::generate();
+    let listener_token = authenticate_http(&base, &listener).await;
+
+    let late_joiner = Identity::generate();
+    let late_joiner_token = authenticate_http(&base, &late_joiner).await;
+    let late_joiner_pk = late_joiner.public_key_hex();
+
+    let (mut w_tx, mut w_rx) = connect_ws(&base, &whisperer_token).await;
+    let (mut l_tx, mut l_rx) = connect_ws(&base, &listener_token).await;
+    let (mut lj_tx, mut lj_rx) = connect_ws(&base, &late_joiner_token).await;
+
+    join_voice(&mut w_tx, &mut w_rx, &ch.id).await;
+    join_voice(&mut l_tx, &mut l_rx, &ch.id).await;
+
+    send_ws(
+        &mut w_tx,
+        json!({
+            "type": "voice_whisper_start",
+            "targets": [{ "type": "channel", "id": ch.id }],
+        }),
+    )
+    .await;
+    let notif = wait_for(&mut l_rx, "voice_whisper_started").await;
+    assert_eq!(notif["sender_pubkey"], whisperer_pk);
+
+    // Late joiner arrives in the target channel mid-session -> gets its own
+    // started push; the already-resolved listener gets no duplicate.
+    join_voice(&mut lj_tx, &mut lj_rx, &ch.id).await;
+    let notif = wait_for(&mut lj_rx, "voice_whisper_started").await;
+    assert_eq!(notif["sender_pubkey"], whisperer_pk);
+    assert_not_received(&mut l_rx, "voice_whisper_started").await;
+
+    let resolved = state
+        .whisper_target_pubkeys
+        .read()
+        .await
+        .get(&whisperer_pk)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        resolved.contains(&late_joiner_pk),
+        "late joiner must be resolved into the live target set"
+    );
+
+    // Late joiner leaves voice -> gets stopped; listener still gets nothing.
+    send_ws(
+        &mut lj_tx,
+        json!({ "type": "voice_leave", "channel_id": ch.id }),
+    )
+    .await;
+    let notif = wait_for(&mut lj_rx, "voice_whisper_stopped").await;
+    assert_eq!(notif["sender_pubkey"], whisperer_pk);
+    assert_not_received(&mut l_rx, "voice_whisper_stopped").await;
+
+    let _ = w_tx.send(TsMessage::Close(None)).await;
+    let _ = l_tx.send(TsMessage::Close(None)).await;
+    let _ = lj_tx.send(TsMessage::Close(None)).await;
+}
+
+/// Whisper session teardown on the whisperer leaving voice (whisper.md
+/// "Hub state additions": a session is torn down "on the whisperer leaving
+/// voice, and on WS disconnect"). Previously-resolved recipients must get
+/// `voice_whisper_stopped` at that point, not just have the hub-side routing
+/// state silently cleared.
+#[tokio::test]
+async fn whisperer_leaving_voice_notifies_recipients() {
+    let (base, state, _guard) = start_hub().await;
+    let owner = Identity::generate();
+    let owner_token = authenticate_http(&base, &owner).await;
+    let ch = create_channel(&base, &owner_token, "whisper-teardown-ch").await;
+
+    let whisperer = Identity::generate();
+    let whisperer_token = authenticate_http(&base, &whisperer).await;
+    let whisperer_pk = whisperer.public_key_hex();
+
+    let listener = Identity::generate();
+    let listener_token = authenticate_http(&base, &listener).await;
+
+    let (mut w_tx, mut w_rx) = connect_ws(&base, &whisperer_token).await;
+    let (mut l_tx, mut l_rx) = connect_ws(&base, &listener_token).await;
+
+    join_voice(&mut w_tx, &mut w_rx, &ch.id).await;
+    join_voice(&mut l_tx, &mut l_rx, &ch.id).await;
+
+    send_ws(
+        &mut w_tx,
+        json!({
+            "type": "voice_whisper_start",
+            "targets": [{ "type": "channel", "id": ch.id }],
+        }),
+    )
+    .await;
+    let notif = wait_for(&mut l_rx, "voice_whisper_started").await;
+    assert_eq!(notif["sender_pubkey"], whisperer_pk);
+
+    // Whisperer leaves voice -> the listener gets stopped, and the session's
+    // routing state is gone.
+    send_ws(
+        &mut w_tx,
+        json!({ "type": "voice_leave", "channel_id": ch.id }),
+    )
+    .await;
+    let notif = wait_for(&mut l_rx, "voice_whisper_stopped").await;
+    assert_eq!(notif["sender_pubkey"], whisperer_pk);
+
+    assert!(
+        !state
+            .whisper_target_pubkeys
+            .read()
+            .await
+            .contains_key(&whisperer_pk),
+        "whisper session must be torn down when the whisperer leaves voice"
     );
 
     let _ = w_tx.send(TsMessage::Close(None)).await;

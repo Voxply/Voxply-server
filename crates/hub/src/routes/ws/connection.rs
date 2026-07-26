@@ -931,14 +931,27 @@ pub async fn leave_voice(state: &AppState, public_key: &str, channel_id: &str) {
         }
     }
 
-    // Clean up the departing user's whisper session.
+    // Clean up the departing user's whisper session (whisper.md: a session
+    // is torn down when the whisperer leaves voice). If they were an active
+    // whisperer, notify the previously-resolved recipients so their
+    // indicators clear -- the hub-routed audio is about to stop too since
+    // this pubkey no longer has a voice_channels entry.
     state.whisper_targets.write().await.remove(public_key);
     state.whisper_target_defs.write().await.remove(public_key);
-    state
+    let prev_whisper_pks = state
         .whisper_target_pubkeys
         .write()
         .await
         .remove(public_key);
+    if let Some(prev_whisper_pks) = prev_whisper_pks {
+        super::voice::send_whisper_notification(
+            state,
+            public_key,
+            channel_id,
+            false,
+            prev_whisper_pks.into_iter().collect(),
+        );
+    }
 
     // Revoke the UDP relay slot.
     state.voice_relay_active.write().await.remove(public_key);
@@ -967,4 +980,10 @@ pub async fn leave_voice(state: &AppState, public_key: &str, channel_id: &str) {
             participants: roster,
         },
     ));
+
+    // The departing user may be a RECIPIENT in other users' whisper
+    // sessions; re-resolve here (not just in the explicit voice-leave
+    // handler) so raw WS-disconnect teardown drops them from every
+    // resolved target set too.
+    super::voice::re_resolve_whisper_sessions(state).await;
 }

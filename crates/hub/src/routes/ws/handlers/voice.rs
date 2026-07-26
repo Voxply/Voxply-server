@@ -12,7 +12,7 @@ use crate::routes::ws::conn_state::{ConnState, DispatchResult};
 use crate::routes::ws::voice::{
     apply_pending_voice_move_assignment, get_voice_participants, get_voice_roster,
     re_resolve_whisper_sessions, resolve_role_addrs, resolve_whisper_target_pubkeys,
-    resolve_whisper_targets,
+    resolve_whisper_targets, send_whisper_notification,
 };
 
 type WsTx = futures_util::stream::SplitSink<axum::extract::ws::WebSocket, Message>;
@@ -505,7 +505,6 @@ pub(in crate::routes::ws) async fn handle_voice_leave(
 
     crate::routes::ws::connection::leave_voice(state, &cs.public_key, &channel_id).await;
     cs.voice_channel = None;
-    re_resolve_whisper_sessions(state).await;
 
     {
         let state_c = state.clone();
@@ -613,16 +612,13 @@ pub(in crate::routes::ws) async fn handle_voice_whisper_start(
         .insert(cs.public_key.clone(), target_pks.clone());
 
     let target_pubkeys: Vec<String> = target_pks.into_iter().collect();
-    let reply = WsServerMessage::VoiceWhisperStarted {
-        sender_pubkey: cs.public_key.clone(),
-    };
-    let ev = crate::routes::chat_models::ChatEvent::WhisperSignal {
-        channel_id: cs.voice_channel.clone().unwrap_or_default(),
-        to_pubkeys: target_pubkeys,
-    };
-    let json: std::sync::Arc<str> =
-        std::sync::Arc::from(serde_json::to_string(&reply).unwrap().as_str());
-    let _ = state.chat_tx.send((ev, json));
+    send_whisper_notification(
+        state,
+        &cs.public_key,
+        &cs.voice_channel.clone().unwrap_or_default(),
+        true,
+        target_pubkeys,
+    );
     DispatchResult::Continue
 }
 
@@ -645,16 +641,13 @@ pub(in crate::routes::ws) async fn handle_voice_whisper_stop(
     if prev_addrs.is_some() || prev_pks.is_some() {
         // Notify the pubkey-based target set (covers web + UDP targets).
         let target_pubkeys: Vec<String> = prev_pks.unwrap_or_default().into_iter().collect();
-        let reply = WsServerMessage::VoiceWhisperStopped {
-            sender_pubkey: cs.public_key.clone(),
-        };
-        let ev = crate::routes::chat_models::ChatEvent::WhisperSignal {
-            channel_id: cs.voice_channel.clone().unwrap_or_default(),
-            to_pubkeys: target_pubkeys,
-        };
-        let json: std::sync::Arc<str> =
-            std::sync::Arc::from(serde_json::to_string(&reply).unwrap().as_str());
-        let _ = state.chat_tx.send((ev, json));
+        send_whisper_notification(
+            state,
+            &cs.public_key,
+            &cs.voice_channel.clone().unwrap_or_default(),
+            false,
+            target_pubkeys,
+        );
     }
     DispatchResult::Continue
 }
@@ -665,11 +658,10 @@ pub(in crate::routes::ws) async fn handle_voice_whisper_stop(
 /// session afterward (same call used on voice join/leave) so an opt-out
 /// immediately drops the sender from any live target set and an opt-back-in
 /// immediately adds them back, without waiting for the whisperer to send a
-/// fresh `voice_whisper_start`. Note: like the join/leave re-resolution
-/// paths, this updates the resolved target-set state only -- it does not
-/// itself push a fresh `voice_whisper_started`/`stopped` notification to the
-/// affected pubkey (that diffing is not yet implemented for any
-/// re-resolution trigger).
+/// fresh `voice_whisper_start`. `re_resolve_whisper_sessions` diffs the
+/// resolved pubkey set against its previous value and pushes
+/// `voice_whisper_stopped` to the opted-out pubkey (or `voice_whisper_started`
+/// on opt-back-in) for every session it was a target of.
 pub(in crate::routes::ws) async fn handle_voice_whisper_optout(
     cs: &ConnState,
     state: &Arc<AppState>,

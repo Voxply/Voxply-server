@@ -1,7 +1,44 @@
 use std::collections::HashSet;
 
-use crate::routes::chat_models::{VoiceParticipantInfo, VoiceRosterEntry};
+use crate::routes::chat_models::{
+    ChatEvent, VoiceParticipantInfo, VoiceRosterEntry, WsServerMessage,
+};
 use crate::state::AppState;
+
+/// Sends a targeted `voice_whisper_started`/`voice_whisper_stopped` to
+/// exactly `pubkeys` (never a broadcast — whisper.md's "New WS envelopes").
+/// `channel_id` is the whisperer's current voice channel, per the existing
+/// `WhisperSignal` delivery convention (filtered by `to_pubkeys`, not by
+/// channel subscription semantics, but still carried for the `channel_id()`
+/// contract). No-op if `pubkeys` is empty so callers can pass a diff result
+/// unconditionally.
+pub(super) fn send_whisper_notification(
+    state: &AppState,
+    sender_pubkey: &str,
+    channel_id: &str,
+    started: bool,
+    pubkeys: Vec<String>,
+) {
+    if pubkeys.is_empty() {
+        return;
+    }
+    let reply = if started {
+        WsServerMessage::VoiceWhisperStarted {
+            sender_pubkey: sender_pubkey.to_string(),
+        }
+    } else {
+        WsServerMessage::VoiceWhisperStopped {
+            sender_pubkey: sender_pubkey.to_string(),
+        }
+    };
+    let ev = ChatEvent::WhisperSignal {
+        channel_id: channel_id.to_string(),
+        to_pubkeys: pubkeys,
+    };
+    let json: std::sync::Arc<str> =
+        std::sync::Arc::from(serde_json::to_string(&reply).unwrap().as_str());
+    let _ = state.chat_tx.send((ev, json));
+}
 
 /// Builds the participant list for `channel_id` as seen by `viewer`:
 /// invisible members are omitted (decisions.md 2026-07-12 — invisible users
@@ -189,7 +226,12 @@ pub(super) async fn resolve_whisper_target_pubkeys(
 }
 
 /// Walk every active whisper session and rebuild its resolved SocketAddr set from stored defs.
-/// Called after any VoiceJoin or VoiceLeave so the live target set stays correct.
+/// Called after any VoiceJoin or VoiceLeave (and whisper opt-out toggling) so
+/// the live target set stays correct. Also diffs the pubkey-keyed target set
+/// against its previous value and pushes targeted `voice_whisper_started` /
+/// `voice_whisper_stopped` notifications to exactly the added/removed
+/// recipients (whisper.md "New WS envelopes" — never a broadcast, and never a
+/// duplicate notification to someone whose membership didn't change).
 pub(super) async fn re_resolve_whisper_sessions(state: &AppState) {
     // Snapshot the current defs outside the write lock.
     let defs_map: Vec<(String, Vec<crate::state::WhisperTargetDef>)> = {
@@ -202,15 +244,18 @@ pub(super) async fn re_resolve_whisper_sessions(state: &AppState) {
             .collect()
     };
     for (sender_pk, defs) in defs_map {
-        // Find the sender's current SocketAddr (they may have just left voice).
-        let sender_addr = {
+        // Find the sender's current channel + SocketAddr (they may have just left voice).
+        let sender_loc = {
             let vc = state.voice_channels.read().await;
-            vc.values().find_map(|p| p.get(&sender_pk)).copied()
+            vc.iter()
+                .find_map(|(cid, p)| p.get(&sender_pk).map(|addr| (cid.clone(), *addr)))
         };
-        let sender_addr = match sender_addr {
-            Some(a) => a,
+        let (channel_id, sender_addr) = match sender_loc {
+            Some(v) => v,
             None => {
-                // Sender is no longer in voice; their session will be cleaned up by leave_voice.
+                // Sender is no longer in voice; their session (and the
+                // stop-notification to prior recipients) is handled by
+                // `leave_voice`'s own whisper teardown.
                 continue;
             }
         };
@@ -226,13 +271,20 @@ pub(super) async fn re_resolve_whisper_sessions(state: &AppState) {
             .await
             .insert(sender_pk.clone(), new_addrs);
 
-        // Keep the pubkey-keyed set (WS delivery) in sync with the same defs.
+        // Keep the pubkey-keyed set (WS delivery) in sync with the same defs,
+        // diffing against the previous set to notify only what changed.
         let new_pks = resolve_whisper_target_pubkeys(state, &defs, &sender_pk).await;
-        state
+        let old_pks = state
             .whisper_target_pubkeys
             .write()
             .await
-            .insert(sender_pk, new_pks);
+            .insert(sender_pk.clone(), new_pks.clone())
+            .unwrap_or_default();
+
+        let added: Vec<String> = new_pks.difference(&old_pks).cloned().collect();
+        let removed: Vec<String> = old_pks.difference(&new_pks).cloned().collect();
+        send_whisper_notification(state, &sender_pk, &channel_id, true, added);
+        send_whisper_notification(state, &sender_pk, &channel_id, false, removed);
     }
 }
 

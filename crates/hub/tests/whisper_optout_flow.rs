@@ -381,3 +381,77 @@ async fn whisper_optout_blocks_receiving_until_reenabled() {
     let _ = b_tx.send(TsMessage::Close(None)).await;
     let _ = c_tx.send(TsMessage::Close(None)).await;
 }
+
+/// Live re-resolution diff (whisper.md "New WS envelopes"): once a whisper is
+/// already running, a target opting out mid-session gets a targeted
+/// `voice_whisper_stopped`, and opting back in gets a fresh
+/// `voice_whisper_started` -- without the whisperer re-sending
+/// `voice_whisper_start`. An unaffected bystander in the same target channel
+/// gets neither push (no re-announce to the whole set on a partial change).
+#[tokio::test]
+async fn whisper_optout_midsession_pushes_started_stopped_diff() {
+    let (base, _state, _guard) = start_hub().await;
+    let owner = Identity::generate();
+    let owner_token = authenticate_http(&base, &owner).await;
+    let ch = create_channel(&base, &owner_token, "whisper-optout-diff-ch").await;
+
+    let whisperer = Identity::generate();
+    let whisperer_token = authenticate_http(&base, &whisperer).await;
+    let whisperer_pk = whisperer.public_key_hex();
+
+    let b = Identity::generate();
+    let b_token = authenticate_http(&base, &b).await;
+
+    let c = Identity::generate();
+    let c_token = authenticate_http(&base, &c).await;
+
+    let (mut w_tx, mut w_rx) = connect_ws(&base, &whisperer_token).await;
+    let (mut b_tx, mut b_rx) = connect_ws(&base, &b_token).await;
+    let (mut c_tx, mut c_rx) = connect_ws(&base, &c_token).await;
+
+    join_voice(&mut w_tx, &mut w_rx, &ch.id).await;
+    join_voice(&mut b_tx, &mut b_rx, &ch.id).await;
+    join_voice(&mut c_tx, &mut c_rx, &ch.id).await;
+
+    // Whisperer targets the whole channel: B and C both get started.
+    send_ws(
+        &mut w_tx,
+        json!({
+            "type": "voice_whisper_start",
+            "targets": [{ "type": "channel", "id": ch.id }],
+        }),
+    )
+    .await;
+    let notif = wait_for(&mut b_rx, "voice_whisper_started").await;
+    assert_eq!(notif["sender_pubkey"], whisperer_pk);
+    let notif = wait_for(&mut c_rx, "voice_whisper_started").await;
+    assert_eq!(notif["sender_pubkey"], whisperer_pk);
+
+    // B opts out mid-session -> B alone gets voice_whisper_stopped; C gets
+    // nothing (their membership in the target set didn't change).
+    send_ws(
+        &mut b_tx,
+        json!({ "type": "voice_whisper_optout", "enabled": true }),
+    )
+    .await;
+    let notif = wait_for(&mut b_rx, "voice_whisper_stopped").await;
+    assert_eq!(notif["sender_pubkey"], whisperer_pk);
+    assert_not_received(&mut c_rx, "voice_whisper_stopped").await;
+    assert_not_received(&mut c_rx, "voice_whisper_started").await;
+
+    // B opts back in -> B alone gets a fresh voice_whisper_started; C still
+    // gets nothing new.
+    send_ws(
+        &mut b_tx,
+        json!({ "type": "voice_whisper_optout", "enabled": false }),
+    )
+    .await;
+    let notif = wait_for(&mut b_rx, "voice_whisper_started").await;
+    assert_eq!(notif["sender_pubkey"], whisperer_pk);
+    assert_not_received(&mut c_rx, "voice_whisper_started").await;
+    assert_not_received(&mut c_rx, "voice_whisper_stopped").await;
+
+    let _ = w_tx.send(TsMessage::Close(None)).await;
+    let _ = b_tx.send(TsMessage::Close(None)).await;
+    let _ = c_tx.send(TsMessage::Close(None)).await;
+}
