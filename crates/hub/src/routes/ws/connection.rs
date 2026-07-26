@@ -375,7 +375,20 @@ pub(super) async fn handle_socket(
 
             // ── Voice channel events ──────────────────────────────────────
             voice_result = voice_rx.recv() => {
-                if let Ok((channel_id, msg)) = voice_result {
+                match voice_result {
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // Dropped voice events are permanent UI damage (a
+                        // missed Joined leaves a participant invisible until
+                        // the next roster broadcast) — tell the client to
+                        // resync, same as the chat arm.
+                        tracing::warn!("WebSocket client lagged on voice events, missed {n}");
+                        let lag_msg = crate::routes::chat_models::WsServerMessage::Lagged { count: n };
+                        if let Ok(json) = serde_json::to_string(&lag_msg) {
+                            let _ = ws_tx.send(Message::Text(json.into())).await;
+                        }
+                    }
+                    Err(_) => break,
+                    Ok((channel_id, msg)) => {
                     let is_self = match &msg {
                         WsServerMessage::VoiceParticipantSpeaking {
                             public_key: pk, ..
@@ -408,6 +421,7 @@ pub(super) async fn handle_socket(
                         if ws_tx.send(Message::Text(json.into())).await.is_err() {
                             break;
                         }
+                    }
                     }
                 }
             }

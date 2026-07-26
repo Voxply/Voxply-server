@@ -728,6 +728,69 @@ async fn voice_ws_join_to_spawner_creates_temp_sibling() {
     let _ = watcher_tx.send(TsMessage::Close(None)).await;
 }
 
+/// A `/voice/ws` join must broadcast a `voice_roster_update` on the main hub
+/// WS, mirroring the UDP join path — the roster carries the sender_id ↔
+/// pubkey map and heals any `voice_participant_joined` a client missed
+/// (voice-event resilience gap found 2026-07-26).
+#[tokio::test]
+async fn voice_ws_join_broadcasts_roster_update() {
+    let (base, _state, _guard) = start_hub().await;
+    let owner = Identity::generate();
+    let owner_token = authenticate_http(&base, &owner).await;
+
+    let channel = create_channel(&base, &owner_token, json!({ "name": "roster-web" })).await;
+
+    let member = Identity::generate();
+    let member_token = authenticate_http(&base, &member).await;
+
+    // Watcher on the main hub WS (not in voice) — roster broadcasts reach
+    // same-channel clients; joined/left reach everyone. Use the owner as an
+    // in-channel watcher: join voice first via /voice/ws, drain the ready
+    // frame, then watch the main WS.
+    let (_owner_voice_tx, mut owner_voice_rx) =
+        connect_voice_ws(&base, &owner_token, &channel.id).await;
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(15), owner_voice_rx.next())
+        .await
+        .expect("owner voice_ws_ready before timeout")
+        .expect("stream ended")
+        .expect("websocket error");
+    assert!(matches!(msg, TsMessage::Text(_)));
+
+    let (mut watcher_tx, mut watcher_rx) = connect_ws(&base, &owner_token).await;
+    // The main WS scopes non-roster voice events to the connection's own
+    // voice channel, tracked per-connection — tell it which channel we're in.
+    send_ws(
+        &mut watcher_tx,
+        json!({ "type": "voice_watch", "channel_id": channel.id }),
+    )
+    .await;
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(200), watcher_rx.next()).await;
+
+    let (_member_voice_tx, mut _member_voice_rx) =
+        connect_voice_ws(&base, &member_token, &channel.id).await;
+
+    let roster_frame = next_frame_of_type(
+        &mut watcher_rx,
+        "voice_roster_update",
+        std::time::Duration::from_secs(15),
+    )
+    .await
+    .expect("expected a voice_roster_update broadcast after a /voice/ws join");
+    assert_eq!(roster_frame["channel_id"], channel.id.as_str());
+    let pks: Vec<&str> = roster_frame["participants"]
+        .as_array()
+        .expect("participants array")
+        .iter()
+        .filter_map(|p| p["public_key"].as_str())
+        .collect();
+    assert!(
+        pks.contains(&member.public_key_hex().as_str()),
+        "roster must include the /voice/ws joiner, got {pks:?}"
+    );
+
+    let _ = watcher_tx.send(TsMessage::Close(None)).await;
+}
+
 /// A member denied `read_messages` on the spawner cannot spawn a room via
 /// `/voice/ws` -- no `voice_ws_ready` frame arrives and no temp channel is
 /// created. Mirrors the read-gating the main-hub-WS spawn path enforces

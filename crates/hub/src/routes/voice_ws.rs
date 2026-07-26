@@ -246,6 +246,19 @@ async fn voice_ws_task(socket: WebSocket, params: VoiceWsParams, state: Arc<AppS
             .send((channel_id.clone(), join_broadcast));
     }
 
+    // Broadcast the roster too, mirroring the UDP join path: it carries the
+    // sender_id ↔ pubkey map (audio attribution for everyone already in the
+    // channel) and heals any Joined event a client missed. get_voice_roster
+    // omits invisible members itself.
+    let roster = crate::routes::ws::get_voice_roster(&state, &channel_id).await;
+    let _ = state.voice_event_tx.send((
+        channel_id.clone(),
+        WsServerMessage::VoiceRosterUpdate {
+            channel_id: channel_id.clone(),
+            participants: roster,
+        },
+    ));
+
     // Split the socket into sender and receiver halves.
     let (mut sink, mut stream) = socket.split();
 

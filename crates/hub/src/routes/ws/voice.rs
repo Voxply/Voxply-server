@@ -405,7 +405,7 @@ pub async fn apply_pending_voice_move_assignment(
 /// payload for all recipients, so there is no per-viewer exemption here.
 /// Audio stays functional: clients play frames from unmapped sender_ids at
 /// default gain, so a hidden participant is still heard.
-pub(super) async fn get_voice_roster(state: &AppState, channel_id: &str) -> Vec<VoiceRosterEntry> {
+pub async fn get_voice_roster(state: &AppState, channel_id: &str) -> Vec<VoiceRosterEntry> {
     let sender_ids = state.voice_sender_ids.read().await;
     let ch_map = match sender_ids.get(channel_id) {
         Some(m) => m.clone(),
