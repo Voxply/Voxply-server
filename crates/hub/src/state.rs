@@ -353,6 +353,15 @@ pub struct AppState {
     /// clients (which have no stable UDP addr).
     pub whisper_target_pubkeys: RwLock<HashMap<String, HashSet<String>>>,
 
+    /// Pubkeys that have opted out of RECEIVING whispers (whisper.md).
+    /// Ephemeral, in-memory only -- resets on hub restart. Consulted at the
+    /// top of every whisper-target resolution function (`resolve_whisper_targets`,
+    /// `resolve_role_addrs`, `resolve_whisper_target_pubkeys` in
+    /// `routes/ws/voice.rs`) so an opted-out pubkey is filtered out of every
+    /// target set. Opting out only affects receiving -- an opted-out user can
+    /// still start a whisper of their own.
+    pub whisper_optouts: RwLock<HashSet<String>>,
+
     /// Pubkeys that currently own a live UDP relay slot.
     ///
     /// Inserted on `VoiceJoin`; removed on `leave_voice` (called on WS

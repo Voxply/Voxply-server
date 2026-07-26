@@ -1,9 +1,8 @@
-//! Regression test for the role-target whisper routing gap
-//! (docs/docs/client-parity.md): a "role" whisper target was resolved only
-//! into the UDP SocketAddr set, never into `whisper_target_pubkeys`, so a
-//! role-targeted whisper never reached a WS (web) listener holding that
-//! role. See `resolve_whisper_target_pubkeys` in
-//! crates/hub/src/routes/ws/voice.rs.
+//! Hub-enforced whisper opt-out (whisper.md): a user can refuse to RECEIVE
+//! whispers. Opting out never blocks the user from *starting* their own
+//! whisper -- it only removes them from the resolved target set of anyone
+//! else's whisper (`resolve_whisper_targets`, `resolve_role_addrs`,
+//! `resolve_whisper_target_pubkeys` in crates/hub/src/routes/ws/voice.rs).
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -14,7 +13,6 @@ use tokio_tungstenite::tungstenite::Message as TsMessage;
 use wavvon_hub::auth::models::{ChallengeResponse, VerifyResponse};
 use wavvon_hub::federation::client::FederationClient;
 use wavvon_hub::routes::chat_models::ChannelResponse;
-use wavvon_hub::routes::role_models::RoleResponse;
 use wavvon_hub::server;
 use wavvon_hub::state::AppState;
 use wavvon_identity::Identity;
@@ -23,8 +21,8 @@ use wavvon_identity::Identity;
 mod common;
 
 // ---------------------------------------------------------------------------
-// Harness — mirrors voice_move_flow.rs so real WS upgrades work over a real
-// TCP listener.
+// Harness — mirrors whisper_role_target_flow.rs so real WS upgrades work
+// over a real TCP listener.
 // ---------------------------------------------------------------------------
 
 async fn start_hub() -> (String, Arc<AppState>, common::TestDbGuard) {
@@ -34,7 +32,7 @@ async fn start_hub() -> (String, Arc<AppState>, common::TestDbGuard) {
     let (voice_event_tx, _) = broadcast::channel(16);
 
     let state = Arc::new(AppState {
-        hub_name: "whisper-role-test".to_string(),
+        hub_name: "whisper-optout-test".to_string(),
         hub_identity: Identity::generate(),
         db,
         db_read: None,
@@ -158,29 +156,6 @@ async fn create_channel(base: &str, token: &str, name: &str) -> ChannelResponse 
         .unwrap()
 }
 
-async fn create_role(base: &str, token: &str, name: &str) -> RoleResponse {
-    reqwest::Client::new()
-        .post(format!("{base}/roles"))
-        .bearer_auth(token)
-        .json(&json!({ "name": name, "permissions": [], "priority": 10 }))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap()
-}
-
-async fn assign_role(base: &str, token: &str, pubkey: &str, role_id: &str) {
-    let resp = reqwest::Client::new()
-        .put(format!("{base}/users/{pubkey}/roles/{role_id}"))
-        .bearer_auth(token)
-        .send()
-        .await
-        .unwrap();
-    assert!(resp.status().is_success(), "assign_role failed: {resp:?}");
-}
-
 type WsSink = futures_util::stream::SplitSink<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     TsMessage,
@@ -220,70 +195,189 @@ async fn wait_for(rx: &mut WsStream, want: &str) -> Value {
     .unwrap_or_else(|_| panic!("`{want}` not received within 15s"))
 }
 
-/// Happy path: a member holding `role_id` is in voice, another whisperer
-/// starts a whisper targeted at that role, and the role holder receives
-/// `voice_whisper_started` over their WS connection -- proving the role was
-/// resolved into the pubkey-keyed delivery set, not just the UDP addr set.
+/// Asserts that `want` does NOT arrive on `rx` within a short grace window.
+/// Any other frame type is drained and ignored.
+async fn assert_not_received(rx: &mut WsStream, want: &str) {
+    let outcome = tokio::time::timeout(std::time::Duration::from_millis(800), async {
+        loop {
+            match rx.next().await {
+                Some(Ok(TsMessage::Text(raw))) => {
+                    let v: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+                    if v.get("type").and_then(|t| t.as_str()) == Some(want) {
+                        return v;
+                    }
+                }
+                Some(Ok(_)) => continue,
+                other => panic!("WS stream ended unexpectedly: {other:?}"),
+            }
+        }
+    })
+    .await;
+    assert!(
+        outcome.is_err(),
+        "expected no `{want}` within the grace window, but got one: {outcome:?}"
+    );
+}
+
+async fn join_voice(tx: &mut WsSink, rx: &mut WsStream, channel_id: &str) {
+    send_ws(tx, json!({ "type": "subscribe", "channel_id": channel_id })).await;
+    send_ws(
+        tx,
+        json!({ "type": "voice_join", "channel_id": channel_id, "udp_port": 0 }),
+    )
+    .await;
+    wait_for(rx, "voice_joined").await;
+}
+
+/// Full lifecycle: B opts out -> unreachable as a user-type AND channel-type
+/// whisper target, while a non-opted bystander C in the same channel still
+/// receives it -> B opts back in mid-session and re-resolution (state-level;
+/// `re_resolve_whisper_sessions` does not currently re-announce
+/// `voice_whisper_started` on membership change for ANY trigger -- join,
+/// leave, or opt-out -- so this asserts the resolved set, not a fresh WS
+/// push) adds B back -> double opt-out/opt-in toggles are idempotent (no
+/// panic, no duplicate bookkeeping).
 #[tokio::test]
-async fn role_targeted_whisper_reaches_ws_role_holder() {
+async fn whisper_optout_blocks_receiving_until_reenabled() {
     let (base, state, _guard) = start_hub().await;
     let owner = Identity::generate();
     let owner_token = authenticate_http(&base, &owner).await;
-    let ch = create_channel(&base, &owner_token, "whisper-role-ch").await;
-
-    let role = create_role(&base, &owner_token, "moderator").await;
+    let ch = create_channel(&base, &owner_token, "whisper-optout-ch").await;
 
     let whisperer = Identity::generate();
     let whisperer_token = authenticate_http(&base, &whisperer).await;
+    let whisperer_pk = whisperer.public_key_hex();
 
-    let listener = Identity::generate();
-    let listener_token = authenticate_http(&base, &listener).await;
-    let listener_pk = listener.public_key_hex();
-    assign_role(&base, &owner_token, &listener_pk, &role.id).await;
+    let b = Identity::generate();
+    let b_token = authenticate_http(&base, &b).await;
+    let b_pk = b.public_key_hex();
+
+    let c = Identity::generate();
+    let c_token = authenticate_http(&base, &c).await;
 
     let (mut w_tx, mut w_rx) = connect_ws(&base, &whisperer_token).await;
-    let (mut l_tx, mut l_rx) = connect_ws(&base, &listener_token).await;
+    let (mut b_tx, mut b_rx) = connect_ws(&base, &b_token).await;
+    let (mut c_tx, mut c_rx) = connect_ws(&base, &c_token).await;
 
-    // Both subscribe to the channel (WhisperSignal delivery is channel-gated
-    // before the to_pubkeys filter narrows it further) and join voice there.
-    for (tx, rx) in [(&mut w_tx, &mut w_rx), (&mut l_tx, &mut l_rx)] {
-        send_ws(tx, json!({ "type": "subscribe", "channel_id": ch.id })).await;
-        send_ws(
-            tx,
-            json!({ "type": "voice_join", "channel_id": ch.id, "udp_port": 0 }),
-        )
-        .await;
-        wait_for(rx, "voice_joined").await;
-    }
+    join_voice(&mut w_tx, &mut w_rx, &ch.id).await;
+    join_voice(&mut b_tx, &mut b_rx, &ch.id).await;
+    join_voice(&mut c_tx, &mut c_rx, &ch.id).await;
 
-    // Whisperer opens a whisper session targeted at the role.
+    // B opts out of receiving whispers.
+    send_ws(
+        &mut b_tx,
+        json!({ "type": "voice_whisper_optout", "enabled": true }),
+    )
+    .await;
+    // Give the hub a moment to process before racing the assertion below.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(
+        state.whisper_optouts.read().await.contains(&b_pk),
+        "B should be recorded as opted out"
+    );
+
+    // --- user-type target: whisperer targets B directly. ---
     send_ws(
         &mut w_tx,
         json!({
             "type": "voice_whisper_start",
-            "targets": [{ "type": "role", "id": role.id }],
+            "targets": [{ "type": "user", "id": b_pk }],
         }),
     )
     .await;
-
-    // The role holder should see the whisper-started notification.
-    let notif = wait_for(&mut l_rx, "voice_whisper_started").await;
-    assert_eq!(notif["sender_pubkey"], whisperer.public_key_hex());
-
-    // And the resolved pubkey set should contain the role holder directly.
-    let sender_pk = whisperer.public_key_hex();
+    assert_not_received(&mut b_rx, "voice_whisper_started").await;
     let resolved = state
         .whisper_target_pubkeys
         .read()
         .await
-        .get(&sender_pk)
+        .get(&whisperer_pk)
         .cloned()
         .unwrap_or_default();
     assert!(
-        resolved.contains(&listener_pk),
-        "role member should be resolved into whisper_target_pubkeys"
+        !resolved.contains(&b_pk),
+        "opted-out user should never be resolved as a whisper target"
     );
 
+    // --- channel-type target: whisperer targets the channel both B and C
+    // are in. C (not opted out) should receive it; B should not. ---
+    send_ws(
+        &mut w_tx,
+        json!({
+            "type": "voice_whisper_start",
+            "targets": [{ "type": "channel", "id": ch.id }],
+        }),
+    )
+    .await;
+    let notif = wait_for(&mut c_rx, "voice_whisper_started").await;
+    assert_eq!(notif["sender_pubkey"], whisperer_pk);
+    assert_not_received(&mut b_rx, "voice_whisper_started").await;
+
+    let resolved = state
+        .whisper_target_pubkeys
+        .read()
+        .await
+        .get(&whisperer_pk)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !resolved.contains(&b_pk),
+        "opted-out B must stay out of the channel-target resolution"
+    );
+    assert!(
+        resolved.contains(&c.public_key_hex()),
+        "non-opted-out C must stay in the channel-target resolution"
+    );
+
+    // --- B opts back in mid-session: re-resolution should add them back
+    // into the resolved target set immediately (no fresh voice_whisper_start
+    // needed from the whisperer). ---
+    send_ws(
+        &mut b_tx,
+        json!({ "type": "voice_whisper_optout", "enabled": false }),
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(!state.whisper_optouts.read().await.contains(&b_pk));
+
+    let resolved = state
+        .whisper_target_pubkeys
+        .read()
+        .await
+        .get(&whisperer_pk)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        resolved.contains(&b_pk),
+        "B should be back in the resolved target set after opting back in"
+    );
+
+    // --- Idempotency: repeating the same toggle must not panic and must
+    // not leave stray duplicate bookkeeping (it's a HashSet, so this mostly
+    // guards against a future switch to a counting structure). ---
+    send_ws(
+        &mut b_tx,
+        json!({ "type": "voice_whisper_optout", "enabled": false }),
+    )
+    .await;
+    send_ws(
+        &mut b_tx,
+        json!({ "type": "voice_whisper_optout", "enabled": true }),
+    )
+    .await;
+    send_ws(
+        &mut b_tx,
+        json!({ "type": "voice_whisper_optout", "enabled": true }),
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(
+        state.whisper_optouts.read().await.len(),
+        1,
+        "double opt-out must not create duplicate entries"
+    );
+    assert!(state.whisper_optouts.read().await.contains(&b_pk));
+
     let _ = w_tx.send(TsMessage::Close(None)).await;
-    let _ = l_tx.send(TsMessage::Close(None)).await;
+    let _ = b_tx.send(TsMessage::Close(None)).await;
+    let _ = c_tx.send(TsMessage::Close(None)).await;
 }

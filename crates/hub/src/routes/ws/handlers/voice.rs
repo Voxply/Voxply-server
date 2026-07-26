@@ -659,6 +659,40 @@ pub(in crate::routes::ws) async fn handle_voice_whisper_stop(
     DispatchResult::Continue
 }
 
+/// Sender opts in or out of RECEIVING whispers (whisper.md). Only affects
+/// resolution of the sender as a whisper *target* -- they can still start
+/// whispers of their own while opted out. Re-resolves every active whisper
+/// session afterward (same call used on voice join/leave) so an opt-out
+/// immediately drops the sender from any live target set and an opt-back-in
+/// immediately adds them back, without waiting for the whisperer to send a
+/// fresh `voice_whisper_start`. Note: like the join/leave re-resolution
+/// paths, this updates the resolved target-set state only -- it does not
+/// itself push a fresh `voice_whisper_started`/`stopped` notification to the
+/// affected pubkey (that diffing is not yet implemented for any
+/// re-resolution trigger).
+pub(in crate::routes::ws) async fn handle_voice_whisper_optout(
+    cs: &ConnState,
+    state: &Arc<AppState>,
+    msg: WsClientMessage,
+) -> DispatchResult {
+    let enabled = match msg {
+        WsClientMessage::VoiceWhisperOptout { enabled } => enabled,
+        _ => return DispatchResult::Continue,
+    };
+
+    {
+        let mut optouts = state.whisper_optouts.write().await;
+        if enabled {
+            optouts.insert(cs.public_key.clone());
+        } else {
+            optouts.remove(&cs.public_key);
+        }
+    }
+
+    re_resolve_whisper_sessions(state).await;
+    DispatchResult::Continue
+}
+
 /// Sends a `voice_move`-context `Error` back to the mover on `ws_tx`.
 async fn send_voice_move_error(ws_tx: &mut WsTx, message: impl Into<String>) -> DispatchResult {
     let err = WsServerMessage::Error {

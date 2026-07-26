@@ -1073,6 +1073,7 @@ async fn main() -> Result<()> {
         started_at: std::time::Instant::now(),
         whisper_targets: RwLock::new(HashMap::new()),
         whisper_target_defs: RwLock::new(HashMap::new()),
+        whisper_optouts: RwLock::new(std::collections::HashSet::new()),
         whisper_target_pubkeys: RwLock::new(HashMap::new()),
         voice_relay_active: RwLock::new(std::collections::HashSet::new()),
         staging_voice_grants: RwLock::new(HashMap::new()),

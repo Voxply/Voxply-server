@@ -53,6 +53,7 @@ async fn setup() -> (common::TestHarness, Identity) {
         started_at: std::time::Instant::now(),
         whisper_targets: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         whisper_target_defs: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+        whisper_optouts: tokio::sync::RwLock::new(std::collections::HashSet::new()),
         voice_relay_active: tokio::sync::RwLock::new(std::collections::HashSet::new()),
         staging_voice_grants: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         voice_pending_binds: tokio::sync::RwLock::new(std::collections::HashMap::new()),

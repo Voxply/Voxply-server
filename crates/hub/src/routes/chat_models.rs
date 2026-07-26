@@ -567,6 +567,11 @@ pub enum WsClientMessage {
     #[serde(rename = "voice_whisper_stop")]
     VoiceWhisperStop,
 
+    /// Sender opts in or out of RECEIVING whispers (whisper.md). Does not
+    /// affect the sender's ability to start whispers of their own.
+    #[serde(rename = "voice_whisper_optout")]
+    VoiceWhisperOptout { enabled: bool },
+
     /// Request that the hub ask `target_pubkey` to leave-and-join
     /// `target_channel_id` (events.md §7.1). `event_id` is present when the
     /// move is driven by a staging panel (Phase 2); absent for the generic

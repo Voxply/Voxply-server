@@ -714,6 +714,9 @@ async fn dispatch_client_msg(
             voice::handle_voice_whisper_start(cs, state, msg).await
         }
         WsClientMessage::VoiceWhisperStop => voice::handle_voice_whisper_stop(cs, state).await,
+        WsClientMessage::VoiceWhisperOptout { .. } => {
+            voice::handle_voice_whisper_optout(cs, state, msg).await
+        }
         WsClientMessage::VoiceMove { .. } => voice::handle_voice_move(cs, state, ws_tx, msg).await,
 
         // ── Proximity voice ────────────────────────────────────────────────

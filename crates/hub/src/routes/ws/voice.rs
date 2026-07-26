@@ -55,11 +55,15 @@ pub(super) async fn resolve_whisper_targets(
     defs: &[crate::state::WhisperTargetDef],
     exclude_addr: std::net::SocketAddr,
 ) -> HashSet<std::net::SocketAddr> {
+    let optouts = state.whisper_optouts.read().await;
     let voice_channels = state.voice_channels.read().await;
     let mut addrs = HashSet::new();
     for def in defs {
         match def.target_type.as_str() {
             "user" => {
+                if optouts.contains(&def.id) {
+                    continue;
+                }
                 // Search all channels for the target pubkey.
                 for participants in voice_channels.values() {
                     if let Some(addr) = participants.get(&def.id) {
@@ -71,8 +75,8 @@ pub(super) async fn resolve_whisper_targets(
             }
             "channel" => {
                 if let Some(participants) = voice_channels.get(&def.id) {
-                    for addr in participants.values() {
-                        if *addr != exclude_addr {
+                    for (pk, addr) in participants.iter() {
+                        if *addr != exclude_addr && !optouts.contains(pk) {
                             addrs.insert(*addr);
                         }
                     }
@@ -97,9 +101,13 @@ pub(super) async fn resolve_role_addrs(
             .await
             .unwrap_or_default();
 
+    let optouts = state.whisper_optouts.read().await;
     let voice_channels = state.voice_channels.read().await;
     let mut addrs = HashSet::new();
     for pk in &role_users {
+        if optouts.contains(pk) {
+            continue;
+        }
         for participants in voice_channels.values() {
             if let Some(addr) = participants.get(pk.as_str()) {
                 if *addr != exclude_addr {
@@ -143,18 +151,23 @@ pub(super) async fn resolve_whisper_target_pubkeys(
     defs: &[crate::state::WhisperTargetDef],
     exclude_pubkey: &str,
 ) -> HashSet<String> {
+    let optouts = state.whisper_optouts.read().await;
     let mut pks = HashSet::new();
     {
         let vc = state.voice_channels.read().await;
         for def in defs {
             match def.target_type.as_str() {
                 "user" => {
-                    pks.insert(def.id.clone());
+                    if !optouts.contains(&def.id) {
+                        pks.insert(def.id.clone());
+                    }
                 }
                 "channel" => {
                     if let Some(p) = vc.get(&def.id) {
                         for pk in p.keys() {
-                            pks.insert(pk.clone());
+                            if !optouts.contains(pk) {
+                                pks.insert(pk.clone());
+                            }
                         }
                     }
                 }
@@ -164,7 +177,11 @@ pub(super) async fn resolve_whisper_target_pubkeys(
     }
     for def in defs {
         if def.target_type == "role" {
-            pks.extend(resolve_role_pubkeys(state, &def.id).await);
+            for pk in resolve_role_pubkeys(state, &def.id).await {
+                if !optouts.contains(&pk) {
+                    pks.insert(pk);
+                }
+            }
         }
     }
     pks.remove(exclude_pubkey);

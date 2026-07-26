@@ -62,6 +62,7 @@ async fn make_state() -> (Arc<AppState>, common::TestDbGuard) {
         started_at: std::time::Instant::now(),
         whisper_targets: RwLock::new(HashMap::new()),
         whisper_target_defs: RwLock::new(HashMap::new()),
+        whisper_optouts: RwLock::new(std::collections::HashSet::new()),
         voice_relay_active: RwLock::new(std::collections::HashSet::new()),
         staging_voice_grants: RwLock::new(std::collections::HashMap::new()),
         voice_pending_binds: RwLock::new(HashMap::new()),
