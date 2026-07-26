@@ -16,7 +16,6 @@ pub use traits::events::EventStore;
 pub use traits::federation::FederationStore;
 pub use traits::invites::InviteStore;
 pub use traits::messages::MessageStore;
-pub use traits::migrate::Migrate;
 pub use traits::moderation::ModerationStore;
 pub use traits::polls::PollStore;
 pub use traits::recovery::RecoveryStore;
@@ -44,7 +43,6 @@ pub trait HubStore:
     + BadgeStore
     + RecoveryStore
     + UploadStore
-    + Migrate
     + Send
     + Sync
 {
@@ -68,7 +66,6 @@ impl<T> HubStore for T where
         + BadgeStore
         + RecoveryStore
         + UploadStore
-        + Migrate
         + Send
         + Sync
 {
@@ -77,7 +74,6 @@ impl<T> HubStore for T where
 // ── concrete PostgreSQL implementation (was wavvon-store-postgres) ─────────
 mod error_map;
 mod impls;
-pub mod migrations;
 
 use sqlx::PgPool;
 

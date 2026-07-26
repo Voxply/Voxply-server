@@ -8,7 +8,6 @@ pub mod events;
 pub mod federation;
 pub mod invites;
 pub mod messages;
-pub mod migrate;
 pub mod moderation;
 pub mod polls;
 pub mod recovery;
