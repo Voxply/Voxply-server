@@ -429,10 +429,28 @@ pub(super) async fn handle_socket(
             // ── DM events ────────────────────────────────────────────────
             dm_result = dm_rx.recv() => {
                 if let Ok(dm) = dm_result {
+                    // `my_conversations` is loaded once at connect, so keep it
+                    // live from membership events: without this, a conversation
+                    // created after this connection opened would be dead air
+                    // (every event for it dropped by the gate below) until the
+                    // client reconnects. Removal happens after delivery so the
+                    // removed member still receives their final MemberChanged.
+                    let mut removed_from = None;
+                    if let crate::state::DmEvent::MemberChanged { conversation_id, added, removed, .. } = &dm {
+                        if added.iter().any(|k| k == &cs.public_key) {
+                            cs.my_conversations.insert(conversation_id.clone());
+                        }
+                        if removed.iter().any(|k| k == &cs.public_key) {
+                            removed_from = Some(conversation_id.clone());
+                        }
+                    }
                     if (dm.suppress_echo() && dm.sender() == cs.public_key)
                         || !cs.my_conversations.contains(dm.conversation_id())
                     {
                         continue;
+                    }
+                    if let Some(conv_id) = removed_from {
+                        cs.my_conversations.remove(&conv_id);
                     }
                     let reply = match dm {
                         crate::state::DmEvent::Message {
