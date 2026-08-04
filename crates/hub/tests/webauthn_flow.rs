@@ -70,6 +70,7 @@ async fn make_state() -> (Arc<AppState>, common::TestDbGuard) {
         peer_tokens: RwLock::new(HashMap::new()),
         http_client: reqwest::Client::new(),
         voice_channels: RwLock::new(HashMap::new()),
+        voice_last_active: RwLock::new(HashMap::new()),
         voice_addr_map: RwLock::new(HashMap::new()),
         whisper_target_pubkeys: RwLock::new(HashMap::new()),
         voice_sender_ids: RwLock::new(HashMap::new()),

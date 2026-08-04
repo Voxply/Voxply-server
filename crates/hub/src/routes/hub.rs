@@ -105,6 +105,37 @@ pub async fn update_hub(
         )
         .await?;
     }
+    if let Some(channel_id) = req.afk_channel_id.as_deref() {
+        if channel_id.is_empty() {
+            // Empty string clears the setting, matching the convention used
+            // by `icon` and `default_invite_role_id` above.
+            upsert_setting(&state.db, "afk_channel_id", "").await?;
+        } else {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM channels WHERE id = $1 AND is_category = false)",
+            )
+            .bind(channel_id)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+            if !exists {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "afk_channel_id does not reference an existing channel".to_string(),
+                ));
+            }
+            upsert_setting(&state.db, "afk_channel_id", channel_id).await?;
+        }
+    }
+    if let Some(secs) = req.afk_timeout_secs {
+        if secs < 60 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "afk_timeout_secs must be at least 60".to_string(),
+            ));
+        }
+        upsert_setting(&state.db, "afk_timeout_secs", &secs.to_string()).await?;
+    }
 
     let json: std::sync::Arc<str> = std::sync::Arc::from(
         serde_json::to_string(&crate::routes::chat_models::WsServerMessage::HubUpdated)
@@ -333,6 +364,15 @@ pub async fn get_hub_settings(
         .map(|v| v == "true")
         .unwrap_or(true);
 
+    let afk_channel_id: Option<String> = read_setting(&state.db, "afk_channel_id")
+        .await
+        .filter(|v| !v.is_empty());
+
+    let afk_timeout_secs: u32 = read_setting(&state.db, "afk_timeout_secs")
+        .await
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_AFK_TIMEOUT_SECS);
+
     Ok(Json(HubSettings {
         require_approval,
         invite_only,
@@ -341,8 +381,14 @@ pub async fn get_hub_settings(
         default_invite_role_id,
         timezone,
         birthdays_enabled,
+        afk_channel_id,
+        afk_timeout_secs,
     }))
 }
+
+/// Default idle threshold for the AFK sweep when a channel is configured but
+/// the timeout was never set explicitly (matches Discord's 5-minute default).
+pub const DEFAULT_AFK_TIMEOUT_SECS: u32 = 300;
 
 #[derive(Serialize, Deserialize)]
 pub struct HubSettings {
@@ -362,6 +408,17 @@ pub struct HubSettings {
     /// when never set.
     #[serde(default = "default_true")]
     pub birthdays_enabled: bool,
+    /// AFK channel idle voice participants are auto-moved into. `null` when
+    /// unset (sweep disabled).
+    #[serde(default)]
+    pub afk_channel_id: Option<String>,
+    /// Idle threshold for the AFK sweep, in seconds.
+    #[serde(default = "default_afk_timeout")]
+    pub afk_timeout_secs: u32,
+}
+
+fn default_afk_timeout() -> u32 {
+    DEFAULT_AFK_TIMEOUT_SECS
 }
 
 fn default_true() -> bool {
@@ -437,6 +494,15 @@ pub struct UpdateHubRequest {
     /// birthday via PATCH /me is rejected while this is false.
     #[serde(default)]
     pub birthdays_enabled: Option<bool>,
+    /// AFK channel (afk-channel): voice participants idle past
+    /// `afk_timeout_secs` are auto-moved here by `afk_worker`. Must reference
+    /// an existing non-category channel. Empty string clears the setting
+    /// (disabling the sweep).
+    #[serde(default)]
+    pub afk_channel_id: Option<String>,
+    /// Idle threshold for the AFK sweep, in seconds. Minimum 60.
+    #[serde(default)]
+    pub afk_timeout_secs: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -549,7 +615,7 @@ pub async fn birthdays_enabled(db: &sqlx::PgPool) -> bool {
         .unwrap_or(true)
 }
 
-async fn read_setting(db: &sqlx::PgPool, key: &str) -> Option<String> {
+pub(crate) async fn read_setting(db: &sqlx::PgPool, key: &str) -> Option<String> {
     sqlx::query_scalar::<_, String>("SELECT value FROM hub_settings WHERE key = $1")
         .bind(key)
         .fetch_optional(db)

@@ -1,3 +1,4 @@
+pub mod afk_worker;
 pub mod auth;
 pub mod banlist_worker;
 pub mod bootstrap;

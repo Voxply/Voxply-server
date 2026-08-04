@@ -312,6 +312,12 @@ pub(in crate::routes::ws) async fn handle_voice_join(
         .entry(channel_id.clone())
         .or_default()
         .insert(cs.public_key.clone(), sentinel);
+    // Joining counts as activity for the AFK sweep — a joiner who never
+    // speaks still gets the full timeout before being moved.
+    state.voice_last_active.write().await.insert(
+        cs.public_key.clone(),
+        crate::auth::handlers::unix_timestamp(),
+    );
     // voice_addr_map is NOT updated here; it is updated by the VXRG handler.
     state
         .voice_relay_active
@@ -541,6 +547,13 @@ pub(in crate::routes::ws) async fn handle_voice_speaking(
         } => (channel_id, speaking),
         _ => return DispatchResult::Continue,
     };
+    // Any speaking transition (start or stop) is activity for the AFK
+    // sweep. Stamped before the invisibility gate below — invisible
+    // participants talk too.
+    state.voice_last_active.write().await.insert(
+        cs.public_key.clone(),
+        crate::auth::handlers::unix_timestamp(),
+    );
     // A speaking indicator for a hidden participant would out them — same
     // gate as the join/leave broadcasts. Their audio still relays.
     if crate::routes::users::is_invisible(&state.db, &cs.public_key).await {

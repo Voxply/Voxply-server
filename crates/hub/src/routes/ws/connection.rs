@@ -841,6 +841,7 @@ pub async fn leave_voice_for_test(state: &AppState, public_key: &str, channel_id
 }
 
 pub async fn leave_voice(state: &AppState, public_key: &str, channel_id: &str) {
+    state.voice_last_active.write().await.remove(public_key);
     let (removed_addr, became_empty) = {
         let mut channels = state.voice_channels.write().await;
         let addr = channels

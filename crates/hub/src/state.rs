@@ -353,6 +353,15 @@ pub struct AppState {
     /// clients (which have no stable UDP addr).
     pub whisper_target_pubkeys: RwLock<HashMap<String, HashSet<String>>>,
 
+    /// pubkey → unix timestamp of last voice activity (join or a
+    /// `voice_speaking` message). Drives the AFK sweep in `afk_worker`:
+    /// a participant whose stamp is older than the hub's `afk_timeout_secs`
+    /// gets a `voice_move` push into the configured AFK channel.
+    ///
+    /// Ephemeral, in-memory only. Stamped on `VoiceJoin` and on every
+    /// `VoiceSpeaking` message; removed by `leave_voice`.
+    pub voice_last_active: RwLock<HashMap<String, i64>>,
+
     /// Pubkeys that have opted out of RECEIVING whispers (whisper.md).
     /// Ephemeral, in-memory only -- resets on hub restart. Consulted at the
     /// top of every whisper-target resolution function (`resolve_whisper_targets`,

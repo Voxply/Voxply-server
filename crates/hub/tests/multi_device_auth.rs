@@ -30,6 +30,7 @@ async fn setup() -> (common::TestHarness, PgPool) {
         federation_client: FederationClient::new(),
         peer_tokens: RwLock::new(HashMap::new()),
         voice_channels: RwLock::new(HashMap::new()),
+        voice_last_active: RwLock::new(HashMap::new()),
         voice_addr_map: RwLock::new(HashMap::new()),
         whisper_target_pubkeys: RwLock::new(HashMap::new()),
         voice_sender_ids: RwLock::new(HashMap::new()),

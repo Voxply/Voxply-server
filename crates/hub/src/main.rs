@@ -1054,6 +1054,7 @@ async fn main() -> Result<()> {
         peer_tokens: RwLock::new(HashMap::new()),
         http_client,
         voice_channels: RwLock::new(HashMap::new()),
+        voice_last_active: RwLock::new(HashMap::new()),
         voice_addr_map: RwLock::new(HashMap::new()),
         voice_sender_ids: RwLock::new(HashMap::new()),
         voice_next_sender_id: RwLock::new(HashMap::new()),
@@ -1366,6 +1367,9 @@ async fn main() -> Result<()> {
 
     // Sweep messages and forum posts past their channel retention deadline.
     wavvon_hub::retention_worker::spawn(state.clone());
+
+    // Auto-move idle voice participants into the configured AFK channel.
+    wavvon_hub::afk_worker::spawn(state.clone());
 
     // Sync federated ban lists from subscribed sources every 6 hours.
     wavvon_hub::banlist_worker::spawn(state.clone());

@@ -364,6 +364,7 @@ async fn start_real_hub_with_state(name: &str) -> (String, Arc<AppState>, common
         federation_client: FederationClient::new(),
         peer_tokens: RwLock::new(HashMap::new()),
         voice_channels: RwLock::new(HashMap::new()),
+        voice_last_active: RwLock::new(HashMap::new()),
         voice_addr_map: RwLock::new(HashMap::new()),
         whisper_target_pubkeys: RwLock::new(HashMap::new()),
         voice_sender_ids: RwLock::new(HashMap::new()),
