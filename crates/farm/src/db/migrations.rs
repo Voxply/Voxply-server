@@ -199,5 +199,12 @@ pub async fn run(pool: &PgPool) -> Result<()> {
         .execute(pool)
         .await;
 
+    // Voice transport v2 (voice-transport-v2.md): per-hub voice
+    // (WebTransport/QUIC over UDP) port, allocated alongside process_port so
+    // farm-spawned hubs on the same box don't collide on the default 3001.
+    let _ = sqlx::query("ALTER TABLE hubs ADD COLUMN voice_port INTEGER")
+        .execute(pool)
+        .await;
+
     Ok(())
 }

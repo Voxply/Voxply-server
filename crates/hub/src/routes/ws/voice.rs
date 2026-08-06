@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::routes::chat_models::{
     ChatEvent, VoiceParticipantInfo, VoiceRosterEntry, WsServerMessage,
@@ -57,6 +57,13 @@ pub async fn get_voice_participants(
         participants.keys().cloned().collect()
     };
     let invisible = crate::routes::users::invisible_subset(&state.db, &keys).await;
+    let sender_ids: HashMap<String, u16> = state
+        .voice_sender_ids
+        .read()
+        .await
+        .get(channel_id)
+        .cloned()
+        .unwrap_or_default();
 
     let mut result = Vec::new();
     for pk in keys
@@ -80,86 +87,15 @@ pub async fn get_voice_participants(
             public_key: pk.clone(),
             display_name,
             is_bot,
+            sender_id: sender_ids.get(pk).copied(),
         });
     }
     result
 }
 
-/// Resolve "user" and "channel" target defs into SocketAddrs.
-/// Role targets require a DB query and must be handled by the caller via `resolve_role_addrs`.
-pub(super) async fn resolve_whisper_targets(
-    state: &AppState,
-    defs: &[crate::state::WhisperTargetDef],
-    exclude_addr: std::net::SocketAddr,
-) -> HashSet<std::net::SocketAddr> {
-    let optouts = state.whisper_optouts.read().await;
-    let voice_channels = state.voice_channels.read().await;
-    let mut addrs = HashSet::new();
-    for def in defs {
-        match def.target_type.as_str() {
-            "user" => {
-                if optouts.contains(&def.id) {
-                    continue;
-                }
-                // Search all channels for the target pubkey.
-                for participants in voice_channels.values() {
-                    if let Some(addr) = participants.get(&def.id) {
-                        if *addr != exclude_addr {
-                            addrs.insert(*addr);
-                        }
-                    }
-                }
-            }
-            "channel" => {
-                if let Some(participants) = voice_channels.get(&def.id) {
-                    for (pk, addr) in participants.iter() {
-                        if *addr != exclude_addr && !optouts.contains(pk) {
-                            addrs.insert(*addr);
-                        }
-                    }
-                }
-            }
-            _ => {} // "role" handled separately; unknown types silently ignored
-        }
-    }
-    addrs
-}
-
-/// Resolve all users with `role_id` that are currently in voice into SocketAddrs.
-pub(super) async fn resolve_role_addrs(
-    state: &AppState,
-    role_id: &str,
-    exclude_addr: std::net::SocketAddr,
-) -> HashSet<std::net::SocketAddr> {
-    let role_users: Vec<String> =
-        sqlx::query_scalar("SELECT user_public_key FROM user_roles WHERE role_id = $1")
-            .bind(role_id)
-            .fetch_all(&state.db)
-            .await
-            .unwrap_or_default();
-
-    let optouts = state.whisper_optouts.read().await;
-    let voice_channels = state.voice_channels.read().await;
-    let mut addrs = HashSet::new();
-    for pk in &role_users {
-        if optouts.contains(pk) {
-            continue;
-        }
-        for participants in voice_channels.values() {
-            if let Some(addr) = participants.get(pk.as_str()) {
-                if *addr != exclude_addr {
-                    addrs.insert(*addr);
-                }
-            }
-        }
-    }
-    addrs
-}
-
 /// Resolve all users with `role_id` that are currently present in any voice
-/// channel into their pubkeys (UDP or WS -- unlike `resolve_role_addrs`, this
-/// doesn't need a real SocketAddr, so it also picks up WS-only participants,
-/// who register in `voice_channels` with the sentinel address).
+/// channel (roster membership — regardless of whether their WT session has
+/// bound yet) into their pubkeys.
 async fn resolve_role_pubkeys(state: &AppState, role_id: &str) -> HashSet<String> {
     let role_users: Vec<String> =
         sqlx::query_scalar("SELECT user_public_key FROM user_roles WHERE role_id = $1")
@@ -176,13 +112,11 @@ async fn resolve_role_pubkeys(state: &AppState, role_id: &str) -> HashSet<String
 }
 
 /// Resolve "user"/"channel"/"role" whisper target defs into the pubkey set
-/// used for pubkey-keyed delivery (the WS voice relay's `voice_ws_senders`
-/// lookup in `voice_ws.rs` and the UDP relay's whisper branch in `main.rs`) --
-/// this is what makes a whisper reach a web (WS-only) listener, which has no
-/// stable UDP `SocketAddr` for the `resolve_whisper_targets`/`resolve_role_addrs`
-/// machinery above to resolve. Shared by the initial resolution in
-/// `handle_voice_whisper_start` and the membership-change rebuild in
-/// `re_resolve_whisper_sessions` below, so both stay in sync.
+/// used for pubkey-keyed delivery (the WT relay's whisper routing in
+/// `voice_wt.rs`, keyed by pubkey since every session is). Shared by the
+/// initial resolution in `handle_voice_whisper_start` and the
+/// membership-change rebuild in `re_resolve_whisper_sessions` below, so both
+/// stay in sync.
 pub(super) async fn resolve_whisper_target_pubkeys(
     state: &AppState,
     defs: &[crate::state::WhisperTargetDef],
@@ -225,10 +159,10 @@ pub(super) async fn resolve_whisper_target_pubkeys(
     pks
 }
 
-/// Walk every active whisper session and rebuild its resolved SocketAddr set from stored defs.
-/// Called after any VoiceJoin or VoiceLeave (and whisper opt-out toggling) so
-/// the live target set stays correct. Also diffs the pubkey-keyed target set
-/// against its previous value and pushes targeted `voice_whisper_started` /
+/// Walk every active whisper session and rebuild its resolved pubkey target
+/// set from stored defs. Called after any VoiceJoin or VoiceLeave (and
+/// whisper opt-out toggling) so the live target set stays correct. Diffs
+/// against the previous value and pushes targeted `voice_whisper_started` /
 /// `voice_whisper_stopped` notifications to exactly the added/removed
 /// recipients (whisper.md "New WS envelopes" — never a broadcast, and never a
 /// duplicate notification to someone whose membership didn't change).
@@ -244,35 +178,19 @@ pub(super) async fn re_resolve_whisper_sessions(state: &AppState) {
             .collect()
     };
     for (sender_pk, defs) in defs_map {
-        // Find the sender's current channel + SocketAddr (they may have just left voice).
-        let sender_loc = {
+        // Find the sender's current channel (they may have just left voice).
+        let channel_id = {
             let vc = state.voice_channels.read().await;
             vc.iter()
-                .find_map(|(cid, p)| p.get(&sender_pk).map(|addr| (cid.clone(), *addr)))
+                .find_map(|(cid, p)| p.contains_key(&sender_pk).then(|| cid.clone()))
         };
-        let (channel_id, sender_addr) = match sender_loc {
-            Some(v) => v,
-            None => {
-                // Sender is no longer in voice; their session (and the
-                // stop-notification to prior recipients) is handled by
-                // `leave_voice`'s own whisper teardown.
-                continue;
-            }
+        let Some(channel_id) = channel_id else {
+            // Sender is no longer in voice; their session (and the
+            // stop-notification to prior recipients) is handled by
+            // `leave_voice`'s own whisper teardown.
+            continue;
         };
-        let mut new_addrs = resolve_whisper_targets(state, &defs, sender_addr).await;
-        for def in &defs {
-            if def.target_type == "role" {
-                new_addrs.extend(resolve_role_addrs(state, &def.id, sender_addr).await);
-            }
-        }
-        state
-            .whisper_targets
-            .write()
-            .await
-            .insert(sender_pk.clone(), new_addrs);
 
-        // Keep the pubkey-keyed set (WS delivery) in sync with the same defs,
-        // diffing against the previous set to notify only what changed.
         let new_pks = resolve_whisper_target_pubkeys(state, &defs, &sender_pk).await;
         let old_pks = state
             .whisper_target_pubkeys
@@ -293,8 +211,8 @@ pub(super) async fn re_resolve_whisper_sessions(state: &AppState) {
 /// `target_channel_id` differs from `joined_channel_id` and belongs to an
 /// event that hasn't ended yet (`ends_at IS NULL OR ends_at > now`).
 ///
-/// Called from both voice-join paths (`routes/ws/handlers/voice.rs` and
-/// `routes/voice_ws.rs`) right after a join succeeds. Pushes a `voice_move`
+/// Called from the voice-join path (`routes/ws/handlers/voice.rs`) right
+/// after a join succeeds. Pushes a `voice_move`
 /// exactly like a live move — creating a voice-only presence grant (§7.4)
 /// first if the target lacks `READ_MESSAGES` on the assigned channel. The
 /// assignment row is intentionally left in place (not consumed): a

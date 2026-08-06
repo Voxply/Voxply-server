@@ -313,23 +313,37 @@ async fn handle_agent_socket(socket: WebSocket, state: Arc<FarmState>) {
                             val.get("hub_id").and_then(|v| v.as_str()),
                             val.get("port").and_then(|v| v.as_u64()),
                         ) {
+                            // voice_port is optional in the reply for backward
+                            // compatibility with older agents / test mocks —
+                            // when absent the column is left NULL and gets
+                            // backfilled by `FarmState::resolve_voice_port` on
+                            // the next restart.
+                            let voice_port = val.get("voice_port").and_then(|v| v.as_u64());
                             let _ = sqlx::query(
-                                "UPDATE hubs SET process_port = $1, server_id = $2 WHERE id = $3",
+                                "UPDATE hubs SET process_port = $1, voice_port = $2, server_id = $3 WHERE id = $4",
                             )
                             .bind(port as i32)
+                            .bind(voice_port.map(|v| v as i32))
                             .bind(&server_id)
                             .bind(hub_id)
                             .execute(&state.db)
                             .await;
-                            tracing::info!(server_id, hub_id, port, "Hub spawned on remote server");
+                            tracing::info!(
+                                server_id,
+                                hub_id,
+                                port,
+                                voice_port,
+                                "Hub spawned on remote server"
+                            );
                         }
                     } else if msg_type == "hub_stopped" {
                         if let Some(hub_id) = val.get("hub_id").and_then(|v| v.as_str()) {
-                            let _ =
-                                sqlx::query("UPDATE hubs SET process_port = NULL WHERE id = $1")
-                                    .bind(hub_id)
-                                    .execute(&state.db)
-                                    .await;
+                            let _ = sqlx::query(
+                                "UPDATE hubs SET process_port = NULL, voice_port = NULL WHERE id = $1",
+                            )
+                            .bind(hub_id)
+                            .execute(&state.db)
+                            .await;
                             tracing::info!(server_id, hub_id, "Hub stopped on remote server");
                         }
                     }

@@ -164,6 +164,7 @@ pub(super) async fn handle_socket(
     let mut cs = ConnState::new(
         public_key.clone(),
         is_bot,
+        is_mini_app,
         session_id.clone(),
         subscribed,
         my_conversations,
@@ -842,11 +843,12 @@ pub async fn leave_voice_for_test(state: &AppState, public_key: &str, channel_id
 
 pub async fn leave_voice(state: &AppState, public_key: &str, channel_id: &str) {
     state.voice_last_active.write().await.remove(public_key);
-    let (removed_addr, became_empty) = {
+    let (removed_session, became_empty) = {
         let mut channels = state.voice_channels.write().await;
-        let addr = channels
+        let session = channels
             .get_mut(channel_id)
-            .and_then(|participants| participants.remove(public_key));
+            .and_then(|participants| participants.remove(public_key))
+            .flatten();
         let mut became_empty = false;
         if let Some(participants) = channels.get(channel_id) {
             if participants.is_empty() {
@@ -854,7 +856,7 @@ pub async fn leave_voice(state: &AppState, public_key: &str, channel_id: &str) {
                 channels.remove(channel_id);
             }
         }
-        (addr, became_empty)
+        (session, became_empty)
     };
 
     if became_empty {
@@ -871,23 +873,17 @@ pub async fn leave_voice(state: &AppState, public_key: &str, channel_id: &str) {
         .execute(&state.db)
         .await;
     }
-    // Remove from voice_addr_map if this was a real bound address (not the sentinel 0.0.0.0:0).
-    if let Some(addr) = removed_addr {
-        let sentinel: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
-        if addr != sentinel {
-            state.voice_addr_map.write().await.remove(&addr);
-        }
+    // WS leave_voice is authoritative for roster (voice-transport-v2.md):
+    // proactively close any still-live WT session rather than leaving it to
+    // idle out on its own now that it has no roster entry.
+    if let Some(session) = removed_session {
+        session.close(wtransport::VarInt::from_u32(0), b"voice_leave");
     }
 
     // Remove any un-consumed pending bind for this pubkey.
     {
         let mut binds = state.voice_pending_binds.write().await;
         binds.retain(|_, v| v.pubkey != public_key);
-    }
-    // Remove any consumed-token record whose bound address maps to this pubkey.
-    {
-        let mut consumed = state.voice_consumed_tokens.write().await;
-        consumed.retain(|_, v| v.pubkey != public_key);
     }
 
     // An invisible participant was never announced as joined, so don't
@@ -969,7 +965,6 @@ pub async fn leave_voice(state: &AppState, public_key: &str, channel_id: &str) {
     // whisperer, notify the previously-resolved recipients so their
     // indicators clear -- the hub-routed audio is about to stop too since
     // this pubkey no longer has a voice_channels entry.
-    state.whisper_targets.write().await.remove(public_key);
     state.whisper_target_defs.write().await.remove(public_key);
     let prev_whisper_pks = state
         .whisper_target_pubkeys
@@ -986,14 +981,13 @@ pub async fn leave_voice(state: &AppState, public_key: &str, channel_id: &str) {
         );
     }
 
-    // Revoke the UDP relay slot.
+    // Revoke the voice relay slot.
     state.voice_relay_active.write().await.remove(public_key);
 
     // events.md §7.4: a voice-only presence grant for this exact
     // (pubkey, channel) pair evaporates on leave -- never persisted, never
-    // outlives the voice session. Both transports (main hub WS VoiceLeave
-    // and the /voice/ws relay's disconnect cleanup) funnel through this
-    // shared teardown.
+    // outlives the voice session. Both WS disconnect and explicit
+    // VoiceLeave funnel through this shared teardown.
     {
         let mut grants = state.staging_voice_grants.write().await;
         if let Some(set) = grants.get_mut(public_key) {

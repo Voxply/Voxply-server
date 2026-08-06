@@ -198,13 +198,13 @@ async fn start_hub_with(
         peer_tokens: RwLock::new(HashMap::new()),
         voice_channels: RwLock::new(HashMap::new()),
         voice_last_active: RwLock::new(HashMap::new()),
-        voice_addr_map: RwLock::new(HashMap::new()),
         whisper_target_pubkeys: RwLock::new(HashMap::new()),
         voice_sender_ids: RwLock::new(HashMap::new()),
         voice_next_sender_id: RwLock::new(HashMap::new()),
         voice_zones: RwLock::new(HashMap::new()),
         voice_udp_port: 0,
-        voice_udp_addr: None,
+        voice_wt_url: None,
+        voice_cert_hash: RwLock::new(None),
         voice_event_tx,
         dm_tx: broadcast::channel(16).0,
         online_users: RwLock::new(std::collections::HashMap::new()),
@@ -217,16 +217,12 @@ async fn start_hub_with(
         last_farm_pubkey_fetch: Arc::new(RwLock::new(0)),
         video_channels: RwLock::new(HashMap::new()),
         started_at: std::time::Instant::now(),
-        whisper_targets: RwLock::new(HashMap::new()),
         whisper_target_defs: RwLock::new(HashMap::new()),
         whisper_optouts: RwLock::new(std::collections::HashSet::new()),
         voice_relay_active: RwLock::new(std::collections::HashSet::new()),
         staging_voice_grants: RwLock::new(std::collections::HashMap::new()),
         voice_pending_binds: RwLock::new(HashMap::new()),
-        voice_consumed_tokens: RwLock::new(HashMap::new()),
-        voice_ws_senders: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         ws_key_senders: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-        voice_udp_socket: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
         rate_limiters: Default::default(),
         preview_cache: std::sync::Mutex::new(HashMap::new()),
         search: Arc::new(wavvon_hub::search::null_search::NullSearch),
@@ -613,6 +609,78 @@ async fn migration_backfills_grant_for_pre_existing_self_declared_bot() {
         wavvon_hub::bots::capabilities::has_capability(&db, bot_pubkey, "can_speak_voice").await,
         "backfill should grant the pre-existing self-declared capability"
     );
+}
+
+// ---------------------------------------------------------------------------
+// `can_speak_voice` gate at `voice_join` (soundboard.md §2). Re-applied to
+// the unified `voice_join` WS handler (`routes/ws/handlers/voice.rs`) as
+// part of voice-transport-v2.md — this gate used to live in the now-deleted
+// `/voice/ws` endpoint.
+// ---------------------------------------------------------------------------
+
+/// A bot without the `can_speak_voice` grant gets an error reply from
+/// `voice_join`, not a silent join.
+#[tokio::test]
+async fn bot_voice_join_rejected_without_can_speak_voice_grant() {
+    let (base, _state, _guard) = start_hub().await;
+
+    let owner = Identity::generate();
+    let owner_token = authenticate_http(&base, &owner).await;
+    let ch = create_channel(&base, &owner_token, "voice-ungranted").await;
+    let channel_id = ch["id"].as_str().unwrap().to_string();
+
+    let bot = Identity::generate();
+    let bot_token =
+        invite_and_auth_bot_http_with_caps(&base, &owner_token, &bot, &["can_speak_voice"]).await;
+    // Deliberately no grant — `requested` alone must not be sufficient.
+
+    let (mut bot_tx, mut bot_rx) = connect_ws(&base, &bot_token).await;
+    send_text(
+        &mut bot_tx,
+        json!({ "type": "voice_join", "channel_id": channel_id }),
+    )
+    .await;
+
+    let frame = next_meaningful_frame(&mut bot_rx, std::time::Duration::from_secs(2))
+        .await
+        .expect("expected an error reply");
+    assert_eq!(frame["type"], "error");
+    assert_eq!(frame["context"], "voice_join");
+}
+
+/// The same bot, once granted `can_speak_voice`, joins successfully.
+#[tokio::test]
+async fn bot_voice_join_succeeds_with_can_speak_voice_grant() {
+    let (base, _state, _guard) = start_hub().await;
+
+    let owner = Identity::generate();
+    let owner_token = authenticate_http(&base, &owner).await;
+    let ch = create_channel(&base, &owner_token, "voice-granted").await;
+    let channel_id = ch["id"].as_str().unwrap().to_string();
+
+    let bot = Identity::generate();
+    let bot_token =
+        invite_and_auth_bot_http_with_caps(&base, &owner_token, &bot, &["can_speak_voice"]).await;
+    grant_capabilities(
+        &base,
+        &owner_token,
+        &bot.public_key_hex(),
+        &["can_speak_voice"],
+    )
+    .await;
+
+    let (mut bot_tx, mut bot_rx) = connect_ws(&base, &bot_token).await;
+    send_text(
+        &mut bot_tx,
+        json!({ "type": "voice_join", "channel_id": channel_id }),
+    )
+    .await;
+
+    let frame = next_meaningful_frame(&mut bot_rx, std::time::Duration::from_secs(15))
+        .await
+        .expect("granted bot should join voice");
+    assert_eq!(frame["type"], "voice_joined");
+    assert_eq!(frame["channel_id"], channel_id);
 }
 
 // ---------------------------------------------------------------------------

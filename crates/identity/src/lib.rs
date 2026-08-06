@@ -3,6 +3,7 @@ mod master;
 mod pow;
 mod recovery;
 mod subkey;
+pub mod voice;
 mod wire;
 
 use anyhow::{Context, Result};
@@ -17,6 +18,10 @@ pub use ecies::{unwrap_blob_key, wrap_blob_key};
 pub use master::MasterIdentity;
 pub use pow::{compute_security_level, leading_zero_bits, verify_security_level};
 pub use subkey::DeviceSubkey;
+pub use voice::{
+    voice_key_unwrap, voice_key_wrap, voice_key_wrap_with_nonce, voice_packet_open,
+    voice_packet_seal,
+};
 pub use wire::{
     dm_envelope_signing_bytes, dr_envelope_signing_bytes, federated_plaintext_dm_signing_bytes,
     group_dm_envelope_signing_bytes, recovery_attestation_signing_bytes,
@@ -144,19 +149,26 @@ impl Identity {
     /// Uses the standard ed25519→x25519 conversion:
     /// SHA-512(seed)[0..32] → clamp → X25519 scalar.
     pub fn dh_keypair(&self) -> (x25519_dalek::StaticSecret, x25519_dalek::PublicKey) {
-        use sha2::{Digest, Sha512};
         let seed = self.signing_key.to_bytes();
-        let hash = Sha512::digest(seed);
-        let mut scalar = [0u8; 32];
-        scalar.copy_from_slice(&hash[..32]);
-        // X25519 clamping
-        scalar[0] &= 248;
-        scalar[31] &= 127;
-        scalar[31] |= 64;
-        let secret = x25519_dalek::StaticSecret::from(scalar);
+        let secret = ed25519_seed_to_x25519_secret(&seed);
         let public = x25519_dalek::PublicKey::from(&secret);
         (secret, public)
     }
+}
+
+/// Standard ed25519→x25519 conversion: SHA-512(seed)[0..32] → clamp →
+/// X25519 scalar. Canonical derivation shared by `Identity::dh_keypair`
+/// and every module (ecies, voice) that needs a static X25519 secret from
+/// a raw Ed25519 seed without constructing a full `Identity`.
+pub(crate) fn ed25519_seed_to_x25519_secret(seed: &[u8; 32]) -> x25519_dalek::StaticSecret {
+    use sha2::{Digest, Sha512};
+    let hash = Sha512::digest(seed);
+    let mut scalar = [0u8; 32];
+    scalar.copy_from_slice(&hash[..32]);
+    scalar[0] &= 248;
+    scalar[31] &= 127;
+    scalar[31] |= 64;
+    x25519_dalek::StaticSecret::from(scalar)
 }
 
 impl fmt::Display for Identity {

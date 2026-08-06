@@ -53,6 +53,10 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Computed early — before any partial move of `cfg`'s fields below makes
+    // a whole-struct method call on `cfg` impossible.
+    let voice_base_port = cfg.resolved_voice_base_port();
+
     let json_logs = cfg.log_format.to_lowercase() == "json";
 
     // Optional OpenTelemetry OTLP trace export.
@@ -192,6 +196,7 @@ async fn main() -> Result<()> {
         hub_bin,
         farm_url.clone(),
         cfg.hub_base_port,
+        voice_base_port,
     ));
     hub_manager.spawn_all_from_db(&db).await?;
 

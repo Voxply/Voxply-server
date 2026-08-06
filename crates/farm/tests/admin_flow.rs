@@ -52,6 +52,7 @@ async fn setup() -> (TestServer, Arc<FarmState>, common::TestDbGuard) {
         "wavvon-hub".to_string(),
         farm_url.to_string(),
         9100,
+        10100,
     ));
     let state = Arc::new(FarmState::new(
         db,

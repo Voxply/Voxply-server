@@ -168,8 +168,8 @@ pub(in crate::routes::ws) async fn handle_screen_share_start(
     };
 
     // Bot video injection (bot-capability-layer.md §3/§6 Phase 2): a bot
-    // pushes frames into this same screen-share relay, gated exactly like the
-    // shipped `can_speak_voice` voice gate (voice_ws.rs). Human sharers are
+    // pushes frames into this same screen-share relay, gated the same shape
+    // as the shipped `can_speak_voice` voice capability. Human sharers are
     // unaffected by this branch entirely.
     if cs.is_bot {
         // Gate 1: admin grant. Reads the *effective* capability set
@@ -201,7 +201,7 @@ pub(in crate::routes::ws) async fn handle_screen_share_start(
             return DispatchResult::Continue;
         }
 
-        // Gate 3: channel-scoped READ_MESSAGES, same rule as voice_ws.rs.
+        // Gate 3: channel-scoped READ_MESSAGES, same rule as voice join.
         match crate::permissions::channel_permissions(&state.db, &cs.public_key, &channel_id).await
         {
             Ok(perms) if perms.has(crate::permissions::READ_MESSAGES) => {}

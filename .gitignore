@@ -1,4 +1,4 @@
-/target
+﻿/target
 /target-test
 .claude/
 .obsidian/
@@ -10,6 +10,7 @@ demo-credentials.json
 hub_identity.json
 *.pem
 *.key
+voice_wt_cert*
 .env
 # Tantivy search index (runtime artifact)
 **/*.search/

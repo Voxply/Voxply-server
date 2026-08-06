@@ -6,7 +6,7 @@ use anyhow::{anyhow, Result};
 use hkdf::Hkdf;
 use rand::rngs::OsRng;
 use rand::RngCore;
-use sha2::{Digest, Sha256, Sha512};
+use sha2::Sha256;
 
 const ECIES_INFO: &[u8] = b"wavvon/ecies/v1";
 
@@ -85,13 +85,7 @@ pub fn unwrap_blob_key(wrapped_hex: &str, recipient_ed25519_seed: &[u8; 32]) -> 
     let ct = &bytes[44..92]; // 48 bytes (32 + 16 tag)
 
     // 3. Ed25519 seed → X25519 scalar (standard conversion)
-    let hash = Sha512::digest(recipient_ed25519_seed);
-    let mut scalar = [0u8; 32];
-    scalar.copy_from_slice(&hash[..32]);
-    scalar[0] &= 248;
-    scalar[31] &= 127;
-    scalar[31] |= 64;
-    let x25519_priv = x25519_dalek::StaticSecret::from(scalar);
+    let x25519_priv = crate::ed25519_seed_to_x25519_secret(recipient_ed25519_seed);
 
     // 4. ECDH
     let eph_pub = x25519_dalek::PublicKey::from(eph_pub_bytes);

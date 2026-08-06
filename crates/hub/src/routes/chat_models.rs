@@ -418,7 +418,7 @@ pub enum WsClientMessage {
     #[serde(rename = "unsubscribe")]
     Unsubscribe { channel_id: String },
     #[serde(rename = "voice_join")]
-    VoiceJoin { channel_id: String, udp_port: u16 },
+    VoiceJoin { channel_id: String },
     #[serde(rename = "voice_watch")]
     VoiceWatch { channel_id: String },
     #[serde(rename = "voice_unwatch")]
@@ -704,12 +704,24 @@ pub enum WsServerMessage {
     #[serde(rename = "voice_joined")]
     VoiceJoined {
         channel_id: String,
-        hub_udp_port: u16,
+        /// The joiner's own numeric relay id in this channel (also present
+        /// in their `participants` entry; duplicated top-level so clients
+        /// don't have to self-locate by pubkey).
+        sender_id: u16,
         participants: Vec<VoiceParticipantInfo>,
-        /// Single-use token the client sends in a UDP VXRG register packet so
-        /// the hub can learn the client's real public source address.  Delivered
-        /// confidentially over the authenticated TLS WebSocket; 30-second TTL.
-        udp_register_token: String,
+        /// Single-use token the client presents when opening its WebTransport
+        /// session (`voice_wt_url?token=<hex>`) so the hub can bind the
+        /// session to (channel_id, pubkey). Delivered confidentially over
+        /// the authenticated TLS WebSocket; 30-second TTL.
+        voice_token: String,
+        /// Absolute `https://host:port/voice` URL for this hub's WebTransport
+        /// voice endpoint (voice-transport-v2.md). Built from the same
+        /// advertise host as the old `voice_udp_addr`.
+        voice_wt_url: String,
+        /// Hex SHA-256 digest of the WT endpoint's current certificate, for
+        /// `WebTransportOptions.serverCertificateHashes` (self-signed tier).
+        /// `None` when a CA-issued cert is in use.
+        voice_cert_hash: Option<String>,
     },
     #[serde(rename = "voice_participant_joined")]
     VoiceParticipantJoined {
@@ -1119,6 +1131,12 @@ pub struct VoiceParticipantInfo {
     pub display_name: Option<String>,
     #[serde(default)]
     pub is_bot: bool,
+    /// Numeric relay id for this participant in the channel — the id
+    /// carried in every downlink datagram header. Clients seed their
+    /// sender_id→pubkey map from `voice_joined.participants`, so this
+    /// must be present there (voice-transport-v2.md).
+    #[serde(default)]
+    pub sender_id: Option<u16>,
 }
 
 #[derive(Serialize, Clone)]

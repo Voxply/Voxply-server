@@ -368,11 +368,13 @@ pub async fn create_hub(
     // Try to delegate to a connected server agent; fall back to local spawn.
     let launched = if let Some((server_id, sender)) = pick_agent(&state.agent_senders).await {
         let port = state.hub_manager.allocate_port().await;
+        let voice_port = state.hub_manager.allocate_voice_port().await;
         let cmd = serde_json::json!({
             "type": "spawn_hub",
             "hub_id": hub_id,
             "db_path": db_path,
             "port": port,
+            "voice_port": voice_port,
             "owner_pubkey": payload.sub,
             "farm_url": state.farm_url,
         });
@@ -394,7 +396,9 @@ pub async fn create_hub(
             .allocate_and_spawn(&state.db, &hub_id, &db_path, Some(payload.sub.as_str()))
             .await
         {
-            Ok(port) => tracing::info!(hub_id, port, "Hub spawned locally"),
+            Ok((port, voice_port)) => {
+                tracing::info!(hub_id, port, voice_port, "Hub spawned locally")
+            }
             Err(e) => tracing::warn!(hub_id, error = %e, "Hub spawn failed"),
         }
     }
@@ -557,8 +561,9 @@ pub async fn force_restart_hub(
         ));
     }
 
-    let row: Option<(String, Option<i32>, Option<String>, String)> = sqlx::query_as(
-        "SELECT db_path, process_port, server_id, owner_pubkey FROM hubs
+    #[allow(clippy::type_complexity)]
+    let row: Option<(String, Option<i32>, Option<i32>, Option<String>, String)> = sqlx::query_as(
+        "SELECT db_path, process_port, voice_port, server_id, owner_pubkey FROM hubs
          WHERE id = $1 AND deleted_at IS NULL",
     )
     .bind(&hub_id)
@@ -571,7 +576,7 @@ pub async fn force_restart_hub(
         )
     })?;
 
-    let (db_path, process_port, server_id, owner_pubkey) = row.ok_or_else(|| {
+    let (db_path, process_port, voice_port, server_id, owner_pubkey) = row.ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "hub_not_found"})),
@@ -585,6 +590,8 @@ pub async fn force_restart_hub(
         ));
     };
 
+    let voice_port = state.resolve_voice_port(&hub_id, voice_port).await;
+
     if let Some(server_id) = server_id {
         // Agent-hosted hub — delegate the restart over the agent's WebSocket.
         if state
@@ -593,6 +600,7 @@ pub async fn force_restart_hub(
                 &hub_id,
                 &db_path,
                 port as u16,
+                voice_port,
                 Some(&owner_pubkey),
             )
             .await
@@ -610,7 +618,7 @@ pub async fn force_restart_hub(
         // 500 — it's logged, and the fleet view already surfaces online status.
         if let Err(e) = state
             .hub_manager
-            .restart_hub(&hub_id, &db_path, port as u16)
+            .restart_hub(&hub_id, &db_path, port as u16, voice_port)
             .await
         {
             tracing::warn!(hub_id, error = %e, "Force-restart failed to spawn hub process");

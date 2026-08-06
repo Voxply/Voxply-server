@@ -156,7 +156,8 @@ pub async fn info(State(state): State<Arc<AppState>>) -> Json<InfoResponse> {
         lan_fingerprint: state.lan_fingerprint.clone(),
         welcome_label,
         welcome_invite_url,
-        voice_udp_addr: state.voice_udp_addr.clone(),
+        voice_wt_url: state.voice_wt_url.clone(),
+        voice_cert_hash: state.voice_cert_hash.read().await.clone(),
         timezone,
         birthdays_enabled,
     })
@@ -240,12 +241,19 @@ pub struct InfoResponse {
     /// Always `https://` or `wavvon://` when present. Absent when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub welcome_invite_url: Option<String>,
-    /// Publicly-reachable `host:port` for this hub's voice UDP relay.
-    /// Absent when the hub has no known public host (no `WAVVON_PUBLIC_URL`
-    /// and not in LAN mode). Clients dial UDP voice directly at this
-    /// address after fetching `/info` — see "UDP voice" in farm-impl.md.
+    /// Absolute `https://host:port/voice` URL for this hub's WebTransport
+    /// voice endpoint (voice-transport-v2.md). Absent when the hub has no
+    /// known public host (no `WAVVON_PUBLIC_URL` and not in LAN mode).
+    /// Clients dial voice directly at this URL — `voice_joined` carries the
+    /// same value so most clients never need this field, but a farm-routed
+    /// client (or any client) can fetch it here too.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub voice_udp_addr: Option<String>,
+    pub voice_wt_url: Option<String>,
+    /// Hex SHA-256 digest of the WT endpoint's current self-signed
+    /// certificate, for `WebTransportOptions.serverCertificateHashes`.
+    /// `None` when a CA-issued cert is in use.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice_cert_hash: Option<String>,
     /// Operator-configured IANA timezone name (e.g. "Europe/Rome"). Absent
     /// when unset.
     #[serde(skip_serializing_if = "Option::is_none")]

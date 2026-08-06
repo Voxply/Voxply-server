@@ -1,12 +1,10 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use sqlx::postgres::PgPoolOptions;
 use store::PostgresStore;
-use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, RwLock};
 use url::Url;
 use wavvon_hub::bots::token_expiry;
@@ -15,7 +13,7 @@ use wavvon_hub::db;
 use wavvon_hub::dm_worker;
 use wavvon_hub::federation::client::FederationClient;
 use wavvon_hub::server;
-use wavvon_hub::state::{AppState, ConsumedVoiceToken};
+use wavvon_hub::state::AppState;
 use wavvon_identity::Identity;
 use webauthn_rs::WebauthnBuilder;
 
@@ -414,7 +412,10 @@ async fn main() -> Result<()> {
     // are handled above before settings are loaded.
     let subcommand = std::env::args().nth(1);
     if subcommand.as_deref() == Some("migrate") {
-        let db_url = std::env::var("DATABASE_URL")
+        // WAVVON_DATABASE_URL is the documented config var (same one the
+        // server path resolves via Settings); DATABASE_URL kept as fallback.
+        let db_url = std::env::var("WAVVON_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
             .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/wavvon".to_string());
         let db = PgPoolOptions::new()
             .max_connections(1)
@@ -989,18 +990,19 @@ async fn main() -> Result<()> {
 
     let store: Arc<dyn store::HubStore> = Arc::new(PostgresStore::new(db.clone()));
 
-    // Publicly-reachable host for the voice UDP relay: WAVVON_PUBLIC_URL's
-    // host wins (explicit operator override), falling back to the LAN-mode
-    // advertise address when set. No public host is known otherwise — the
-    // hub doesn't guess at its own internet-facing IP.
+    // Publicly-reachable host for the voice WebTransport endpoint
+    // (voice-transport-v2.md): WAVVON_PUBLIC_URL's host wins (explicit
+    // operator override), falling back to the LAN-mode advertise address
+    // when set. No public host is known otherwise — the hub doesn't guess
+    // at its own internet-facing IP.
     let voice_udp_host: Option<String> = settings
         .public_url
         .as_deref()
         .and_then(|u| Url::parse(u).ok())
         .and_then(|parsed| parsed.host_str().map(|h| h.to_string()))
         .or_else(|| lan_advertise_ip.map(|ip| ip.to_string()));
-    let voice_udp_addr: Option<String> =
-        voice_udp_host.map(|host| format!("{host}:{voice_udp_port}"));
+    let voice_wt_url: Option<String> =
+        voice_udp_host.map(|host| format!("https://{host}:{voice_udp_port}/voice"));
 
     // ---- WebAuthn / passkey setup ----
     let rp_id: String = settings
@@ -1055,11 +1057,11 @@ async fn main() -> Result<()> {
         http_client,
         voice_channels: RwLock::new(HashMap::new()),
         voice_last_active: RwLock::new(HashMap::new()),
-        voice_addr_map: RwLock::new(HashMap::new()),
         voice_sender_ids: RwLock::new(HashMap::new()),
         voice_next_sender_id: RwLock::new(HashMap::new()),
         voice_udp_port,
-        voice_udp_addr,
+        voice_wt_url,
+        voice_cert_hash: RwLock::new(None),
         voice_event_tx,
         dm_tx,
         online_users: RwLock::new(HashMap::new()),
@@ -1072,17 +1074,13 @@ async fn main() -> Result<()> {
         voice_zones: RwLock::new(HashMap::new()),
         video_channels: RwLock::new(HashMap::new()),
         started_at: std::time::Instant::now(),
-        whisper_targets: RwLock::new(HashMap::new()),
         whisper_target_defs: RwLock::new(HashMap::new()),
         whisper_optouts: RwLock::new(std::collections::HashSet::new()),
         whisper_target_pubkeys: RwLock::new(HashMap::new()),
         voice_relay_active: RwLock::new(std::collections::HashSet::new()),
         staging_voice_grants: RwLock::new(HashMap::new()),
         voice_pending_binds: RwLock::new(HashMap::new()),
-        voice_consumed_tokens: RwLock::new(HashMap::new()),
-        voice_ws_senders: RwLock::new(HashMap::new()),
         ws_key_senders: RwLock::new(HashMap::new()),
-        voice_udp_socket: Arc::new(RwLock::new(None)),
         rate_limiters: Default::default(),
         preview_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         search,
@@ -1143,218 +1141,20 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Bind voice UDP socket and start forwarding task
-    let voice_socket = Arc::new(UdpSocket::bind(format!("0.0.0.0:{voice_udp_port}")).await?);
-    *state.voice_udp_socket.write().await = Some(voice_socket.clone());
-    tracing::info!("Voice UDP listening on port {voice_udp_port}");
-
-    let voice_state = state.clone();
-    tokio::spawn(async move {
-        // Register packet magic: b"VXRG" (4 bytes) followed by the 64 hex-char token.
-        // Total minimum length: 4 + 64 = 68 bytes.
-        // Cannot be confused with an audio packet: audio is raw Opus and never
-        // starts with the ASCII sequence 'V','X','R','G'.
-        const VXRG_MAGIC: &[u8] = b"VXRG";
-        const VXRG_TOKEN_LEN: usize = 64; // 32 bytes hex-encoded
-        const VXRG_MIN_LEN: usize = 4 + VXRG_TOKEN_LEN; // 68
-
-        // Ack packet sent back to a successfully registered source.
-        const VXRA: &[u8] = b"VXRA";
-
-        let mut buf = [0u8; 2048];
-        loop {
-            match voice_socket.recv_from(&mut buf).await {
-                Ok((len, from_addr)) => {
-                    let packet_data = &buf[..len];
-
-                    // ── VXRG register packet ──────────────────────────────────
-                    if len >= VXRG_MIN_LEN && &packet_data[..4] == VXRG_MAGIC {
-                        let token_bytes = &packet_data[4..4 + VXRG_TOKEN_LEN];
-                        let token = match std::str::from_utf8(token_bytes) {
-                            Ok(t) => t,
-                            Err(_) => continue, // not valid UTF-8 → drop
-                        };
-
-                        // Check consumed-token map first for idempotent re-ack.
-                        // If this source address is already bound (token was consumed
-                        // earlier), just ack again — the client may retry.
-                        {
-                            let already_bound = {
-                                let consumed = voice_state.voice_consumed_tokens.read().await;
-                                consumed.contains_key(&from_addr)
-                            };
-                            if already_bound {
-                                let _ = voice_socket.send_to(VXRA, from_addr).await;
-                                continue;
-                            }
-                        }
-
-                        // Look up the pending bind.
-                        let now = std::time::Instant::now();
-                        let bind_opt = {
-                            let mut binds = voice_state.voice_pending_binds.write().await;
-                            // Purge expired entries opportunistically.
-                            binds.retain(|_, v| v.expires_at > now);
-                            binds.remove(token)
-                        };
-
-                        let bind = match bind_opt {
-                            Some(b) if b.expires_at > now => b,
-                            _ => {
-                                // Unknown, expired, or already consumed from a
-                                // different address: drop silently (no reply).
-                                continue;
-                            }
-                        };
-
-                        // Bind the real source address.
-                        {
-                            let mut addr_map = voice_state.voice_addr_map.write().await;
-                            addr_map
-                                .insert(from_addr, (bind.channel_id.clone(), bind.pubkey.clone()));
-                        }
-                        // Update voice_channels to store the real address instead of the sentinel.
-                        {
-                            let mut channels = voice_state.voice_channels.write().await;
-                            if let Some(ch_map) = channels.get_mut(&bind.channel_id) {
-                                ch_map.insert(bind.pubkey.clone(), from_addr);
-                            }
-                        }
-                        // Record the consumed token so retries from the same address get re-acked.
-                        {
-                            let mut consumed = voice_state.voice_consumed_tokens.write().await;
-                            consumed.insert(
-                                from_addr,
-                                ConsumedVoiceToken {
-                                    bound_addr: from_addr,
-                                    channel_id: bind.channel_id.clone(),
-                                    pubkey: bind.pubkey.clone(),
-                                },
-                            );
-                        }
-
-                        tracing::debug!(
-                            "Voice VXRG: bound {} → channel {} pubkey {}",
-                            from_addr,
-                            &bind.channel_id[..8.min(bind.channel_id.len())],
-                            &bind.pubkey[..16.min(bind.pubkey.len())],
-                        );
-
-                        // Send ack.
-                        let _ = voice_socket.send_to(VXRA, from_addr).await;
-                        continue;
-                    }
-
-                    // ── Audio relay ───────────────────────────────────────────
-                    // O(1) lookup: which channel+peer owns this SocketAddr?
-                    let lookup = {
-                        let map = voice_state.voice_addr_map.read().await;
-                        map.get(&from_addr).cloned()
-                    };
-                    if let Some((channel_id, sender_pk)) = lookup {
-                        // Gate: drop the packet if this pubkey no longer has a
-                        // live WS-backed voice session.  This is the enforcement
-                        // point that ties UDP relay lifetime to WS session
-                        // lifetime — leave_voice() removes the entry, so a
-                        // packet arriving after WS disconnect is rejected here
-                        // before any fan-out work is done.
-                        {
-                            let active = voice_state.voice_relay_active.read().await;
-                            if !active.contains(&sender_pk) {
-                                continue;
-                            }
-                        }
-                        // Look up the sender's sender_id for this channel.
-                        let sender_id: u16 = {
-                            let sids = voice_state.voice_sender_ids.read().await;
-                            sids.get(&channel_id)
-                                .and_then(|m| m.get(&sender_pk))
-                                .copied()
-                                .unwrap_or(0)
-                        };
-                        let sender_id_bytes = sender_id.to_be_bytes();
-
-                        // Determine packet_type:
-                        //   0x01 = whisper (fan-out to resolved whisper target set only)
-                        //   0x00 = normal channel voice
-                        let packet_type: u8 = {
-                            let wt = voice_state.whisper_targets.read().await;
-                            if wt.contains_key(&sender_pk) {
-                                0x01u8
-                            } else {
-                                0x00u8
-                            }
-                        };
-
-                        // Build outbound: [sender_id: 2][packet_type: 1][original packet]
-                        let mut outbound = Vec::with_capacity(3 + packet_data.len());
-                        outbound.extend_from_slice(&sender_id_bytes);
-                        outbound.push(packet_type);
-                        outbound.extend_from_slice(packet_data);
-
-                        // Fan-out to UDP and WS participants.
-                        //
-                        // Hard invariant for UDP: only emit to addresses that have completed
-                        // an authenticated UDP bind (i.e. present in voice_addr_map).
-                        // The sentinel 0.0.0.0:0 is never in voice_addr_map, so
-                        // unregistered UDP participants are automatically excluded.
-                        // WS clients are identified by presence in voice_ws_senders.
-                        let sentinel: SocketAddr = "0.0.0.0:0".parse().unwrap();
-                        {
-                            let addr_map = voice_state.voice_addr_map.read().await;
-                            let channels = voice_state.voice_channels.read().await;
-                            let ws_senders = voice_state.voice_ws_senders.read().await;
-
-                            if packet_type == 0x01 {
-                                // Whisper: deliver to the resolved target set only.
-                                // Two parallel target sets are kept for a whisper
-                                // session (routes/ws/handlers/voice.rs): a
-                                // SocketAddr set for UDP targets and a pubkey set
-                                // for WS targets (voice_ws_senders), since a WS
-                                // client has no stable UDP address to resolve.
-                                let wt = voice_state.whisper_targets.read().await;
-                                if let Some(whisper_addrs) = wt.get(&sender_pk) {
-                                    for addr in whisper_addrs {
-                                        if addr_map.contains_key(addr) {
-                                            let _ = voice_socket.send_to(&outbound, *addr).await;
-                                        }
-                                    }
-                                }
-                                let wtp = voice_state.whisper_target_pubkeys.read().await;
-                                if let Some(whisper_pks) = wtp.get(&sender_pk) {
-                                    for pk in whisper_pks {
-                                        if let Some(ws_tx) = ws_senders.get(pk.as_str()) {
-                                            let _ = ws_tx.send(outbound.clone());
-                                        }
-                                    }
-                                }
-                            } else {
-                                // Normal: all channel participants except the sender.
-                                if let Some(participants) = channels.get(&channel_id) {
-                                    for (pk, addr) in participants {
-                                        if pk == &sender_pk {
-                                            continue;
-                                        }
-                                        if let Some(ws_tx) = ws_senders.get(pk.as_str()) {
-                                            let _ = ws_tx.send(outbound.clone());
-                                        } else if *addr != sentinel
-                                            && addr_map.contains_key(addr)
-                                            && *addr != from_addr
-                                        {
-                                            let _ = voice_socket.send_to(&outbound, *addr).await;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Voice UDP recv error: {e}");
-                }
-            }
-        }
-    });
+    // Start the WebTransport voice relay (voice-transport-v2.md). Uses the
+    // *raw* WAVVON_TLS_CERT/WAVVON_TLS_KEY, not `effective_tls_cert`/`_key`
+    // — a LAN-mode self-signed cert has no rotation story and isn't bounded
+    // to the 14-day validity `serverCertificateHashes` requires, so voice
+    // always manages its own identity independently of LAN mode.
+    let bound_voice_port = wavvon_hub::voice_wt::start(
+        state.clone(),
+        voice_udp_port,
+        settings.tls_cert.as_deref(),
+        settings.tls_key.as_deref(),
+    )
+    .await
+    .context("Failed to start voice WebTransport relay")?;
+    tracing::info!("Voice WebTransport listening on port {bound_voice_port}");
 
     // Retry undelivered federated DMs in the background.
     dm_worker::spawn(state.clone());

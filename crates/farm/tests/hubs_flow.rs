@@ -58,6 +58,7 @@ async fn setup_with_farm_url(farm_url: &str) -> (TestServer, Arc<FarmState>, com
         "wavvon-hub".to_string(),
         farm_url.to_string(),
         9100,
+        10100,
     ));
     let state = Arc::new(FarmState::new(
         db,
@@ -722,6 +723,70 @@ async fn delete_hub_by_admin_succeeds() {
         )
         .await;
     resp.assert_status(axum::http::StatusCode::NO_CONTENT);
+}
+
+// ---------------------------------------------------------------------------
+// HubManager::allocate_and_spawn — HTTP + voice port allocation/persistence
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn allocate_and_spawn_yields_distinct_ports_and_persists_voice_port() {
+    let (_server, state, _guard) = setup().await;
+    let owner = Identity::generate();
+
+    // insert_hub leaves process_port/voice_port NULL — nothing allocated yet.
+    insert_hub(
+        &state,
+        "huballoc1",
+        &owner.public_key_hex(),
+        "Hub Alloc One",
+        "private",
+    )
+    .await;
+    insert_hub(
+        &state,
+        "huballoc2",
+        &owner.public_key_hex(),
+        "Hub Alloc Two",
+        "private",
+    )
+    .await;
+
+    // The `wavvon-hub` binary isn't on PATH in the test environment, so the
+    // spawn itself fails — but the port allocation + DB persistence happens
+    // before the spawn attempt, so we can ignore the Result here.
+    let _ = state
+        .hub_manager
+        .allocate_and_spawn(&state.db, "huballoc1", "/tmp/huballoc1.db", None)
+        .await;
+    let _ = state
+        .hub_manager
+        .allocate_and_spawn(&state.db, "huballoc2", "/tmp/huballoc2.db", None)
+        .await;
+
+    let row1: (Option<i32>, Option<i32>) =
+        sqlx::query_as("SELECT process_port, voice_port FROM hubs WHERE id = 'huballoc1'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    let row2: (Option<i32>, Option<i32>) =
+        sqlx::query_as("SELECT process_port, voice_port FROM hubs WHERE id = 'huballoc2'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+
+    let (port1, voice1) = (
+        row1.0.expect("port1 persisted"),
+        row1.1.expect("voice1 persisted"),
+    );
+    let (port2, voice2) = (
+        row2.0.expect("port2 persisted"),
+        row2.1.expect("voice2 persisted"),
+    );
+
+    assert_ne!(port1, port2, "HTTP ports must be distinct");
+    assert_ne!(voice1, voice2, "voice ports must be distinct");
+    assert_ne!(port1, voice1, "HTTP and voice ports use separate ranges");
 }
 
 #[tokio::test]

@@ -259,7 +259,7 @@ async fn bot_voice_join_returns_ws_url() {
         .await;
     join_resp.assert_status_success();
     let body: serde_json::Value = join_resp.json();
-    assert!(body["voice_ws_url"].as_str().unwrap().contains("/voice/ws"));
+    assert_eq!(body["ws_url"], "/ws");
     assert_eq!(body["channel_id"], channel_id);
 }
 

@@ -13,6 +13,7 @@ use tokio::sync::RwLock;
 
 struct HubProcess {
     port: u16,
+    voice_port: u16,
     child: Child,
 }
 
@@ -22,26 +23,43 @@ pub struct HubManager {
     hub_bin: String,
     /// Externally reachable farm URL — passed to hub processes as `WAVVON_FARM_URL`.
     farm_url: String,
-    /// Base port for allocating new hub process ports.
+    /// Base port for allocating new hub process HTTP ports.
     base_port: u16,
+    /// Base port for allocating new hub voice (WebTransport/QUIC over UDP) ports.
+    /// Separate range from `base_port` so the two never collide.
+    voice_base_port: u16,
 }
 
 impl HubManager {
-    pub fn new(hub_bin: String, farm_url: String, base_port: u16) -> Self {
+    pub fn new(hub_bin: String, farm_url: String, base_port: u16, voice_base_port: u16) -> Self {
         Self {
             hubs: RwLock::new(HashMap::new()),
             hub_bin,
             farm_url,
             base_port,
+            voice_base_port,
         }
     }
 
-    /// Allocate the next free port for a new hub process.
+    /// Allocate the next free HTTP port for a new hub process.
     /// Scans occupied ports and returns `base_port + N` where N is the first gap.
     pub async fn allocate_port(&self) -> u16 {
         let hubs = self.hubs.read().await;
         let mut port = self.base_port;
         let occupied: std::collections::HashSet<u16> = hubs.values().map(|h| h.port).collect();
+        while occupied.contains(&port) {
+            port += 1;
+        }
+        port
+    }
+
+    /// Allocate the next free voice port for a new hub process. Same first-gap
+    /// strategy as `allocate_port`, over the separate `voice_base_port` range.
+    pub async fn allocate_voice_port(&self) -> u16 {
+        let hubs = self.hubs.read().await;
+        let mut port = self.voice_base_port;
+        let occupied: std::collections::HashSet<u16> =
+            hubs.values().map(|h| h.voice_port).collect();
         while occupied.contains(&port) {
             port += 1;
         }
@@ -54,12 +72,15 @@ impl HubManager {
     /// the path stored in `self.hub_bin`.
     ///
     /// `owner_pubkey` is passed as `WAVVON_OWNER_PUBKEY` so the hub seeds that key
-    /// as the builtin-owner role on first boot.
+    /// as the builtin-owner role on first boot. `voice_port` is passed as
+    /// `WAVVON_VOICE_UDP_PORT` so multiple farm-spawned hubs on one box don't
+    /// collide on the default 3001.
     pub async fn spawn_hub(
         &self,
         hub_id: &str,
         db_path: &str,
         port: u16,
+        voice_port: u16,
         owner_pubkey: Option<&str>,
     ) -> Result<()> {
         let bin = std::env::var("WAVVON_HUB_BIN").unwrap_or_else(|_| self.hub_bin.clone());
@@ -67,6 +88,7 @@ impl HubManager {
         let mut cmd = tokio::process::Command::new(&bin);
         cmd.env("WAVVON_HUB_DB", db_path)
             .env("WAVVON_HUB_HTTP_PORT", port.to_string())
+            .env("WAVVON_VOICE_UDP_PORT", voice_port.to_string())
             .env("WAVVON_FARM_URL", &self.farm_url);
         if let Some(pk) = owner_pubkey {
             cmd.env("WAVVON_OWNER_PUBKEY", pk);
@@ -76,8 +98,15 @@ impl HubManager {
         })?;
 
         let mut hubs = self.hubs.write().await;
-        hubs.insert(hub_id.to_string(), HubProcess { port, child });
-        tracing::info!(hub_id, port, "Hub process spawned");
+        hubs.insert(
+            hub_id.to_string(),
+            HubProcess {
+                port,
+                voice_port,
+                child,
+            },
+        );
+        tracing::info!(hub_id, port, voice_port, "Hub process spawned");
         Ok(())
     }
 
@@ -94,10 +123,18 @@ impl HubManager {
         Ok(())
     }
 
-    /// Restart a hub process: stop it then re-spawn with the same db_path and port.
-    pub async fn restart_hub(&self, hub_id: &str, db_path: &str, port: u16) -> Result<()> {
+    /// Restart a hub process: stop it then re-spawn with the same db_path, port
+    /// and voice_port.
+    pub async fn restart_hub(
+        &self,
+        hub_id: &str,
+        db_path: &str,
+        port: u16,
+        voice_port: u16,
+    ) -> Result<()> {
         self.stop_hub(hub_id).await?;
-        self.spawn_hub(hub_id, db_path, port, None).await
+        self.spawn_hub(hub_id, db_path, port, voice_port, None)
+            .await
     }
 
     /// Whether a hub process is currently tracked as running.
@@ -112,21 +149,37 @@ impl HubManager {
 
     /// Re-spawn all non-suspended, non-deleted hubs from the DB.
     /// Called once at farm startup.
+    ///
+    /// Hubs created before `voice_port` existed have it NULL — allocate and
+    /// persist one now rather than falling back to the fatal-collision default.
     pub async fn spawn_all_from_db(&self, db: &PgPool) -> Result<()> {
-        // process_port is INTEGER (i32) — decoding as i64 fails sqlx's type
-        // check at runtime (same latent bug the proxy had; see proxy.rs).
-        let rows: Vec<(String, String, i32, Option<String>)> = sqlx::query_as(
-            "SELECT id, db_path, process_port, owner_pubkey FROM hubs
+        // process_port/voice_port are INTEGER (i32) — decoding as i64 fails sqlx's
+        // type check at runtime (same latent bug the proxy had; see proxy.rs).
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(String, String, i32, Option<i32>, Option<String>)> = sqlx::query_as(
+            "SELECT id, db_path, process_port, voice_port, owner_pubkey FROM hubs
              WHERE suspended_at IS NULL AND deleted_at IS NULL AND process_port IS NOT NULL",
         )
         .fetch_all(db)
         .await
         .context("Failed to query hubs for startup spawn")?;
 
-        for (hub_id, db_path, port, owner_pubkey) in rows {
+        for (hub_id, db_path, port, voice_port, owner_pubkey) in rows {
             let port = port as u16;
+            let voice_port = match voice_port {
+                Some(vp) => vp as u16,
+                None => {
+                    let vp = self.allocate_voice_port().await;
+                    let _ = sqlx::query("UPDATE hubs SET voice_port = $1 WHERE id = $2")
+                        .bind(vp as i32)
+                        .bind(&hub_id)
+                        .execute(db)
+                        .await;
+                    vp
+                }
+            };
             if let Err(e) = self
-                .spawn_hub(&hub_id, &db_path, port, owner_pubkey.as_deref())
+                .spawn_hub(&hub_id, &db_path, port, voice_port, owner_pubkey.as_deref())
                 .await
             {
                 tracing::warn!(hub_id, error = %e, "Failed to spawn hub on startup (skipping)");
@@ -136,26 +189,29 @@ impl HubManager {
         Ok(())
     }
 
-    /// Allocate a port and persist it to the `hubs` row, then spawn.
-    /// Returns the allocated port.
+    /// Allocate an HTTP port and a voice port and persist both to the `hubs`
+    /// row, then spawn. Returns the allocated `(port, voice_port)`.
     pub async fn allocate_and_spawn(
         self: &Arc<Self>,
         db: &PgPool,
         hub_id: &str,
         db_path: &str,
         owner_pubkey: Option<&str>,
-    ) -> Result<u16> {
+    ) -> Result<(u16, u16)> {
         let port = self.allocate_port().await;
+        let voice_port = self.allocate_voice_port().await;
 
-        // Persist port before spawning so a restart can re-use it.
-        sqlx::query("UPDATE hubs SET process_port = $1 WHERE id = $2")
+        // Persist ports before spawning so a restart can re-use them.
+        sqlx::query("UPDATE hubs SET process_port = $1, voice_port = $2 WHERE id = $3")
             .bind(port as i64)
+            .bind(voice_port as i64)
             .bind(hub_id)
             .execute(db)
             .await
-            .context("Failed to persist hub port")?;
+            .context("Failed to persist hub ports")?;
 
-        self.spawn_hub(hub_id, db_path, port, owner_pubkey).await?;
-        Ok(port)
+        self.spawn_hub(hub_id, db_path, port, voice_port, owner_pubkey)
+            .await?;
+        Ok((port, voice_port))
     }
 }

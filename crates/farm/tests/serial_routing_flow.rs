@@ -50,6 +50,7 @@ async fn start_farm() -> (String, Arc<FarmState>, common::TestDbGuard) {
         "wavvon-hub".to_string(),
         farm_url.clone(),
         9200,
+        10200,
     ));
     let state = Arc::new(FarmState::new(
         db_pool,

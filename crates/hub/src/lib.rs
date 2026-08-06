@@ -22,4 +22,5 @@ pub mod setup;
 pub mod state;
 pub mod subkey_revocation_worker;
 pub mod temp_channel_worker;
+pub mod voice_wt;
 pub mod web_client;

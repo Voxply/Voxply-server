@@ -29,13 +29,15 @@ impl HubManager {
         hub_id: &str,
         db_path: &str,
         port: u16,
+        voice_port: u16,
         owner_pubkey: Option<&str>,
         farm_url: Option<&str>,
     ) -> Result<()> {
         let bin = std::env::var("WAVVON_HUB_BIN").unwrap_or_else(|_| self.hub_bin.clone());
         let mut cmd = tokio::process::Command::new(&bin);
         cmd.env("WAVVON_HUB_DB", db_path)
-            .env("WAVVON_HUB_HTTP_PORT", port.to_string());
+            .env("WAVVON_HUB_HTTP_PORT", port.to_string())
+            .env("WAVVON_VOICE_UDP_PORT", voice_port.to_string());
         if let Some(pk) = owner_pubkey {
             cmd.env("WAVVON_OWNER_PUBKEY", pk);
         }
@@ -50,7 +52,7 @@ impl HubManager {
                 _child: child,
             },
         );
-        tracing::info!(hub_id, port, "Hub spawned");
+        tracing::info!(hub_id, port, voice_port, "Hub spawned");
         Ok(())
     }
 
@@ -69,11 +71,12 @@ impl HubManager {
         hub_id: &str,
         db_path: &str,
         port: u16,
+        voice_port: u16,
         owner_pubkey: Option<&str>,
         farm_url: Option<&str>,
     ) -> Result<()> {
         self.stop_hub(hub_id).await?;
-        self.spawn_hub(hub_id, db_path, port, owner_pubkey, farm_url)
+        self.spawn_hub(hub_id, db_path, port, voice_port, owner_pubkey, farm_url)
             .await
     }
 
