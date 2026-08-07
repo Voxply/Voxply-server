@@ -1025,11 +1025,15 @@ pub enum WsServerMessage {
     MemberOffline { public_key: String },
     /// A user changed their display name and/or avatar. Carries the fresh
     /// values so clients update in place without re-fetching /users.
+    /// `name_color` is the server-resolved nickname color (member name
+    /// colors feature) at the time of the push.
     #[serde(rename = "member_updated")]
     MemberUpdated {
         public_key: String,
         display_name: Option<String>,
         avatar: Option<String>,
+        #[serde(default)]
+        name_color: Option<String>,
     },
     /// A user changed their presence status. `status` is None for plain
     /// online (away/dnd otherwise); `custom` is optional short status text.

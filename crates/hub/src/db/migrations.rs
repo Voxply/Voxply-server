@@ -1924,6 +1924,16 @@ pub async fn run(pool: &PgPool) -> Result<()> {
         .execute(pool)
         .await;
 
+    // Per-user nickname color override for the member name colors feature.
+    // "#rrggbb" or NULL; validated at the route layer (routes/me.rs), same
+    // "empty string clears it" semantics as `accent_color`. The hub-wide
+    // `name_color_mode` setting (hub_settings key/value table) decides
+    // whether this or a role's `color` wins when resolving the color shown
+    // for a member (routes/users.rs `resolve_name_color`).
+    let _ = sqlx::query("ALTER TABLE users ADD COLUMN name_color TEXT")
+        .execute(pool)
+        .await;
+
     // =======================================================================
     // One-time data cleanup
     // =======================================================================

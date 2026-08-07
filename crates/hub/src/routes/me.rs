@@ -89,7 +89,7 @@ fn validate_favorite_hubs(hubs: &[FavoriteHub]) -> Result<(), (StatusCode, Strin
 
 /// Row shape shared by the GET and PATCH `/me` handlers: display_name,
 /// approval_status, avatar, bio, pronouns, status_message, activities,
-/// accent_color, cover, favorite_hubs, show_hubs, birthday.
+/// accent_color, cover, favorite_hubs, show_hubs, birthday, name_color.
 #[allow(clippy::type_complexity)]
 type MeProfileRow = (
     Option<String>,
@@ -104,14 +104,16 @@ type MeProfileRow = (
     Option<String>,
     Option<bool>,
     Option<String>,
+    Option<String>,
 );
 
-const ME_SELECT: &str = "SELECT display_name, approval_status, avatar, bio, pronouns, status_message, activities, accent_color, cover, favorite_hubs, show_hubs, birthday FROM users WHERE public_key = $1";
+const ME_SELECT: &str = "SELECT display_name, approval_status, avatar, bio, pronouns, status_message, activities, accent_color, cover, favorite_hubs, show_hubs, birthday, name_color FROM users WHERE public_key = $1";
 
 fn empty_row() -> MeProfileRow {
     (
         None,
         "approved".to_string(),
+        None,
         None,
         None,
         None,
@@ -172,6 +174,7 @@ pub async fn me(
         favorite_hubs,
         show_hubs,
         birthday,
+        name_color,
     ) = row.unwrap_or_else(empty_row);
 
     let roles = fetch_user_roles(&state.db, &user.public_key).await?;
@@ -191,6 +194,7 @@ pub async fn me(
         approval_status,
         roles,
         birthday,
+        name_color,
     }))
 }
 
@@ -298,6 +302,23 @@ pub async fn update_me(
     if let Some(ref cover) = req.cover {
         update_text_field(&state.db, pk, "cover", cover, COVER_MAX, "cover").await?;
     }
+    if let Some(ref name_color) = req.name_color {
+        if !name_color.is_empty() && !is_valid_hex_color(name_color) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "name_color must match #rrggbb".to_string(),
+            ));
+        }
+        update_text_field(
+            &state.db,
+            pk,
+            "name_color",
+            name_color,
+            usize::MAX,
+            "name_color",
+        )
+        .await?;
+    }
     if let Some(ref hubs) = req.favorite_hubs {
         validate_favorite_hubs(hubs)?;
         let stored = if hubs.is_empty() {
@@ -363,20 +384,32 @@ pub async fn update_me(
         favorite_hubs,
         show_hubs,
         birthday,
+        name_color,
     ) = row.unwrap_or_else(empty_row);
 
     let roles = fetch_user_roles(&state.db, &user.public_key).await?;
 
+    // Roles are already ordered by priority DESC (fetch_user_roles), so the
+    // first one carrying a color is the highest-priority role color.
+    let role_color = roles.iter().find_map(|r| r.color.clone());
+    let resolved_name_color = crate::routes::users::resolve_name_color(
+        &crate::routes::users::name_color_mode(&state.db).await,
+        role_color.as_deref(),
+        name_color.as_deref(),
+    );
+
     // Push the change hub-wide so other clients refresh this user's name/avatar
     // in the member list and on message authors without reconnecting. Only
-    // name/avatar are mirrored elsewhere; the richer profile fields are
-    // fetched live when a card opens, so they are deliberately not broadcast.
+    // name/avatar (+ the resolved name_color, cheap to compute here) are
+    // mirrored elsewhere; the richer profile fields are fetched live when a
+    // card opens, so they are deliberately not broadcast.
     let json: std::sync::Arc<str> = std::sync::Arc::from(
         serde_json::to_string(
             &crate::routes::chat_models::WsServerMessage::MemberUpdated {
                 public_key: user.public_key.clone(),
                 display_name: display_name.clone(),
                 avatar: avatar.clone(),
+                name_color: resolved_name_color,
             },
         )
         .unwrap_or_default()
@@ -404,6 +437,7 @@ pub async fn update_me(
         approval_status,
         roles,
         birthday,
+        name_color,
     }))
 }
 
@@ -484,6 +518,11 @@ pub struct MeResponse {
     /// always returns the stored value regardless of `birthdays_enabled`.
     #[serde(default)]
     pub birthday: Option<String>,
+    /// "#rrggbb" nickname color override, or `null` when unset. This is the
+    /// raw stored value, not the server-resolved color shown to other
+    /// members — see `routes::users::resolve_name_color` for that.
+    #[serde(default)]
+    pub name_color: Option<String>,
 }
 
 fn default_approval_status() -> String {
@@ -517,6 +556,10 @@ pub struct UpdateMeRequest {
     /// match "MM-DD" with a valid month/day.
     #[serde(default)]
     pub birthday: Option<String>,
+    /// "#rrggbb" nickname color override. Empty string clears it, same
+    /// semantics as `accent_color`.
+    #[serde(default)]
+    pub name_color: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]

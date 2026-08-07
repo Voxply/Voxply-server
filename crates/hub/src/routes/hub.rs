@@ -136,6 +136,18 @@ pub async fn update_hub(
         }
         upsert_setting(&state.db, "afk_timeout_secs", &secs.to_string()).await?;
     }
+    if let Some(mode) = req.name_color_mode.as_deref() {
+        if !crate::routes::users::NAME_COLOR_MODES.contains(&mode) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "name_color_mode must be one of: {}",
+                    crate::routes::users::NAME_COLOR_MODES.join(", ")
+                ),
+            ));
+        }
+        upsert_setting(&state.db, "name_color_mode", mode).await?;
+    }
 
     let json: std::sync::Arc<str> = std::sync::Arc::from(
         serde_json::to_string(&crate::routes::chat_models::WsServerMessage::HubUpdated)
@@ -373,6 +385,8 @@ pub async fn get_hub_settings(
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_AFK_TIMEOUT_SECS);
 
+    let name_color_mode = crate::routes::users::name_color_mode(&state.db).await;
+
     Ok(Json(HubSettings {
         require_approval,
         invite_only,
@@ -383,6 +397,7 @@ pub async fn get_hub_settings(
         birthdays_enabled,
         afk_channel_id,
         afk_timeout_secs,
+        name_color_mode,
     }))
 }
 
@@ -415,10 +430,20 @@ pub struct HubSettings {
     /// Idle threshold for the AFK sweep, in seconds.
     #[serde(default = "default_afk_timeout")]
     pub afk_timeout_secs: u32,
+    /// Priority order deciding which color wins when both a role color and a
+    /// user's own `name_color` profile field are set (member name colors
+    /// feature). One of: "user_over_role", "role_over_user", "role_only",
+    /// "user_only", "none". Defaults to "role_over_user" when unset.
+    #[serde(default = "default_name_color_mode")]
+    pub name_color_mode: String,
 }
 
 fn default_afk_timeout() -> u32 {
     DEFAULT_AFK_TIMEOUT_SECS
+}
+
+fn default_name_color_mode() -> String {
+    "role_over_user".to_string()
 }
 
 fn default_true() -> bool {
@@ -503,6 +528,12 @@ pub struct UpdateHubRequest {
     /// Idle threshold for the AFK sweep, in seconds. Minimum 60.
     #[serde(default)]
     pub afk_timeout_secs: Option<u32>,
+    /// Priority order for resolving a member's displayed name color (member
+    /// name colors feature). Must be one of `NAME_COLOR_MODES`
+    /// ("user_over_role", "role_over_user", "role_only", "user_only",
+    /// "none").
+    #[serde(default)]
+    pub name_color_mode: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]

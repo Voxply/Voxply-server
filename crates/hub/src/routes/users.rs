@@ -11,7 +11,8 @@ use crate::state::AppState;
 
 /// Row shape for the profile fields SELECT in `get_user_profile`:
 /// display_name, avatar, first_seen_at, bio, pronouns, status_message,
-/// activities, accent_color, cover, favorite_hubs, show_hubs, birthday.
+/// activities, accent_color, cover, favorite_hubs, show_hubs, birthday,
+/// name_color.
 #[allow(clippy::type_complexity)]
 type UserProfileRow = (
     Option<String>,
@@ -26,7 +27,49 @@ type UserProfileRow = (
     Option<String>,
     Option<bool>,
     Option<String>,
+    Option<String>,
 );
+
+/// Allowed values for the hub-wide `name_color_mode` setting (member name
+/// colors feature). Default when unset is `role_over_user`.
+pub const NAME_COLOR_MODES: &[&str] = &[
+    "user_over_role",
+    "role_over_user",
+    "role_only",
+    "user_only",
+    "none",
+];
+
+/// Reads the hub-wide `name_color_mode` setting, falling back to
+/// `role_over_user` when unset or set to an unrecognized value. Callers
+/// resolving a roster/list of users should call this once per request, not
+/// once per row.
+pub async fn name_color_mode(db: &sqlx::PgPool) -> String {
+    crate::routes::hub::read_setting(db, "name_color_mode")
+        .await
+        .filter(|v| NAME_COLOR_MODES.contains(&v.as_str()))
+        .unwrap_or_else(|| "role_over_user".to_string())
+}
+
+/// Resolves the color shown for a member's name from the hub-wide mode, the
+/// color of their highest-priority role that has one, and their own
+/// `name_color` profile field. `role_color`/`user_color` should both already
+/// be `None` when absent (no further filtering needed here).
+pub fn resolve_name_color(
+    mode: &str,
+    role_color: Option<&str>,
+    user_color: Option<&str>,
+) -> Option<String> {
+    match mode {
+        "none" => None,
+        "role_only" => role_color.map(str::to_string),
+        "user_only" => user_color.map(str::to_string),
+        "user_over_role" => user_color.or(role_color).map(str::to_string),
+        // "role_over_user" and any unrecognized value (name_color_mode
+        // already validates against NAME_COLOR_MODES at the write path).
+        _ => role_color.or(user_color).map(str::to_string),
+    }
+}
 
 #[derive(Deserialize)]
 pub struct UserSearchParams {
@@ -115,6 +158,12 @@ pub struct UserInfo {
     /// is false hub-wide.
     #[serde(default)]
     pub birthday: Option<String>,
+    /// Server-resolved nickname color ("#rrggbb"), or `null`. Resolved from
+    /// the hub-wide `name_color_mode` setting, this user's highest-priority
+    /// role color, and their own `name_color` profile field — see
+    /// `resolve_name_color`.
+    #[serde(default)]
+    pub name_color: Option<String>,
 }
 
 pub async fn list_users(
@@ -136,11 +185,15 @@ pub async fn list_users(
         let search = format!("%{q}%");
         sqlx::query_as::<_, UserRowWithRole>(
             "SELECT u.public_key, u.display_name, u.avatar, u.is_bot,
-                    u.presence_status, u.presence_custom, u.birthday,
+                    u.presence_status, u.presence_custom, u.birthday, u.name_color,
                     (SELECT r.name FROM roles r
                      INNER JOIN user_roles ur ON r.id = ur.role_id
                      WHERE ur.user_public_key = u.public_key AND r.display_separately = TRUE
-                     ORDER BY r.priority DESC LIMIT 1) AS group_role
+                     ORDER BY r.priority DESC LIMIT 1) AS group_role,
+                    (SELECT r.color FROM roles r
+                     INNER JOIN user_roles ur ON r.id = ur.role_id
+                     WHERE ur.user_public_key = u.public_key AND r.color IS NOT NULL
+                     ORDER BY r.priority DESC LIMIT 1) AS role_color
              FROM users u
              WHERE (u.display_name LIKE $1 OR u.public_key LIKE $2)
                AND NOT EXISTS (SELECT 1 FROM bans b WHERE b.target_public_key = u.public_key)
@@ -155,11 +208,15 @@ pub async fn list_users(
     } else {
         sqlx::query_as::<_, UserRowWithRole>(
             "SELECT u.public_key, u.display_name, u.avatar, u.is_bot,
-                    u.presence_status, u.presence_custom, u.birthday,
+                    u.presence_status, u.presence_custom, u.birthday, u.name_color,
                     (SELECT r.name FROM roles r
                      INNER JOIN user_roles ur ON r.id = ur.role_id
                      WHERE ur.user_public_key = u.public_key AND r.display_separately = TRUE
-                     ORDER BY r.priority DESC LIMIT 1) AS group_role
+                     ORDER BY r.priority DESC LIMIT 1) AS group_role,
+                    (SELECT r.color FROM roles r
+                     INNER JOIN user_roles ur ON r.id = ur.role_id
+                     WHERE ur.user_public_key = u.public_key AND r.color IS NOT NULL
+                     ORDER BY r.priority DESC LIMIT 1) AS role_color
              FROM users u
              WHERE NOT EXISTS (SELECT 1 FROM bans b WHERE b.target_public_key = u.public_key)
                AND (u.is_bot = TRUE OR EXISTS
@@ -173,12 +230,18 @@ pub async fn list_users(
 
     // Checked once per request, not per row.
     let show_birthdays = crate::routes::hub::birthdays_enabled(&state.db).await;
+    let color_mode = name_color_mode(&state.db).await;
 
     let result: Vec<UserInfo> = rows
         .into_iter()
         .map(|r| {
             let is_connected = online.contains_key(&r.public_key);
             let is_online = reported_online(is_connected, r.presence_status.as_deref());
+            let name_color = resolve_name_color(
+                &color_mode,
+                r.role_color.as_deref(),
+                r.name_color.as_deref(),
+            );
             UserInfo {
                 online: is_online,
                 status: r.presence_status.filter(|_| is_online),
@@ -189,6 +252,7 @@ pub async fn list_users(
                 group_role: r.group_role,
                 is_bot: r.is_bot,
                 birthday: if show_birthdays { r.birthday } else { None },
+                name_color,
             }
         })
         .collect();
@@ -208,7 +272,11 @@ pub async fn channel_members(
 
     let rows = sqlx::query_as::<_, UserRow>(
         "SELECT u.public_key, u.display_name, u.avatar, u.is_bot,
-                u.presence_status, u.presence_custom, u.birthday
+                u.presence_status, u.presence_custom, u.birthday, u.name_color,
+                (SELECT r.color FROM roles r
+                 INNER JOIN user_roles ur ON r.id = ur.role_id
+                 WHERE ur.user_public_key = u.public_key AND r.color IS NOT NULL
+                 ORDER BY r.priority DESC LIMIT 1) AS role_color
          FROM users u
          WHERE u.public_key NOT IN (
              SELECT target_public_key FROM channel_bans WHERE channel_id = $1
@@ -225,12 +293,18 @@ pub async fn channel_members(
 
     // Checked once per request, not per row.
     let show_birthdays = crate::routes::hub::birthdays_enabled(&state.db).await;
+    let color_mode = name_color_mode(&state.db).await;
 
     Ok(Json(
         rows.into_iter()
             .map(|r| {
                 let is_connected = online.contains_key(&r.public_key);
                 let is_online = reported_online(is_connected, r.presence_status.as_deref());
+                let name_color = resolve_name_color(
+                    &color_mode,
+                    r.role_color.as_deref(),
+                    r.name_color.as_deref(),
+                );
                 UserInfo {
                     online: is_online,
                     status: r.presence_status.filter(|_| is_online),
@@ -241,6 +315,7 @@ pub async fn channel_members(
                     group_role: None,
                     is_bot: r.is_bot,
                     birthday: if show_birthdays { r.birthday } else { None },
+                    name_color,
                 }
             })
             .collect(),
@@ -256,6 +331,8 @@ struct UserRow {
     presence_status: Option<String>,
     presence_custom: Option<String>,
     birthday: Option<String>,
+    name_color: Option<String>,
+    role_color: Option<String>,
 }
 
 /// Like UserRow but includes the pre-joined group_role column.
@@ -268,7 +345,9 @@ struct UserRowWithRole {
     presence_status: Option<String>,
     presence_custom: Option<String>,
     birthday: Option<String>,
+    name_color: Option<String>,
     group_role: Option<String>,
+    role_color: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -318,6 +397,10 @@ pub struct UserProfileResponse {
     /// is false hub-wide (unless viewing your own profile).
     #[serde(default)]
     pub birthday: Option<String>,
+    /// Server-resolved nickname color ("#rrggbb"), or `null`. See
+    /// `resolve_name_color`.
+    #[serde(default)]
+    pub name_color: Option<String>,
 }
 
 /// GET /users/:pubkey/profile
@@ -327,7 +410,7 @@ pub async fn get_user_profile(
     Path(pubkey): Path<String>,
 ) -> Result<Json<UserProfileResponse>, (StatusCode, String)> {
     let row: Option<UserProfileRow> = sqlx::query_as(
-        "SELECT display_name, avatar, first_seen_at, bio, pronouns, status_message, activities, accent_color, cover, favorite_hubs, show_hubs, birthday FROM users WHERE public_key = $1",
+        "SELECT display_name, avatar, first_seen_at, bio, pronouns, status_message, activities, accent_color, cover, favorite_hubs, show_hubs, birthday, name_color FROM users WHERE public_key = $1",
     )
     .bind(&pubkey)
     .fetch_optional(&state.db)
@@ -347,6 +430,7 @@ pub async fn get_user_profile(
         favorite_hubs_raw,
         show_hubs_raw,
         birthday_raw,
+        name_color_raw,
     ) = row.ok_or((StatusCode::NOT_FOUND, "User not found".to_string()))?;
 
     // Gate: hide birthday from other members when disabled hub-wide; the
@@ -390,6 +474,16 @@ pub async fn get_user_profile(
     .fetch_all(&state.db)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+
+    // Roles above are already ordered by priority DESC, so the first one
+    // carrying a color is the highest-priority role color.
+    let role_color = roles.iter().find_map(|r| r.color.clone());
+    let color_mode = name_color_mode(&state.db).await;
+    let name_color = resolve_name_color(
+        &color_mode,
+        role_color.as_deref(),
+        name_color_raw.as_deref(),
+    );
 
     let role_summaries: Vec<RoleSummary> = roles
         .into_iter()
@@ -442,6 +536,7 @@ pub async fn get_user_profile(
         roles: role_summaries,
         badges: badge_summaries,
         birthday,
+        name_color,
     }))
 }
 
