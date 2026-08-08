@@ -12,97 +12,6 @@ use crate::state::AppState;
 
 use super::models::{require_can_moderate, ChannelBanRow, VoiceMuteRow};
 
-// --- Channel Ban ---
-
-pub async fn channel_ban(
-    State(state): State<Arc<AppState>>,
-    user: AuthUser,
-    Path(channel_id): Path<String>,
-    Json(req): Json<ChannelBanRequest>,
-) -> Result<(StatusCode, Json<ChannelBanResponse>), (StatusCode, String)> {
-    require_can_moderate(
-        &state,
-        &user.public_key,
-        &req.target_public_key,
-        MUTE_MEMBERS,
-    )
-    .await?;
-
-    let now = crate::auth::handlers::unix_timestamp();
-
-    sqlx::query(
-        "INSERT INTO channel_bans (channel_id, target_public_key, banned_by, reason, created_at) VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (channel_id, target_public_key) DO UPDATE SET banned_by = excluded.banned_by, reason = excluded.reason, created_at = excluded.created_at",
-    )
-    .bind(&channel_id)
-    .bind(&req.target_public_key)
-    .bind(&user.public_key)
-    .bind(&req.reason)
-    .bind(now)
-    .execute(&state.db)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
-
-    Ok((
-        StatusCode::CREATED,
-        Json(ChannelBanResponse {
-            channel_id,
-            target_public_key: req.target_public_key,
-            banned_by: user.public_key,
-            reason: req.reason,
-            created_at: now,
-        }),
-    ))
-}
-
-pub async fn list_channel_bans(
-    State(state): State<Arc<AppState>>,
-    user: AuthUser,
-    Path(channel_id): Path<String>,
-) -> Result<Json<Vec<ChannelBanResponse>>, (StatusCode, String)> {
-    let perms = permissions::user_permissions(&state.db, &user.public_key).await?;
-    perms.require(MUTE_MEMBERS)?;
-
-    let rows = sqlx::query_as::<_, ChannelBanRow>(
-        "SELECT channel_id, target_public_key, banned_by, reason, created_at
-         FROM channel_bans WHERE channel_id = $1 ORDER BY created_at DESC",
-    )
-    .bind(&channel_id)
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
-
-    Ok(Json(
-        rows.into_iter()
-            .map(|r| ChannelBanResponse {
-                channel_id: r.channel_id,
-                target_public_key: r.target_public_key,
-                banned_by: r.banned_by,
-                reason: r.reason,
-                created_at: r.created_at,
-            })
-            .collect(),
-    ))
-}
-
-pub async fn channel_unban(
-    State(state): State<Arc<AppState>>,
-    user: AuthUser,
-    Path((channel_id, target_key)): Path<(String, String)>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    let perms = permissions::user_permissions(&state.db, &user.public_key).await?;
-    perms.require(MUTE_MEMBERS)?;
-
-    sqlx::query("DELETE FROM channel_bans WHERE channel_id = $1 AND target_public_key = $2")
-        .bind(&channel_id)
-        .bind(&target_key)
-        .execute(&state.db)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
-
-    Ok(StatusCode::NO_CONTENT)
-}
-
 // --- Voice Mute ---
 
 pub async fn voice_mute(
@@ -230,9 +139,9 @@ pub async fn get_talk_power(
     }))
 }
 
-// --- Channel-scoped bans (routes under /channels/:id/bans, pubkey field) ---
+// --- Channel-scoped bans (routes under /channels/:id/bans) ---
 
-pub async fn channel_ban_v2(
+pub async fn channel_ban(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
     Path(channel_id): Path<String>,
@@ -243,12 +152,13 @@ pub async fn channel_ban_v2(
     let now = crate::auth::handlers::unix_timestamp();
 
     sqlx::query(
-        "INSERT INTO channel_bans (channel_id, target_public_key, banned_by, reason, created_at) VALUES ($1, $2, $3, NULL, $4)
+        "INSERT INTO channel_bans (channel_id, target_public_key, banned_by, reason, created_at) VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (channel_id, target_public_key) DO UPDATE SET banned_by = excluded.banned_by, reason = excluded.reason, created_at = excluded.created_at",
     )
     .bind(&channel_id)
     .bind(&req.pubkey)
     .bind(&user.public_key)
+    .bind(&req.reason)
     .bind(now)
     .execute(&state.db)
     .await
@@ -260,12 +170,13 @@ pub async fn channel_ban_v2(
             channel_id,
             pubkey: req.pubkey,
             banned_by: user.public_key,
-            banned_at: now.to_string(),
+            reason: req.reason,
+            banned_at: now,
         }),
     ))
 }
 
-pub async fn channel_unban_v2(
+pub async fn channel_unban(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
     Path((channel_id, pubkey)): Path<(String, String)>,
@@ -283,7 +194,7 @@ pub async fn channel_unban_v2(
     Ok(StatusCode::NO_CONTENT)
 }
 
-pub async fn list_channel_bans_v2(
+pub async fn list_channel_bans(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
     Path(channel_id): Path<String>,
@@ -306,7 +217,8 @@ pub async fn list_channel_bans_v2(
                 channel_id: r.channel_id,
                 pubkey: r.target_public_key,
                 banned_by: r.banned_by,
-                banned_at: r.created_at.to_string(),
+                reason: r.reason,
+                banned_at: r.created_at,
             })
             .collect(),
     ))

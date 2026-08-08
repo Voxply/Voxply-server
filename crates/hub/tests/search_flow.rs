@@ -268,9 +268,9 @@ async fn search_respects_channel_ban() {
     // poster's token to insert as a shortcut — the ban row only needs to
     // exist for the search filter to take effect.
     server
-        .post(format!("/moderation/channels/{}/bans", channel.id).as_str())
+        .post(format!("/channels/{}/bans", channel.id).as_str())
         .authorization_bearer(&poster_token)
-        .json(&json!({ "target_public_key": watcher.public_key_hex(), "reason": "test" }))
+        .json(&json!({ "pubkey": watcher.public_key_hex(), "reason": "test" }))
         .await;
 
     // After the moderation call, confirm search still works for the poster.

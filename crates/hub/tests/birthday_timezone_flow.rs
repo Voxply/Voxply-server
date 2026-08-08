@@ -211,7 +211,7 @@ async fn user_roster_includes_birthday_when_enabled_and_omits_when_disabled() {
         .unwrap();
     assert_eq!(me["birthday"], "05-05");
 
-    // Disabled: GET /users (and the per-channel roster) must null it out.
+    // Disabled: GET /users must null it out.
     server
         .patch("/hub")
         .authorization_bearer(&token)
@@ -229,31 +229,10 @@ async fn user_roster_includes_birthday_when_enabled_and_omits_when_disabled() {
         .find(|u| u["public_key"] == owner.public_key_hex())
         .unwrap();
     assert!(me["birthday"].is_null());
-
-    let resp = server
-        .post("/channels")
-        .authorization_bearer(&token)
-        .json(&json!({ "name": "general" }))
-        .await;
-    resp.assert_status(axum::http::StatusCode::CREATED);
-    let channel_id = resp.json::<serde_json::Value>()["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    let resp = server
-        .get(&format!("/channels/{channel_id}/members"))
-        .authorization_bearer(&token)
-        .await;
-    resp.assert_status_ok();
-    let members = resp.json::<serde_json::Value>();
-    let me = members
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|u| u["public_key"] == owner.public_key_hex())
-        .unwrap();
-    assert!(me["birthday"].is_null());
+    // The per-channel roster used to be asserted here too. `GET /channels/
+    // {id}/members` was deleted (2026-08-08): it ignored its channel_id and
+    // returned the same rows as /users, so this was one endpoint's behaviour
+    // checked twice.
 }
 
 // ---- Timezone: settings + public info ----

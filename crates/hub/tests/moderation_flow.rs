@@ -226,9 +226,9 @@ async fn channel_ban_blocks_messages() {
 
     // Ban user2 from channel
     server
-        .post(&format!("/moderation/channels/{}/bans", channel.id))
+        .post(&format!("/channels/{}/bans", channel.id))
         .authorization_bearer(&owner_token)
-        .json(&json!({ "target_public_key": user2.public_key_hex() }))
+        .json(&json!({ "pubkey": user2.public_key_hex() }))
         .await
         .assert_status(axum::http::StatusCode::CREATED);
 
@@ -243,7 +243,7 @@ async fn channel_ban_blocks_messages() {
     // Unban
     server
         .delete(&format!(
-            "/moderation/channels/{}/bans/{}",
+            "/channels/{}/bans/{}",
             channel.id,
             user2.public_key_hex()
         ))
@@ -507,8 +507,49 @@ async fn talk_power_blocks_low_priority_user() {
 }
 
 // ---------------------------------------------------------------------------
-// Task #6 — Channel bans at /channels/:id/bans (pubkey field)
+// Channel bans at /channels/:id/bans — the only channel-ban API since the
+// duplicate /moderation/channels/:id/bans routes were folded in (2026-08-08).
 // ---------------------------------------------------------------------------
+
+/// The two former route families disagreed about `reason`: the
+/// /moderation/... one wrote it, the /channels/... one hardcoded NULL on
+/// insert, so a ban placed with a reason lost it as soon as anyone re-banned
+/// through the other door. One handler now, and it round-trips the reason.
+#[tokio::test]
+async fn channel_ban_round_trips_reason() {
+    let server = common::setup().await;
+
+    let owner = Identity::generate();
+    let owner_token = common::authenticate(&server, &owner).await;
+    let user2 = Identity::generate();
+    let _ = common::authenticate(&server, &user2).await;
+
+    let resp = server
+        .post("/channels")
+        .authorization_bearer(&owner_token)
+        .json(&json!({ "name": "reason-chan" }))
+        .await;
+    let channel: ChannelResponse = resp.json();
+
+    let resp = server
+        .post(&format!("/channels/{}/bans", channel.id))
+        .authorization_bearer(&owner_token)
+        .json(&json!({ "pubkey": user2.public_key_hex(), "reason": "spamming" }))
+        .await;
+    resp.assert_status(axum::http::StatusCode::CREATED);
+    let ban: ChannelBanByPubkeyResponse = resp.json();
+    assert_eq!(ban.reason.as_deref(), Some("spamming"));
+
+    let resp = server
+        .get(&format!("/channels/{}/bans", channel.id))
+        .authorization_bearer(&owner_token)
+        .await;
+    resp.assert_status_ok();
+    let bans: Vec<ChannelBanByPubkeyResponse> = resp.json();
+    assert_eq!(bans.len(), 1);
+    assert_eq!(bans[0].reason.as_deref(), Some("spamming"));
+    assert!(bans[0].banned_at > 0);
+}
 
 #[tokio::test]
 async fn channel_ban_v2_blocks_messages_and_list() {

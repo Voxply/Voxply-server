@@ -71,9 +71,21 @@ pub fn resolve_name_color(
     }
 }
 
+/// Default page size for `GET /users` when the caller passes no `limit`.
+/// Large enough that a typical hub's whole roster arrives in one request
+/// (the member sidebar wants everyone), small enough to bound the response.
+const USERS_DEFAULT_LIMIT: i64 = 200;
+const USERS_MAX_LIMIT: i64 = 500;
+
 #[derive(Deserialize)]
 pub struct UserSearchParams {
     pub q: Option<String>,
+    /// Page size, clamped to `1..=USERS_MAX_LIMIT`.
+    pub limit: Option<i64>,
+    /// Keyset cursor: the `public_key` of the last row of the previous page.
+    /// Rows are ordered by `(display_name, public_key)`, so the cursor row's
+    /// display_name is looked up to resume from exactly where it left off.
+    pub cursor: Option<String>,
 }
 
 /// Whether a user's presence should be *reported* to other members as
@@ -179,53 +191,47 @@ pub async fn list_users(
         .as_deref()
         .map(|s| if s.len() > 64 { &s[..64] } else { s });
 
-    // Single query with a LEFT JOIN to pick up the highest-priority
-    // display_separately role in one round-trip instead of N+1 queries.
-    let rows: Vec<UserRowWithRole> = if let Some(q) = q {
-        let search = format!("%{q}%");
-        sqlx::query_as::<_, UserRowWithRole>(
-            "SELECT u.public_key, u.display_name, u.avatar, u.is_bot,
-                    u.presence_status, u.presence_custom, u.birthday, u.name_color,
-                    (SELECT r.name FROM roles r
-                     INNER JOIN user_roles ur ON r.id = ur.role_id
-                     WHERE ur.user_public_key = u.public_key AND r.display_separately = TRUE
-                     ORDER BY r.priority DESC LIMIT 1) AS group_role,
-                    (SELECT r.color FROM roles r
-                     INNER JOIN user_roles ur ON r.id = ur.role_id
-                     WHERE ur.user_public_key = u.public_key AND r.color IS NOT NULL
-                     ORDER BY r.priority DESC LIMIT 1) AS role_color
-             FROM users u
-             WHERE (u.display_name LIKE $1 OR u.public_key LIKE $2)
-               AND NOT EXISTS (SELECT 1 FROM bans b WHERE b.target_public_key = u.public_key)
-               AND (u.is_bot = TRUE OR EXISTS
-                    (SELECT 1 FROM user_roles ur2 WHERE ur2.user_public_key = u.public_key))
-             ORDER BY u.display_name, u.public_key LIMIT 50",
-        )
-        .bind(&search)
-        .bind(&search)
-        .fetch_all(&state.db)
-        .await
-    } else {
-        sqlx::query_as::<_, UserRowWithRole>(
-            "SELECT u.public_key, u.display_name, u.avatar, u.is_bot,
-                    u.presence_status, u.presence_custom, u.birthday, u.name_color,
-                    (SELECT r.name FROM roles r
-                     INNER JOIN user_roles ur ON r.id = ur.role_id
-                     WHERE ur.user_public_key = u.public_key AND r.display_separately = TRUE
-                     ORDER BY r.priority DESC LIMIT 1) AS group_role,
-                    (SELECT r.color FROM roles r
-                     INNER JOIN user_roles ur ON r.id = ur.role_id
-                     WHERE ur.user_public_key = u.public_key AND r.color IS NOT NULL
-                     ORDER BY r.priority DESC LIMIT 1) AS role_color
-             FROM users u
-             WHERE NOT EXISTS (SELECT 1 FROM bans b WHERE b.target_public_key = u.public_key)
-               AND (u.is_bot = TRUE OR EXISTS
-                    (SELECT 1 FROM user_roles ur2 WHERE ur2.user_public_key = u.public_key))
-             ORDER BY u.display_name, u.public_key LIMIT 50",
-        )
-        .fetch_all(&state.db)
-        .await
-    }
+    let limit = params
+        .limit
+        .unwrap_or(USERS_DEFAULT_LIMIT)
+        .clamp(1, USERS_MAX_LIMIT);
+
+    // One query with the search and cursor predicates switched on by binds
+    // rather than by building two near-identical SQL strings. `$1` NULL means
+    // "no search"; `$3` NULL means "first page". The cursor is a keyset on
+    // (display_name, public_key) — the same order the rows come back in — so
+    // paging stays correct as members are added or renamed mid-scroll.
+    //
+    // The two correlated subqueries pick up the highest-priority
+    // display_separately role and role color in one round-trip instead of N+1.
+    let search = q.map(|q| format!("%{q}%"));
+    let rows: Vec<UserRowWithRole> = sqlx::query_as::<_, UserRowWithRole>(
+        "SELECT u.public_key, u.display_name, u.avatar, u.is_bot,
+                u.presence_status, u.presence_custom, u.birthday, u.name_color,
+                (SELECT r.name FROM roles r
+                 INNER JOIN user_roles ur ON r.id = ur.role_id
+                 WHERE ur.user_public_key = u.public_key AND r.display_separately = TRUE
+                 ORDER BY r.priority DESC LIMIT 1) AS group_role,
+                (SELECT r.color FROM roles r
+                 INNER JOIN user_roles ur ON r.id = ur.role_id
+                 WHERE ur.user_public_key = u.public_key AND r.color IS NOT NULL
+                 ORDER BY r.priority DESC LIMIT 1) AS role_color
+         FROM users u
+         WHERE ($1::text IS NULL OR u.display_name LIKE $1 OR u.public_key LIKE $1)
+           AND ($2::text IS NULL OR
+                (COALESCE(u.display_name, ''), u.public_key) >
+                ((SELECT COALESCE(display_name, '') FROM users WHERE public_key = $2), $2))
+           AND NOT EXISTS (SELECT 1 FROM bans b WHERE b.target_public_key = u.public_key)
+           AND (u.is_bot = TRUE OR EXISTS
+                (SELECT 1 FROM user_roles ur2 WHERE ur2.user_public_key = u.public_key))
+         ORDER BY COALESCE(u.display_name, ''), u.public_key
+         LIMIT $3",
+    )
+    .bind(search.as_deref())
+    .bind(params.cursor.as_deref())
+    .bind(limit)
+    .fetch_all(&state.db)
+    .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
 
     // Checked once per request, not per row.
@@ -260,82 +266,7 @@ pub async fn list_users(
     Ok(Json(result))
 }
 
-pub async fn channel_members(
-    State(state): State<Arc<AppState>>,
-    _user: AuthUser,
-    Path(channel_id): Path<String>,
-) -> Result<Json<Vec<UserInfo>>, (StatusCode, String)> {
-    // For now, all hub users can see all channels (no per-channel access control yet).
-    // Return all users, marking who's online.
-    // When channel bans exist, we filter out banned users.
-    let online = state.online_users.read().await;
-
-    let rows = sqlx::query_as::<_, UserRow>(
-        "SELECT u.public_key, u.display_name, u.avatar, u.is_bot,
-                u.presence_status, u.presence_custom, u.birthday, u.name_color,
-                (SELECT r.color FROM roles r
-                 INNER JOIN user_roles ur ON r.id = ur.role_id
-                 WHERE ur.user_public_key = u.public_key AND r.color IS NOT NULL
-                 ORDER BY r.priority DESC LIMIT 1) AS role_color
-         FROM users u
-         WHERE u.public_key NOT IN (
-             SELECT target_public_key FROM channel_bans WHERE channel_id = $1
-         )
-           AND NOT EXISTS (SELECT 1 FROM bans b WHERE b.target_public_key = u.public_key)
-           AND (u.is_bot = TRUE OR EXISTS
-                (SELECT 1 FROM user_roles ur2 WHERE ur2.user_public_key = u.public_key))
-         ORDER BY u.display_name, u.public_key",
-    )
-    .bind(&channel_id)
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
-
-    // Checked once per request, not per row.
-    let show_birthdays = crate::routes::hub::birthdays_enabled(&state.db).await;
-    let color_mode = name_color_mode(&state.db).await;
-
-    Ok(Json(
-        rows.into_iter()
-            .map(|r| {
-                let is_connected = online.contains_key(&r.public_key);
-                let is_online = reported_online(is_connected, r.presence_status.as_deref());
-                let name_color = resolve_name_color(
-                    &color_mode,
-                    r.role_color.as_deref(),
-                    r.name_color.as_deref(),
-                );
-                UserInfo {
-                    online: is_online,
-                    status: r.presence_status.filter(|_| is_online),
-                    status_custom: r.presence_custom.filter(|_| is_online),
-                    public_key: r.public_key,
-                    display_name: r.display_name,
-                    avatar: r.avatar,
-                    group_role: None,
-                    is_bot: r.is_bot,
-                    birthday: if show_birthdays { r.birthday } else { None },
-                    name_color,
-                }
-            })
-            .collect(),
-    ))
-}
-
-#[derive(sqlx::FromRow)]
-struct UserRow {
-    public_key: String,
-    display_name: Option<String>,
-    avatar: Option<String>,
-    is_bot: bool,
-    presence_status: Option<String>,
-    presence_custom: Option<String>,
-    birthday: Option<String>,
-    name_color: Option<String>,
-    role_color: Option<String>,
-}
-
-/// Like UserRow but includes the pre-joined group_role column.
+/// Row shape for `list_users`, including the pre-joined group_role column.
 #[derive(sqlx::FromRow)]
 struct UserRowWithRole {
     public_key: String,

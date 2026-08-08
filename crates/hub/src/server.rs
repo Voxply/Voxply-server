@@ -405,10 +405,6 @@ pub fn create_router_full(
             get(routes::users::get_user_profile),
         )
         .route(
-            "/channels/{channel_id}/members",
-            get(routes::users::channel_members),
-        )
-        .route(
             "/voice/populations",
             get(routes::channels::voice_populations),
         )
@@ -544,14 +540,6 @@ pub fn create_router_full(
         )
         .route("/moderation/kick", post(routes::moderation::kick_user))
         .route(
-            "/moderation/channels/{channel_id}/bans",
-            get(routes::moderation::list_channel_bans).post(routes::moderation::channel_ban),
-        )
-        .route(
-            "/moderation/channels/{channel_id}/bans/{target_key}",
-            axum::routing::delete(routes::moderation::channel_unban),
-        )
-        .route(
             "/moderation/voice-mutes",
             get(routes::moderation::list_voice_mutes).post(routes::moderation::voice_mute),
         )
@@ -563,14 +551,14 @@ pub fn create_router_full(
             "/channels/{channel_id}/talk-power",
             get(routes::moderation::get_talk_power).post(routes::moderation::set_talk_power),
         )
-        // ---- Channel-scoped moderation (pubkey field, task #6/#7/#8) ----
+        // ---- Channel-scoped moderation ----
         .route(
             "/channels/{channel_id}/bans",
-            get(routes::moderation::list_channel_bans_v2).post(routes::moderation::channel_ban_v2),
+            get(routes::moderation::list_channel_bans).post(routes::moderation::channel_ban),
         )
         .route(
             "/channels/{channel_id}/bans/{pubkey}",
-            axum::routing::delete(routes::moderation::channel_unban_v2),
+            axum::routing::delete(routes::moderation::channel_unban),
         )
         .route(
             "/channels/{channel_id}/voice-mutes",
