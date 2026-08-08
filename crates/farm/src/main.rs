@@ -121,10 +121,9 @@ async fn main() -> Result<()> {
     // `wavvon-farm migrate` — run migrations and exit.
     let subcommand = std::env::args().nth(1);
     if subcommand.as_deref() == Some("migrate") {
-        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
         let db = PgPoolOptions::new()
             .max_connections(1)
-            .connect(&database_url)
+            .connect(&cfg.database_url)
             .await?;
         db::migrations::run(&db).await?;
         tracing::info!("Migrations applied to PostgreSQL database");
@@ -146,10 +145,9 @@ async fn main() -> Result<()> {
         tracing::info!("Loaded farm identity: {pubkey_hex}");
     }
 
-    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let db = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&database_url)
+        .max_connections(cfg.db_max_connections)
+        .connect(&cfg.database_url)
         .await?;
 
     db::migrations::run(&db).await?;

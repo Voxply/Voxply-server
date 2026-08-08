@@ -33,7 +33,13 @@ COPY --from=builder /build/target/release/wavvon-farm /usr/local/bin/wavvon-farm
 EXPOSE 4000
 
 # All env vars the farm reads. Override in docker-compose.yml or with -e flags.
-ENV WAVVON_FARM_HTTP_PORT=4000
+# WAVVON_HTTP_PORT, not WAVVON_FARM_HTTP_PORT: settings::load() reads every
+# field through config::Environment::with_prefix("WAVVON"), so the field
+# `http_port` comes from WAVVON_HTTP_PORT. The old name was ignored and only
+# appeared to work because it matched the built-in default.
+ENV WAVVON_HTTP_PORT=4000
+# PostgreSQL connection URL. Required — the farm will not start without it.
+# ENV WAVVON_DATABASE_URL=postgres://wavvon:wavvon@db:5432/wavvon_farm
 # The externally reachable URL of this farm — used in session tokens.
 # Must be set correctly in production.
 # ENV WAVVON_FARM_URL=https://farm.example.com

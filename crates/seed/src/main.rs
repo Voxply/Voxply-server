@@ -9,12 +9,25 @@ use wavvon_seed::state::SeedState;
 
 const DEFAULT_HTTP_PORT: u16 = 5000;
 const DEFAULT_DATABASE_URL: &str = "postgres://postgres:postgres@localhost:5432/wavvon_seed";
+/// Connection-pool size. Caps concurrent database work, not concurrent users
+/// — a connection is borrowed per query and returned. Env:
+/// `WAVVON_SEED_DB_MAX_CONNECTIONS`.
+const DEFAULT_DB_MAX_CONNECTIONS: u32 = 5;
 
 fn port_from_env(var: &str, default: u16) -> Result<u16> {
     match std::env::var(var) {
         Ok(s) => s
             .parse::<u16>()
             .with_context(|| format!("{var}={s:?} is not a valid port (1..=65535)")),
+        Err(_) => Ok(default),
+    }
+}
+
+fn u32_from_env(var: &str, default: u32) -> Result<u32> {
+    match std::env::var(var) {
+        Ok(s) => s
+            .parse::<u32>()
+            .with_context(|| format!("{var}={s:?} is not a valid positive integer")),
         Err(_) => Ok(default),
     }
 }
@@ -40,8 +53,11 @@ async fn main() -> Result<()> {
 
     let http_port = port_from_env("WAVVON_SEED_HTTP_PORT", DEFAULT_HTTP_PORT)?;
 
+    let db_max_connections =
+        u32_from_env("WAVVON_SEED_DB_MAX_CONNECTIONS", DEFAULT_DB_MAX_CONNECTIONS)?;
+
     let db = PgPoolOptions::new()
-        .max_connections(5)
+        .max_connections(db_max_connections)
         .connect(&database_url)
         .await
         .context("Failed to connect to PostgreSQL")?;

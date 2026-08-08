@@ -6,11 +6,21 @@ use serde::Deserialize;
 /// This slice is used by both `load()` (for defaults) and `--help` (for the
 /// env-var table).  When you add a field to `Settings`, add a row here too.
 ///
+/// Keys that another process sets when launching a hub — the farm and the
+/// agent do — come from [`wavvon_hub_env`] rather than being spelled here as
+/// literals, so the two ends cannot disagree. They did: the farm spent months
+/// setting `WAVVON_HUB_DB` and `WAVVON_HUB_HTTP_PORT`, names this table has
+/// never contained, and nothing failed loudly.
+///
 /// Fields: (env-var name without prefix, default value or "" if unset, purpose)
 pub const ENV_VAR_HELP: &[(&str, &str, &str)] = &[
-    ("WAVVON_HTTP_PORT", "3000", "HTTP / WebSocket port the hub listens on"),
     (
-        "WAVVON_VOICE_UDP_PORT",
+        wavvon_hub_env::HTTP_PORT,
+        "3000",
+        "HTTP / WebSocket port the hub listens on",
+    ),
+    (
+        wavvon_hub_env::VOICE_UDP_PORT,
         "3001",
         "UDP port for the voice relay",
     ),
@@ -32,12 +42,12 @@ pub const ENV_VAR_HELP: &[(&str, &str, &str)] = &[
          not cookie-based, so there is no CSRF surface",
     ),
     (
-        "WAVVON_FARM_URL",
+        wavvon_hub_env::FARM_URL,
         "(unset)",
         "URL of the farm this hub is managed by. Enables farm-issued token acceptance",
     ),
     (
-        "WAVVON_OWNER_PUBKEY",
+        wavvon_hub_env::OWNER_PUBKEY,
         "(unset)",
         "Ed25519 public key (64 hex chars) seeded as builtin-owner on first boot",
     ),
@@ -88,14 +98,23 @@ pub const ENV_VAR_HELP: &[(&str, &str, &str)] = &[
         "Full-text search backend: `tantivy` (default) or `none` to disable search",
     ),
     (
-        "WAVVON_DATABASE_URL",
+        wavvon_hub_env::DATABASE_URL,
         "postgres://postgres:postgres@localhost:5432/wavvon",
         "PostgreSQL connection URL (required). Example: postgres://user:pass@host/dbname",
     ),
     (
-        "WAVVON_DATABASE_READ_URL",
+        wavvon_hub_env::DATABASE_READ_URL,
         "(unset)",
         "Read-replica URL (PostgreSQL only). All queries go to the primary when unset",
+    ),
+    (
+        wavvon_hub_env::DB_MAX_CONNECTIONS,
+        "5",
+        "Size of the PostgreSQL connection pool (applies to the read-replica pool too). \
+         Every request borrows a connection for the duration of a query and returns it, \
+         so this caps concurrent database work, not concurrent users. Raise it for a busy \
+         hub — but keep the total across all hubs sharing one PostgreSQL server under that \
+         server's own max_connections (default 100), or connections will be refused",
     ),
     (
         "WAVVON_SFU_URL",
@@ -246,6 +265,9 @@ pub struct Settings {
     /// Read-replica URL. Only used when database_url is PostgreSQL.
     /// If unset, all queries go to the primary.
     pub database_read_url: Option<String>,
+    /// PostgreSQL connection-pool size, for the primary and the read replica
+    /// alike. Env: WAVVON_DB_MAX_CONNECTIONS
+    pub db_max_connections: u32,
     /// Enable trusted-proxy mode for the rate limiter.
     ///
     /// When `true`, the limiter derives the real client IP from the last
@@ -315,6 +337,7 @@ pub fn load() -> Result<Settings> {
         .set_default("bots_allow_video", false)?
         .set_default("bot_video_stream_budget", 2u32)?
         .set_default("device_token_ttl_days", 30u64)?
+        .set_default("db_max_connections", 5u32)?
         .set_default("lan_mode", false)?
         .set_default("lan_tls_mode", "self")?
         .set_default("lan_mdns", true)?
@@ -323,4 +346,108 @@ pub fn load() -> Result<Settings> {
         .build()?
         .try_deserialize::<Settings>()?;
     Ok(settings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every key a launcher (farm, agent) may set on a spawned hub must be a
+    /// key this hub actually reads.
+    ///
+    /// This is the assertion that was missing. The farm set
+    /// `WAVVON_HUB_HTTP_PORT` and `WAVVON_HUB_DB` for months; the hub reads
+    /// `WAVVON_HTTP_PORT` and `WAVVON_DATABASE_URL`. Nothing failed — spawned
+    /// hubs quietly ignored their assigned port and bound the default, so the
+    /// farm's reverse proxy pointed at nothing and a second hub on the same
+    /// box collided.
+    #[test]
+    fn every_spawnable_key_is_one_the_hub_reads() {
+        let declared: Vec<&str> = ENV_VAR_HELP.iter().map(|(name, _, _)| *name).collect();
+        for key in wavvon_hub_env::SPAWNABLE {
+            assert!(
+                declared.contains(key),
+                "{key} can be set on a spawned hub but is not in ENV_VAR_HELP — \
+                 the hub would ignore it silently"
+            );
+        }
+    }
+
+    /// The test above only proves both sides use the same *symbol*; it would
+    /// still pass if that symbol held a name nothing reads, since the table
+    /// and the launcher now share it. This one proves the name actually
+    /// *configures* the hub, by setting it and watching `load()` react.
+    ///
+    /// Env is process-global and Rust runs tests in parallel, so every
+    /// assertion that touches it lives in this single test rather than one
+    /// test per key.
+    #[test]
+    fn spawnable_keys_actually_reach_settings() {
+        // Guard against a stray hub.toml in the crate dir shadowing defaults.
+        let baseline = load().expect("settings load with no overrides");
+        assert_ne!(baseline.http_port, 41_234, "pick a different probe port");
+
+        std::env::set_var(wavvon_hub_env::HTTP_PORT, "41234");
+        std::env::set_var(wavvon_hub_env::VOICE_UDP_PORT, "41235");
+        std::env::set_var(wavvon_hub_env::DB_MAX_CONNECTIONS, "37");
+        std::env::set_var(wavvon_hub_env::DATABASE_URL, "postgres://probe/db");
+        std::env::set_var(wavvon_hub_env::FARM_URL, "https://probe.farm");
+        std::env::set_var(wavvon_hub_env::OWNER_PUBKEY, "abc123");
+
+        let s = load().expect("settings load with overrides");
+
+        assert_eq!(
+            s.http_port,
+            41_234,
+            "{} is not read",
+            wavvon_hub_env::HTTP_PORT
+        );
+        assert_eq!(
+            s.voice_udp_port,
+            41_235,
+            "{} is not read",
+            wavvon_hub_env::VOICE_UDP_PORT
+        );
+        assert_eq!(
+            s.db_max_connections,
+            37,
+            "{} is not read",
+            wavvon_hub_env::DB_MAX_CONNECTIONS
+        );
+        assert_eq!(
+            s.database_url.as_deref(),
+            Some("postgres://probe/db"),
+            "{} is not read",
+            wavvon_hub_env::DATABASE_URL
+        );
+        assert_eq!(
+            s.farm_url.as_deref(),
+            Some("https://probe.farm"),
+            "{} is not read",
+            wavvon_hub_env::FARM_URL
+        );
+        assert_eq!(
+            s.owner_pubkey.as_deref(),
+            Some("abc123"),
+            "{} is not read",
+            wavvon_hub_env::OWNER_PUBKEY
+        );
+
+        for key in wavvon_hub_env::SPAWNABLE {
+            std::env::remove_var(key);
+        }
+    }
+
+    /// `config::Environment::with_prefix("WAVVON")` maps `WAVVON_FOO_BAR` to
+    /// the `foo_bar` field, so a row whose name lacks the prefix can never be
+    /// read no matter what `load()` does with it.
+    #[test]
+    fn every_declared_key_uses_the_wavvon_prefix() {
+        for (name, _, _) in ENV_VAR_HELP {
+            assert!(
+                name.starts_with("WAVVON_"),
+                "{name} lacks the WAVVON_ prefix and would never be read"
+            );
+        }
+    }
 }

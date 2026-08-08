@@ -4966,6 +4966,7 @@ dependencies = [
  "tokio-tungstenite 0.26.2",
  "tracing",
  "tracing-subscriber",
+ "wavvon-hub-env",
 ]
 
 [[package]]
@@ -4999,6 +5000,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",
+ "wavvon-hub-env",
  "wavvon-identity",
 ]
 
@@ -5045,10 +5047,15 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "wavvon-hub-env",
  "wavvon-identity",
  "webauthn-rs",
  "wtransport",
 ]
+
+[[package]]
+name = "wavvon-hub-env"
+version = "0.1.0"
 
 [[package]]
 name = "wavvon-identity"

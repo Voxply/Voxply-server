@@ -795,7 +795,7 @@ async fn main() -> Result<()> {
         .unwrap_or("postgres://postgres:postgres@localhost:5432/wavvon");
 
     let write_pool = PgPoolOptions::new()
-        .max_connections(5)
+        .max_connections(settings.db_max_connections)
         .connect(db_url)
         .await
         .expect("Failed to connect to database");
@@ -803,7 +803,7 @@ async fn main() -> Result<()> {
     let read_pool = if let Some(read_url) = settings.database_read_url.as_deref() {
         Some(
             PgPoolOptions::new()
-                .max_connections(5)
+                .max_connections(settings.db_max_connections)
                 .connect(read_url)
                 .await
                 .expect("Failed to connect to read-replica database"),

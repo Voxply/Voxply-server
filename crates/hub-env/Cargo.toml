@@ -1,0 +1,7 @@
+[package]
+name = "wavvon-hub-env"
+version = "0.1.0"
+edition = "2021"
+description = "Names of the hub's environment configuration keys, shared by every process that launches a hub."
+
+[dependencies]

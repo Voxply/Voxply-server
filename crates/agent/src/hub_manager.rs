@@ -33,16 +33,26 @@ impl HubManager {
         owner_pubkey: Option<&str>,
         farm_url: Option<&str>,
     ) -> Result<()> {
-        let bin = std::env::var("WAVVON_HUB_BIN").unwrap_or_else(|_| self.hub_bin.clone());
+        // See the same block in farm/src/hub_manager.rs: these names used to
+        // be literals, and WAVVON_HUB_HTTP_PORT was one the hub never reads,
+        // so the assigned port was silently ignored. `db_path` is likewise
+        // still a SQLite-era file path with no PostgreSQL provisioning behind
+        // it, so no database var is passed and the hub uses its own default.
+        let bin = std::env::var(wavvon_hub_env::HUB_BIN).unwrap_or_else(|_| self.hub_bin.clone());
         let mut cmd = tokio::process::Command::new(&bin);
-        cmd.env("WAVVON_HUB_DB", db_path)
-            .env("WAVVON_HUB_HTTP_PORT", port.to_string())
-            .env("WAVVON_VOICE_UDP_PORT", voice_port.to_string());
+        cmd.env(wavvon_hub_env::HTTP_PORT, port.to_string())
+            .env(wavvon_hub_env::VOICE_UDP_PORT, voice_port.to_string());
+        tracing::warn!(
+            hub_id,
+            db_path,
+            "no per-hub database provisioning: this hub will use the default \
+             WAVVON_DATABASE_URL and share it with every other spawned hub"
+        );
         if let Some(pk) = owner_pubkey {
-            cmd.env("WAVVON_OWNER_PUBKEY", pk);
+            cmd.env(wavvon_hub_env::OWNER_PUBKEY, pk);
         }
         if let Some(url) = farm_url {
-            cmd.env("WAVVON_FARM_URL", url);
+            cmd.env(wavvon_hub_env::FARM_URL, url);
         }
         let child = cmd.spawn().with_context(|| format!("spawn hub {hub_id}"))?;
         self.hubs.write().await.insert(

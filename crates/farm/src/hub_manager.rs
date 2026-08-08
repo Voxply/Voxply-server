@@ -83,16 +83,35 @@ impl HubManager {
         voice_port: u16,
         owner_pubkey: Option<&str>,
     ) -> Result<()> {
-        let bin = std::env::var("WAVVON_HUB_BIN").unwrap_or_else(|_| self.hub_bin.clone());
+        let bin = std::env::var(wavvon_hub_env::HUB_BIN).unwrap_or_else(|_| self.hub_bin.clone());
 
+        // Names come from `wavvon_hub_env` rather than string literals. This
+        // call used to set WAVVON_HUB_HTTP_PORT, a name the hub never reads —
+        // so every spawned hub ignored its carefully allocated port and bound
+        // the default 3000, and the proxy routed to a port nothing listened
+        // on. Nothing failed loudly, which is why it survived.
         let mut cmd = tokio::process::Command::new(&bin);
-        cmd.env("WAVVON_HUB_DB", db_path)
-            .env("WAVVON_HUB_HTTP_PORT", port.to_string())
-            .env("WAVVON_VOICE_UDP_PORT", voice_port.to_string())
-            .env("WAVVON_FARM_URL", &self.farm_url);
+        cmd.env(wavvon_hub_env::HTTP_PORT, port.to_string())
+            .env(wavvon_hub_env::VOICE_UDP_PORT, voice_port.to_string())
+            .env(wavvon_hub_env::FARM_URL, &self.farm_url);
         if let Some(pk) = owner_pubkey {
-            cmd.env("WAVVON_OWNER_PUBKEY", pk);
+            cmd.env(wavvon_hub_env::OWNER_PUBKEY, pk);
         }
+
+        // `db_path` is still a leftover SQLite-era file path
+        // (`{hubs_dir}/{hub_id}.db`) and there is no per-hub PostgreSQL
+        // provisioning yet, so nothing is passed for the hub's database and
+        // it falls back to its own default. Two hubs on one box therefore
+        // share a database. That used to be invisible — the farm set
+        // WAVVON_HUB_DB, which the hub has never read, so it looked handled.
+        // Warn until provisioning lands (ROADMAP: farm multi-node data plane
+        // lists per-node PostgreSQL as a prerequisite).
+        tracing::warn!(
+            hub_id,
+            db_path,
+            "no per-hub database provisioning: this hub will use the default \
+             WAVVON_DATABASE_URL and share it with every other farm-spawned hub"
+        );
         let child = cmd.spawn().with_context(|| {
             format!("Failed to spawn hub process for {hub_id} (binary: {bin:?})")
         })?;

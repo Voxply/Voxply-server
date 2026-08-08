@@ -5,6 +5,10 @@
 #
 # Set WAVVON_FARM_URL to the farm's externally reachable URL before starting.
 # The hub will discover the farm at startup and delegate auth to it.
+#
+# Farm and hub each get their own database on one PostgreSQL server: the farm
+# stores accounts and hub lifecycle, the hub stores community state, and they
+# share no tables.
 
 services:
   farm:
@@ -16,10 +20,18 @@ services:
       - "4000:4000"
     volumes:
       - farm-data:/data
+    depends_on:
+      db:
+        condition: service_healthy
     environment:
-      WAVVON_FARM_HTTP_PORT: "4000"
+      WAVVON_HTTP_PORT: "4000"
+      WAVVON_DATABASE_URL: "postgres://wavvon:${WAVVON_DB_PASSWORD:-wavvon}@db:5432/wavvon_farm"
       # Must match the URL clients and hubs use to reach the farm externally:
       WAVVON_FARM_URL: "${WAVVON_FARM_URL:-http://localhost:4000}"
+      # Connection-pool size. Caps concurrent database work, not concurrent
+      # users — raise on a busy farm, keeping farm + hub totals under the
+      # PostgreSQL server's own max_connections (default 100).
+      # WAVVON_DB_MAX_CONNECTIONS: "5"
       # WAVVON_LOG_FORMAT: json
       # WAVVON_OTLP_ENDPOINT: http://otel-collector:4318
     restart: unless-stopped
@@ -38,16 +50,42 @@ services:
     environment:
       WAVVON_HTTP_PORT: "3000"
       WAVVON_VOICE_UDP_PORT: "3001"
+      WAVVON_DATABASE_URL: "postgres://wavvon:${WAVVON_DB_PASSWORD:-wavvon}@db:5432/wavvon"
       # Point the hub at the farm so it delegates auth:
       WAVVON_FARM_URL: http://farm:4000
+      # WAVVON_DB_MAX_CONNECTIONS: "5"
       # WAVVON_TLS_CERT: /certs/fullchain.pem
       # WAVVON_TLS_KEY: /certs/privkey.pem
       # WAVVON_LOG_FORMAT: json
       # WAVVON_OTLP_ENDPOINT: http://otel-collector:4318
     depends_on:
-      - farm
+      farm:
+        condition: service_started
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: wavvon
+      POSTGRES_PASSWORD: "${WAVVON_DB_PASSWORD:-wavvon}"
+      POSTGRES_DB: wavvon
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      # Creates the farm's database alongside the hub's on first boot.
+      # Runs only when the data volume is empty.
+      - ./deploy/init-farm-db.sql:/docker-entrypoint-initdb.d/10-farm-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wavvon -d wavvon"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # No host port published on purpose — reachable only on the compose
+    # network, never the internet.
     restart: unless-stopped
 
 volumes:
   farm-data:
   hub-data:
+  db-data:
