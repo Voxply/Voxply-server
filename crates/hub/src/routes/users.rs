@@ -185,11 +185,14 @@ pub async fn list_users(
 ) -> Result<Json<Vec<UserInfo>>, (StatusCode, String)> {
     let online = state.online_users.read().await;
 
-    // Cap search queries to prevent unbounded LIKE pattern scans.
+    // Cap search queries to prevent unbounded LIKE pattern scans. Truncating
+    // by *character* rather than by byte: `&s[..64]` panics outright when
+    // byte 64 lands mid-codepoint, so any search of 22+ three-byte characters
+    // (`€`, most CJK, …) took the handler down. The hub ships in four locales.
     let q = params
         .q
         .as_deref()
-        .map(|s| if s.len() > 64 { &s[..64] } else { s });
+        .map(|s| s.chars().take(64).collect::<String>());
 
     let limit = params
         .limit
@@ -198,13 +201,14 @@ pub async fn list_users(
 
     // One query with the search and cursor predicates switched on by binds
     // rather than by building two near-identical SQL strings. `$1` NULL means
-    // "no search"; `$3` NULL means "first page". The cursor is a keyset on
+    // "no search"; `$2` NULL means "first page". The cursor is a keyset on
     // (display_name, public_key) — the same order the rows come back in — so
     // paging stays correct as members are added or renamed mid-scroll.
     //
     // The two correlated subqueries pick up the highest-priority
     // display_separately role and role color in one round-trip instead of N+1.
     let search = q.map(|q| format!("%{q}%"));
+
     let rows: Vec<UserRowWithRole> = sqlx::query_as::<_, UserRowWithRole>(
         "SELECT u.public_key, u.display_name, u.avatar, u.is_bot,
                 u.presence_status, u.presence_custom, u.birthday, u.name_color,

@@ -131,6 +131,33 @@ async fn users_search_still_filters_and_pages() {
     assert_eq!(page.len(), 4, "search and limit compose");
 }
 
+/// The `q` cap used to truncate with `&s[..64]`, a *byte* index — so any
+/// search whose 64th byte landed mid-codepoint panicked the handler. 22 or
+/// more three-byte characters was enough, and the hub ships in four locales.
+#[tokio::test]
+async fn users_search_survives_multibyte_queries_past_the_cap() {
+    let server = common::setup().await;
+    let viewer = Identity::generate();
+    let token = common::authenticate(&server, &viewer).await;
+    seed_members(&server, 2).await;
+
+    for q in [
+        "€".repeat(30),  // 3-byte: byte 64 lands inside a character
+        "😀".repeat(40), // 4-byte
+        "à".repeat(50),  // 2-byte
+        "日本語".repeat(30),
+    ] {
+        let resp = server
+            .get("/users")
+            .authorization_bearer(&token)
+            .add_query_param("q", q.as_str())
+            .await;
+        resp.assert_status_ok();
+        // Nobody is named this; the point is that it answers at all.
+        assert!(resp.json::<Vec<serde_json::Value>>().is_empty());
+    }
+}
+
 // ---- DM history ----
 
 /// Opens a 1:1 conversation between two fresh identities and returns
