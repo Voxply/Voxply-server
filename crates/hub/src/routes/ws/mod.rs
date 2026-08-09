@@ -28,7 +28,7 @@ pub async fn ws_handler(
     // Delegate to the shared session-validity helper so the WS admission
     // checks never drift from what the HTTP AuthUser middleware enforces
     // (session expiry, revocation, approval_status, bans).
-    let auth = crate::auth::handlers::validate_ws_token(&state.db, &params.token).await?;
+    let auth = crate::auth::handlers::validate_ws_token(&state, &params.token).await?;
     let public_key = auth.public_key;
 
     tracing::info!(

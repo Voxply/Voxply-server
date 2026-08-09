@@ -30,6 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
+use futures_util::{SinkExt, StreamExt};
 use rand::rngs::OsRng;
 use reqwest::Client;
 use serde_json::json;
@@ -286,5 +287,36 @@ async fn a_hub_created_through_the_farm_becomes_reachable_through_it() {
         "the pubkey address must work too"
     );
 
+    // 8. And the WebSocket, through the proxy's socket bridge to the real hub.
+    //
+    // This is the one part of a farm-hosted hub a client cannot reach over the
+    // ordinary buffered path: an Upgrade needs the raw connection handed over.
+    // The client builds its socket URL as `${hub_url}/ws`, so behind a farm
+    // that is `/hub/<slug>/ws` — a path-prefixed upgrade, bridged to another
+    // process, on a hub authenticating with a farm-issued token. Every one of
+    // those is new here, and none is exercised by the farm's own bridge test
+    // (a stub hub) or by the hub's WS tests (no farm).
+    let ws_url = format!(
+        "{}/hub/mangiadapippo/ws?token={}",
+        farm_url.replace("http://", "ws://"),
+        token,
+    );
+    let (mut socket, _resp) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("the client's WebSocket must reach the hub through the farm");
+
+    // The hub greets an accepted socket. Any frame proves the bridge carried
+    // real traffic from the hub process, rather than the handshake merely
+    // completing against the proxy.
+    let greeting = tokio::time::timeout(Duration::from_secs(10), socket.next())
+        .await
+        .expect("timed out waiting for the hub's first frame")
+        .expect("the socket closed instead of speaking");
+    assert!(
+        greeting.is_ok(),
+        "expected a frame from the hub, got {greeting:?}"
+    );
+
+    let _ = socket.close(None).await;
     let _ = state.hub_manager.stop_hub(&hub_id).await;
 }
