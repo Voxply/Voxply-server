@@ -49,7 +49,11 @@ impl HubManager {
         // `cargo test --workspace` for the better part of an hour.
         cmd.kill_on_drop(true)
             .env(wavvon_hub_env::HTTP_PORT, port.to_string())
-            .env(wavvon_hub_env::VOICE_UDP_PORT, voice_port.to_string());
+            .env(wavvon_hub_env::VOICE_UDP_PORT, voice_port.to_string())
+            // The farm's row id for this hub, forwarded from the spawn command.
+            // The hub reports it back on its heartbeat so the farm can bind the
+            // row to the hub's pubkey and route to it.
+            .env(wavvon_hub_env::FARM_HUB_ID, hub_id);
         tracing::warn!(
             hub_id,
             db_path,

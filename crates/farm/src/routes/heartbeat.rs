@@ -40,6 +40,66 @@ pub async fn receive_heartbeat(
         .unwrap_or(0);
     let now = unix_now();
 
+    // First contact: bind the row to the pubkey ("claiming the serial").
+    //
+    // The farm allocates a `hubs` row before the process exists, so it cannot
+    // know the hub's Ed25519 key — that is generated on the hub's first boot.
+    // The hub reports back the id we handed it at spawn (WAVVON_FARM_HUB_ID)
+    // and we record its pubkey against that row, once.
+    //
+    // Nothing did this, and `hubs.hub_pubkey` stayed NULL forever. Every
+    // consequence was silent: the proxy resolves `/hub/<serial>` against that
+    // column, so every farm-routed request 404'd; the recognition check below
+    // rejected every heartbeat; and the monitor, reading liveness from those
+    // heartbeats, concluded each hub was down, restarted it on a backoff, and
+    // eventually disabled its own auto-restart.
+    //
+    // `WHERE hub_pubkey IS NULL` makes it strictly one-shot: a hub can take an
+    // unclaimed row, never another hub's. A row already bound to a different
+    // key is left alone and the mismatch is logged — that is either a hub
+    // restored from another hub's backup or a misconfigured spawn, and both
+    // want an operator, not a silent rebind.
+    if let Some(hub_id) = payload.get("hub_id").and_then(|v| v.as_str()) {
+        let claimed = sqlx::query(
+            "UPDATE hubs SET hub_pubkey = $1
+             WHERE id = $2 AND hub_pubkey IS NULL AND deleted_at IS NULL",
+        )
+        .bind(&hub_pubkey)
+        .bind(hub_id)
+        .execute(&state.db)
+        .await;
+
+        match claimed {
+            Ok(r) if r.rows_affected() > 0 => {
+                tracing::info!(hub_id, hub_pubkey, "Hub claimed its row — routable now");
+            }
+            Ok(_) => {
+                // Either already bound to us (the normal steady state, every
+                // 60s) or bound to someone else (worth saying out loud).
+                let existing: Option<Option<String>> =
+                    sqlx::query_scalar("SELECT hub_pubkey FROM hubs WHERE id = $1")
+                        .bind(hub_id)
+                        .fetch_optional(&state.db)
+                        .await
+                        .ok()
+                        .flatten();
+                if let Some(Some(bound)) = existing {
+                    if bound != hub_pubkey {
+                        tracing::warn!(
+                            hub_id,
+                            bound_pubkey = bound,
+                            reporting_pubkey = hub_pubkey,
+                            "Heartbeat claims a hub row already bound to a different \
+                             pubkey — ignoring the claim. Check for a duplicated \
+                             WAVVON_FARM_HUB_ID or a restored hub identity."
+                        );
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(hub_id, error = %e, "Failed to claim hub row"),
+        }
+    }
+
     // Only accept heartbeats from hubs we recognise (hub_pubkey in hubs table).
     let known_count: Result<i64, _> = sqlx::query_scalar(
         "SELECT COUNT(*) FROM hubs WHERE hub_pubkey = $1 AND deleted_at IS NULL",

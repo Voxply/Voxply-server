@@ -98,7 +98,11 @@ impl HubManager {
         cmd.kill_on_drop(true)
             .env(wavvon_hub_env::HTTP_PORT, port.to_string())
             .env(wavvon_hub_env::VOICE_UDP_PORT, voice_port.to_string())
-            .env(wavvon_hub_env::FARM_URL, &self.farm_url);
+            .env(wavvon_hub_env::FARM_URL, &self.farm_url)
+            // Our row id for this hub. It reports this back on its first
+            // heartbeat, which is the only way we learn its pubkey and can
+            // start routing `/hub/<serial>` to it.
+            .env(wavvon_hub_env::FARM_HUB_ID, hub_id);
         if let Some(pk) = owner_pubkey {
             cmd.env(wavvon_hub_env::OWNER_PUBKEY, pk);
         }

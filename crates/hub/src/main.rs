@@ -1214,6 +1214,20 @@ async fn main() -> Result<()> {
     if let Some(ref farm_url_for_hb) = state.farm_url {
         let hb_state = state.clone();
         let hb_url = farm_url_for_hb.clone();
+        // The farm allocated our row before this process existed, so it does
+        // not know our pubkey — it is generated on first boot. Reporting the
+        // id it gave us is how it binds the two. Without it the farm has a hub
+        // it can manage but cannot route to, because the proxy keys on
+        // `hubs.hub_pubkey`.
+        let hb_farm_hub_id = settings.farm_hub_id.clone();
+        if hb_farm_hub_id.is_none() {
+            tracing::warn!(
+                "{} is set but {} is not — the farm cannot bind this hub to its row, \
+                 so it will never be able to route traffic to us",
+                wavvon_hub_env::FARM_URL,
+                wavvon_hub_env::FARM_HUB_ID,
+            );
+        }
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             interval.tick().await; // skip the immediate first tick
@@ -1223,6 +1237,7 @@ async fn main() -> Result<()> {
                 let db_size = 0u64; // PostgreSQL: size reported separately by the DB server
                 let uptime = hb_state.started_at.elapsed().as_secs();
                 let payload = serde_json::json!({
+                    "hub_id": hb_farm_hub_id,
                     "hub_pubkey": hb_state.hub_identity.public_key_hex(),
                     "online_users": online,
                     "storage_bytes": db_size,

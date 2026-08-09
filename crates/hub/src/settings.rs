@@ -64,6 +64,11 @@ pub const ENV_VAR_HELP: &[(&str, &str, &str)] = &[
         "Ed25519 public key (64 hex chars) seeded as builtin-owner on first boot",
     ),
     (
+        wavvon_hub_env::FARM_HUB_ID,
+        "(unset)",
+        "The farm's row id for this hub. Reported on heartbeat so the farm can route to it",
+    ),
+    (
         "WAVVON_DISCOVERY_URL",
         "https://discovery.wavvon.io",
         "Discovery service base URL",
@@ -243,6 +248,11 @@ pub struct Settings {
     pub cors_origins: String,
     /// Farm URL when this hub is managed by a farm. Env: WAVVON_FARM_URL
     pub farm_url: Option<String>,
+    /// The farm's own row id for this hub, given at spawn. Reported back on
+    /// every heartbeat so the farm can bind its row to this hub's pubkey —
+    /// without it the farm has a hub it cannot route to.
+    /// Env: WAVVON_FARM_HUB_ID
+    pub farm_hub_id: Option<String>,
     /// Owner's Ed25519 public key (64 hex chars). Seeded as builtin-owner on first boot.
     /// Env: WAVVON_OWNER_PUBKEY
     pub owner_pubkey: Option<String>,
@@ -406,6 +416,7 @@ mod tests {
         std::env::set_var(wavvon_hub_env::DATABASE_URL, "postgres://probe/db");
         std::env::set_var(wavvon_hub_env::FARM_URL, "https://probe.farm");
         std::env::set_var(wavvon_hub_env::OWNER_PUBKEY, "abc123");
+        std::env::set_var(wavvon_hub_env::FARM_HUB_ID, "hub-probe-id");
 
         let s = load().expect("settings load with overrides");
 
@@ -444,6 +455,12 @@ mod tests {
             Some("abc123"),
             "{} is not read",
             wavvon_hub_env::OWNER_PUBKEY
+        );
+        assert_eq!(
+            s.farm_hub_id.as_deref(),
+            Some("hub-probe-id"),
+            "{} is not read",
+            wavvon_hub_env::FARM_HUB_ID
         );
 
         for key in wavvon_hub_env::SPAWNABLE {

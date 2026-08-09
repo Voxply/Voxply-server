@@ -37,6 +37,15 @@ pub const FARM_URL: &str = "WAVVON_FARM_URL";
 /// Public key seeded as the hub owner on first boot.
 pub const OWNER_PUBKEY: &str = "WAVVON_OWNER_PUBKEY";
 
+/// The farm's own row id for this hub, handed to it at spawn.
+///
+/// The farm allocates a hub row before the process exists, so it cannot know
+/// the hub's Ed25519 key — that is generated on first boot. The hub reports
+/// this id back on its first heartbeat, which is how the farm learns the
+/// pubkey and can finally route to it: the proxy keys on `hubs.hub_pubkey`,
+/// and until it is filled every farm-routed request 404s.
+pub const FARM_HUB_ID: &str = "WAVVON_FARM_HUB_ID";
+
 /// Path to the `wavvon-hub` binary. Read by the farm and the agent to decide
 /// what to launch — not read by the hub itself.
 pub const HUB_BIN: &str = "WAVVON_HUB_BIN";
@@ -55,6 +64,7 @@ pub const SPAWNABLE: &[&str] = &[
     DB_MAX_CONNECTIONS,
     FARM_URL,
     OWNER_PUBKEY,
+    FARM_HUB_ID,
 ];
 
 #[cfg(test)]
