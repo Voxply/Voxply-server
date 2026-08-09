@@ -12,11 +12,16 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-22.04]
+        # Both ends of the supported range. 14 is the declared minimum
+        # (hosting.md); testing only the newest would make "we support 14" a
+        # claim nobody checks — which is how the PG floor went undeclared and
+        # unenforced until 2026-08-08.
+        postgres: ["16-alpine", "14-alpine"]
     runs-on: ${{ matrix.os }}
 
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:${{ matrix.postgres }}
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres

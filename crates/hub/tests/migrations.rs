@@ -103,3 +103,14 @@ async fn migrations_create_all_core_tables() {
         assert_eq!(count, 1, "Table '{table}' should exist after migrations");
     }
 }
+
+/// The real server the suite runs against must satisfy the declared floor —
+/// otherwise the floor is a claim nobody checks. Pairs with the unit tests in
+/// `db::version`, which cover the comparison and the message.
+#[tokio::test]
+async fn test_database_meets_the_declared_minimum_version() {
+    let (db, _guard) = common::create_test_db().await;
+    wavvon_hub::db::version::ensure_supported(&db)
+        .await
+        .expect("CI/dev PostgreSQL is below the declared minimum");
+}

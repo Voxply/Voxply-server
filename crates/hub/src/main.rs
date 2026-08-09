@@ -254,7 +254,7 @@ async fn run_doctor() -> bool {
     let db_url = settings
         .database_url
         .clone()
-        .unwrap_or_else(|| "postgres://postgres:postgres@localhost:5432/wavvon".to_string());
+        .unwrap_or_else(|| wavvon_hub::settings::DEFAULT_DATABASE_URL.to_string());
     match PgPoolOptions::new()
         .max_connections(1)
         .connect(&db_url)
@@ -417,6 +417,9 @@ async fn main() -> Result<()> {
             .max_connections(1)
             .connect(&db_url)
             .await?;
+        db::version::ensure_supported(&db)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         db::migrations::run(&db).await?;
         println!("Migrations applied");
         return Ok(());
@@ -784,10 +787,17 @@ async fn main() -> Result<()> {
         );
     }
 
-    let db_url = settings
-        .database_url
-        .as_deref()
-        .unwrap_or("postgres://postgres:postgres@localhost:5432/wavvon");
+    let db_url = settings.database_url.as_deref().unwrap_or_else(|| {
+        // Provisional: an unset URL is going to mean "start the embedded
+        // PostgreSQL" (decisions.md). Until then, say which database we
+        // guessed rather than connecting to localhost silently.
+        eprintln!(
+            "WARN  {} is not set — using the built-in default {}",
+            wavvon_hub_env::DATABASE_URL,
+            wavvon_hub::settings::DEFAULT_DATABASE_URL,
+        );
+        wavvon_hub::settings::DEFAULT_DATABASE_URL
+    });
 
     let write_pool = PgPoolOptions::new()
         .max_connections(settings.db_max_connections)
@@ -809,6 +819,14 @@ async fn main() -> Result<()> {
 
     let db = write_pool;
     let db_read = read_pool;
+
+    // Before migrations: a server below the floor otherwise fails partway
+    // through applying the schema, and the operator sees a CREATE TABLE
+    // syntax error instead of "your PostgreSQL is too old".
+    if let Err(e) = db::version::ensure_supported(&db).await {
+        eprintln!("FATAL {e}");
+        std::process::exit(1);
+    }
 
     db::migrations::run(&db).await?;
 
@@ -1389,10 +1407,22 @@ async fn run_self_update(check_only: bool) -> anyhow::Result<()> {
 /// silently hit the built-in default on any hub configured the documented
 /// way. `WAVVON_DATABASE_URL` is the documented variable (the one `Settings`
 /// resolves for the server path); the unprefixed name stays as a fallback.
+///
+/// Falling back to the built-in default is *announced*. These subcommands
+/// mutate ownership and schema, and "it said OK" against a database the
+/// operator did not mean is the failure this whole function exists to stop.
 fn cli_database_url() -> String {
     std::env::var(wavvon_hub_env::DATABASE_URL)
         .or_else(|_| std::env::var("DATABASE_URL"))
-        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/wavvon".to_string())
+        .unwrap_or_else(|_| {
+            eprintln!(
+                "WARN  {} is not set — using the built-in default {}. \
+                 Set it explicitly to be sure which database you are operating on.",
+                wavvon_hub_env::DATABASE_URL,
+                wavvon_hub::settings::DEFAULT_DATABASE_URL,
+            );
+            wavvon_hub::settings::DEFAULT_DATABASE_URL.to_string()
+        })
 }
 
 fn backup(out_path: &str) -> anyhow::Result<()> {

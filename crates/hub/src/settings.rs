@@ -13,6 +13,18 @@ use serde::Deserialize;
 /// never contained, and nothing failed loudly.
 ///
 /// Fields: (env-var name without prefix, default value or "" if unset, purpose)
+/// Connection URL used when nothing configures one.
+///
+/// **Provisional.** Per
+/// [decisions.md](../../../../docs/docs/decisions.md), an unset
+/// `WAVVON_DATABASE_URL` is going to mean *"start and manage an embedded
+/// PostgreSQL"*, not *"guess localhost with the default superuser
+/// credentials"*. Until that lands this keeps the historical behaviour, but
+/// every caller that falls back to it says so on stderr — silently operating
+/// on whatever database happens to answer at localhost is how
+/// `wavvon-hub admin` came to target the wrong one.
+pub const DEFAULT_DATABASE_URL: &str = "postgres://postgres:postgres@localhost:5432/wavvon";
+
 pub const ENV_VAR_HELP: &[(&str, &str, &str)] = &[
     (
         wavvon_hub_env::HTTP_PORT,
@@ -99,7 +111,7 @@ pub const ENV_VAR_HELP: &[(&str, &str, &str)] = &[
     ),
     (
         wavvon_hub_env::DATABASE_URL,
-        "postgres://postgres:postgres@localhost:5432/wavvon",
+        DEFAULT_DATABASE_URL,
         "PostgreSQL connection URL (required). Example: postgres://user:pass@host/dbname",
     ),
     (
@@ -259,7 +271,8 @@ pub struct Settings {
     /// Set to "none" to disable search entirely (NullSearch).
     /// Env: WAVVON_SEARCH_BACKEND
     pub search_backend: Option<String>,
-    /// PostgreSQL connection URL. Defaults to postgres://postgres:postgres@localhost:5432/wavvon.
+    /// PostgreSQL connection URL. Falls back to [`DEFAULT_DATABASE_URL`]
+    /// when unset — with a warning, and only until embedded PostgreSQL lands.
     /// Env: WAVVON_DATABASE_URL
     pub database_url: Option<String>,
     /// Read-replica URL. Only used when database_url is PostgreSQL.
