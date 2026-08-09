@@ -26,7 +26,10 @@ fn is_allowed_mime(mime: &str) -> bool {
         || mime == "text/plain"
 }
 
-fn uploads_dir() -> String {
+/// Where uploaded attachments live. Public because `backup`/`restore` have to
+/// put the same files in the same place — two copies of this default drifting
+/// apart is how a backup silently stops containing anything.
+pub fn uploads_dir() -> String {
     std::env::var("WAVVON_UPLOADS_DIR").unwrap_or_else(|_| "./uploads/".to_string())
 }
 

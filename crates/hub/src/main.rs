@@ -25,8 +25,13 @@ fn print_help() {
     println!("SUBCOMMANDS:");
     println!("  setup            Interactive install wizard: generates docker-compose.yml + .env");
     println!("  migrate          Apply DB migrations and exit");
-    println!("  backup [FILE]    Write a backup archive (default: hub-backup-<ts>.tar.gz)");
-    println!("  restore FILE     Restore from a backup archive");
+    println!(
+        "  backup [FILE]    Back up database + identity + uploads \
+         (default: hub-backup-<ts>.tar.gz)"
+    );
+    println!("  restore FILE [--force]");
+    println!("                   Restore a backup archive. Refuses a non-empty");
+    println!("                   destination unless --force.");
     println!("  rotate-key       Generate a new hub keypair and sign a rotation payload");
     println!("  update [--check] Self-update binary from GitHub releases (Linux x86_64 only)");
     println!("  admin <cmd>      Admin CLI (stats|users|channels|tokens|backup|restore)\n");
@@ -433,7 +438,7 @@ async fn main() -> Result<()> {
                 .as_secs();
             format!("hub-backup-{ts}.tar.gz")
         });
-        backup(&out_path)?;
+        backup(&out_path, &cli_database_url()).await?;
         println!("Backup written to {out_path}");
         return Ok(());
     }
@@ -441,8 +446,12 @@ async fn main() -> Result<()> {
     if subcommand.as_deref() == Some("restore") {
         let src = std::env::args()
             .nth(2)
-            .ok_or_else(|| anyhow::anyhow!("Usage: wavvon-hub restore <backup.tar.gz>"))?;
-        restore(&src)?;
+            .filter(|a| !a.starts_with("--"))
+            .ok_or_else(|| {
+                anyhow::anyhow!("Usage: wavvon-hub restore <backup.tar.gz> [--force]")
+            })?;
+        let force = std::env::args().any(|a| a == "--force");
+        restore(&src, &cli_database_url(), force).await?;
         println!("Restore complete. Restart the hub to apply.");
         return Ok(());
     }
@@ -653,14 +662,16 @@ async fn main() -> Result<()> {
                             .as_secs()
                     )
                 });
-                backup(&out)?;
+                backup(&out, &db_url).await?;
                 println!("Backup written to {out}");
             }
             "restore" => {
                 let src = std::env::args()
                     .nth(3)
-                    .context("Usage: admin restore <backup.tar.gz>")?;
-                restore(&src)?;
+                    .filter(|a| !a.starts_with("--"))
+                    .context("Usage: admin restore <backup.tar.gz> [--force]")?;
+                let force = std::env::args().any(|a| a == "--force");
+                restore(&src, &db_url, force).await?;
                 println!("Restore complete. Restart the hub.");
             }
             _ => {
@@ -1425,21 +1436,63 @@ fn cli_database_url() -> String {
         })
 }
 
-fn backup(out_path: &str) -> anyhow::Result<()> {
+/// Everything a hub is, in one file: the database, the identity key, and the
+/// uploaded files.
+///
+/// It used to be the identity file and a metadata stub, with a comment saying
+/// to run `pg_dump` separately — so "take a backup first" in the upgrade docs
+/// pointed at a tool that did not take one. Uploads were missing too, which
+/// meant a restored hub came back with every attachment a broken link.
+///
+/// The Tantivy search index is deliberately absent: it is derived from the
+/// messages table and rebuilt by `POST /admin/search/reindex`, so carrying it
+/// would inflate every archive with data the hub can regenerate.
+async fn backup(out_path: &str, db_url: &str) -> anyhow::Result<()> {
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(db_url)
+        .await
+        .context("Cannot open the database to back it up")?;
+
+    let server_version_num = db::dump::server_version_num(&pool).await?;
+    let row_counts = db::dump::row_counts(&pool).await?;
+
+    // Dumped to a temp file first: the tar is written last, so a pg_dump that
+    // fails leaves no archive at all rather than a plausible-looking one that
+    // is missing the database.
+    let staging = tempfile::tempdir()?;
+    let dump_path = staging.path().join("database.dump");
+    println!("Dumping the database…");
+    db::dump::dump(db_url, &dump_path)?;
+
     let file = std::fs::File::create(out_path)?;
     let gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
     let mut tar = tar::Builder::new(gz);
-    // The database is PostgreSQL — back it up separately with pg_dump.
-    // This archive only captures the identity file.
+
+    tar.append_path_with_name(&dump_path, "database.dump")?;
+
     if std::path::Path::new("hub_identity.json").exists() {
         tar.append_path("hub_identity.json")?;
     }
+
+    let uploads = wavvon_hub::routes::uploads::uploads_dir();
+    let uploads_included = std::path::Path::new(&uploads).is_dir();
+    if uploads_included {
+        tar.append_dir_all("uploads", &uploads)?;
+    }
+
     let meta = serde_json::json!({
         "timestamp": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
         "wavvon_version": env!("CARGO_PKG_VERSION"),
+        // Read back at restore time to refuse a restore into an older major
+        // before anything is written.
+        "pg_server_version_num": server_version_num,
+        // Compared after the restore, so a partial one is reported as partial.
+        "row_counts": row_counts,
+        "uploads_included": uploads_included,
     });
     let meta_bytes = serde_json::to_vec_pretty(&meta)?;
     let mut header = tar::Header::new_gnu();
@@ -1448,20 +1501,114 @@ fn backup(out_path: &str) -> anyhow::Result<()> {
     header.set_cksum();
     tar.append_data(&mut header, "backup_meta.json", meta_bytes.as_slice())?;
     tar.finish()?;
+
+    let tables = row_counts.len();
+    let rows: i64 = row_counts.values().sum();
+    println!(
+        "Backed up {rows} rows across {tables} tables from PostgreSQL {}.{}.",
+        server_version_num / 10_000,
+        server_version_num % 10_000
+    );
+    if !uploads_included {
+        println!("No uploads directory at {uploads} — nothing to include.");
+    }
     Ok(())
 }
 
-fn restore(src_path: &str) -> anyhow::Result<()> {
-    let file = std::fs::File::open(src_path)?;
+/// Restore a backup archive over the configured database.
+///
+/// Refuses rather than half-writes, in this order: the destination must be
+/// empty, and its major must be at least the source's. `--force` waives only
+/// the emptiness check — the version rule is not the operator's to overrule,
+/// because past it `pg_restore` simply cannot parse the archive.
+async fn restore(src_path: &str, db_url: &str, force: bool) -> anyhow::Result<()> {
+    let file = std::fs::File::open(src_path)
+        .with_context(|| format!("Cannot open backup archive {src_path}"))?;
     let gz = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(gz);
     let staging = tempfile::tempdir()?;
-    archive.unpack(staging.path())?;
-    // The database is PostgreSQL — restore it separately with pg_restore/psql.
-    // This command only restores the identity file from the archive.
+    archive
+        .unpack(staging.path())
+        .context("Cannot unpack the backup archive")?;
+
+    let meta: serde_json::Value = std::fs::read(staging.path().join("backup_meta.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let dump_path = staging.path().join("database.dump");
+    if dump_path.exists() {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(db_url)
+            .await
+            .context("Cannot open the destination database")?;
+
+        // Direction first: it is the check that cannot be waived, so failing
+        // it should cost nothing.
+        if let Some(source) = meta["pg_server_version_num"].as_i64() {
+            let target = db::dump::server_version_num(&pool).await?;
+            db::dump::check_direction(source as i32, target)?;
+        }
+
+        if !db::dump::is_empty(&pool).await? && !force {
+            anyhow::bail!(
+                "the destination database already has tables. Restoring over them \
+                 would merge two hubs into one. Restore into an empty database, or \
+                 pass --force if you meant to write into this one."
+            );
+        }
+
+        println!("Restoring the database…");
+        db::dump::restore(db_url, &dump_path)?;
+
+        // The archive's counts are the contract: every table it carried must
+        // come back with the same number of rows.
+        if let Ok(expected) = serde_json::from_value::<std::collections::BTreeMap<String, i64>>(
+            meta["row_counts"].clone(),
+        ) {
+            let actual = db::dump::row_counts(&pool).await?;
+            db::dump::compare_row_counts(&expected, &actual)?;
+            let rows: i64 = expected.values().sum();
+            println!("Verified {rows} rows across {} tables.", expected.len());
+        }
+    } else {
+        println!(
+            "WARN  This archive has no database dump — it was written by a hub from \
+             when `backup` only captured the identity file. The database is NOT being \
+             restored."
+        );
+    }
+
     let src = staging.path().join("hub_identity.json");
     if src.exists() {
         std::fs::copy(&src, "hub_identity.json")?;
+        println!("Restored hub_identity.json.");
+    }
+
+    let uploads_src = staging.path().join("uploads");
+    if uploads_src.is_dir() {
+        let dest = wavvon_hub::routes::uploads::uploads_dir();
+        copy_dir_all(&uploads_src, std::path::Path::new(&dest))?;
+        println!("Restored uploads into {dest}.");
+    }
+
+    Ok(())
+}
+
+/// Recursive copy, merging into whatever is already there. Files present in
+/// the archive win; files only in the destination are left alone — a restore
+/// should not delete an attachment the archive simply predates.
+fn copy_dir_all(src: &std::path::Path, dest: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let to = dest.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&entry.path(), &to)?;
+        } else {
+            std::fs::copy(entry.path(), &to)?;
+        }
     }
     Ok(())
 }
