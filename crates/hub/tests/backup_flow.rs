@@ -159,3 +159,97 @@ async fn dump_restores_every_row_into_an_empty_database() {
     drop_db(src_name).await;
     drop_db(dst_name).await;
 }
+
+/// The same round trip for a hub whose tables live in its own schema rather
+/// than in `public` — the layout a farm uses when its PostgreSQL grants one
+/// database and no `CREATEDB`.
+///
+/// `dump.rs` used to hardcode `schemaname = 'public'`. Left that way, a
+/// schema-isolated hub would have counted **zero tables, dumped nothing, and
+/// reported a successful backup** — an operator's archive quietly empty until
+/// the day they needed it. Worth its own test precisely because the failure
+/// looks like success.
+#[tokio::test]
+async fn a_hub_in_its_own_schema_backs_up_that_schema() {
+    let name = "wavvon_dumptest_schema";
+    let (admin_pool, base) = {
+        let base = base_db_url();
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&format!("{base}/postgres"))
+            .await
+            .expect("connect to the postgres maintenance database");
+        (pool, base)
+    };
+    let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
+        .execute(&admin_pool)
+        .await;
+    sqlx::query(&format!("CREATE DATABASE \"{name}\""))
+        .execute(&admin_pool)
+        .await
+        .expect("create test database");
+
+    // A hub confined to `hub_x` by search_path, exactly as the farm hands it
+    // over in schema-isolation mode.
+    let plain = format!("{base}/{name}");
+    let setup = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&plain)
+        .await
+        .unwrap();
+    sqlx::query("CREATE SCHEMA hub_x")
+        .execute(&setup)
+        .await
+        .unwrap();
+
+    let scoped_url = format!("{plain}?options=-c%20search_path%3Dhub_x,public");
+    let scoped = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&scoped_url)
+        .await
+        .expect("connect with a search_path");
+    db::migrations::run(&scoped)
+        .await
+        .expect("migrate into hub_x");
+
+    assert_eq!(
+        db::dump::current_schema(&scoped).await.unwrap(),
+        "hub_x",
+        "the connection must actually be scoped, or this test proves nothing"
+    );
+
+    let expected = db::dump::row_counts(&scoped).await.expect("row counts");
+    assert!(
+        expected.len() > 50,
+        "the hub's tables must be found in its own schema, got {}",
+        expected.len()
+    );
+
+    // Everything above needs no external binary, and it is the half that would
+    // have caught the bug: a schema-blind `row_counts` finds zero tables here
+    // and a backup built on it reports success over nothing. Only the dump
+    // itself needs pg_dump, so only the dump is gated — otherwise the whole
+    // check would vanish on any machine without the client tools, which is
+    // most of them.
+    if have_pg_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("database.dump");
+        db::dump::dump(&scoped_url, &archive, "hub_x").expect("pg_dump");
+        assert!(
+            archive.metadata().unwrap().len() > 0,
+            "an empty archive is the failure this test exists for"
+        );
+    } else {
+        assert!(
+            std::env::var("WAVVON_REQUIRE_PG_TOOLS").is_err(),
+            "pg_dump not found, and WAVVON_REQUIRE_PG_TOOLS is set"
+        );
+        eprintln!("SKIP the pg_dump half: pg_dump not found");
+    }
+
+    drop(scoped);
+    drop(setup);
+    let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
+        .execute(&admin_pool)
+        .await;
+}
