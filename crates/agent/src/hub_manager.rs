@@ -40,7 +40,15 @@ impl HubManager {
         // it, so no database var is passed and the hub uses its own default.
         let bin = std::env::var(wavvon_hub_env::HUB_BIN).unwrap_or_else(|_| self.hub_bin.clone());
         let mut cmd = tokio::process::Command::new(&bin);
-        cmd.env(wavvon_hub_env::HTTP_PORT, port.to_string())
+        // Tokio does NOT kill a child when its `Child` is dropped — it detaches
+        // it. Without this, any path that drops the manager without calling
+        // `stop_hub` (a panic, a test ending, the agent exiting) leaves a hub
+        // running forever with nothing supervising it, still holding its port
+        // and still writing to the shared default database. That is exactly
+        // what it did: an orphaned `wavvon-hub` whose parent was gone wedged
+        // `cargo test --workspace` for the better part of an hour.
+        cmd.kill_on_drop(true)
+            .env(wavvon_hub_env::HTTP_PORT, port.to_string())
             .env(wavvon_hub_env::VOICE_UDP_PORT, voice_port.to_string());
         tracing::warn!(
             hub_id,

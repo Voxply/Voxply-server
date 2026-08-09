@@ -91,7 +91,12 @@ impl HubManager {
         // the default 3000, and the proxy routed to a port nothing listened
         // on. Nothing failed loudly, which is why it survived.
         let mut cmd = tokio::process::Command::new(&bin);
-        cmd.env(wavvon_hub_env::HTTP_PORT, port.to_string())
+        // Tokio detaches a child on drop rather than killing it — see the same
+        // note in agent/src/hub_manager.rs. Without this, dropping the manager
+        // without calling `stop_hub` orphans a hub that keeps its port and
+        // keeps writing to the shared default database, supervised by nobody.
+        cmd.kill_on_drop(true)
+            .env(wavvon_hub_env::HTTP_PORT, port.to_string())
             .env(wavvon_hub_env::VOICE_UDP_PORT, voice_port.to_string())
             .env(wavvon_hub_env::FARM_URL, &self.farm_url);
         if let Some(pk) = owner_pubkey {
