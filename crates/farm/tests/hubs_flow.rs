@@ -61,6 +61,11 @@ async fn setup_with_farm_url(farm_url: &str) -> (TestServer, Arc<FarmState>, com
         10100,
         // Creating a hub provisions it a database on this server.
         common::base_db_url(),
+        // Per-hub working directory root: hubs must not share an identity file.
+        std::env::temp_dir()
+            .join("wavvon-test-hubs")
+            .to_string_lossy()
+            .to_string(),
     ));
     let state = Arc::new(FarmState::new(
         db,

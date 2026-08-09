@@ -31,6 +31,9 @@ pub struct HubManager {
     /// The farm's own PostgreSQL URL. Each hub's database is created on this
     /// server and derived from this URL (db/provision.rs).
     db_base_url: String,
+    /// Parent directory for per-hub working directories. Each hub runs in
+    /// `<hubs_dir>/<hub_id>` so they cannot share an identity file.
+    hubs_dir: String,
 }
 
 impl HubManager {
@@ -40,6 +43,7 @@ impl HubManager {
         base_port: u16,
         voice_base_port: u16,
         db_base_url: String,
+        hubs_dir: String,
     ) -> Self {
         Self {
             hubs: RwLock::new(HashMap::new()),
@@ -48,6 +52,7 @@ impl HubManager {
             base_port,
             voice_base_port,
             db_base_url,
+            hubs_dir,
         }
     }
 
@@ -140,7 +145,20 @@ impl HubManager {
         // so every spawned hub ignored its carefully allocated port and bound
         // the default 3000, and the proxy routed to a port nothing listened
         // on. Nothing failed loudly, which is why it survived.
+        // Each hub gets its own working directory, and that is not tidiness.
+        // A hub resolves `hub_identity.json` and its search index relative to
+        // the process cwd, and children inherit the farm's — so every hub on a
+        // farm loaded the SAME identity file. The first to boot created it and
+        // every other one adopted its key: one pubkey across the whole farm,
+        // which is the hub's whole identity in federation, in serial routing,
+        // and in every signature it makes. They fought over the search index
+        // lock too, which is how this surfaced.
+        let work_dir = std::path::Path::new(&self.hubs_dir).join(hub_id);
+        std::fs::create_dir_all(&work_dir)
+            .with_context(|| format!("Cannot create working directory {work_dir:?}"))?;
+
         let mut cmd = tokio::process::Command::new(&bin);
+        cmd.current_dir(&work_dir);
         // Tokio detaches a child on drop rather than killing it — see the same
         // note in agent/src/hub_manager.rs. Without this, dropping the manager
         // without calling `stop_hub` orphans a hub that keeps its port and

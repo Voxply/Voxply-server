@@ -74,9 +74,25 @@ fn token_for(state: &FarmState, pubkey: &str, farm_url: &str) -> String {
 }
 
 /// A farm on a real port, wired to spawn the real hub binary.
-async fn start_farm(hub_bin: PathBuf) -> (String, Arc<FarmState>, common::TestDbGuard) {
+async fn start_farm(
+    hub_bin: PathBuf,
+    base_port: u16,
+    voice_base_port: u16,
+) -> (String, Arc<FarmState>, common::TestDbGuard) {
     let (db_pool, guard) = common::create_test_db().await;
     db::migrations::run(&db_pool).await.unwrap();
+
+    // Reconstruct the URL of the database this test is using, so hubs are
+    // provisioned inside it rather than wherever a database-less URL lands.
+    let farm_db_url = {
+        use sqlx::ConnectOptions;
+        let opts = db_pool.connect_options();
+        format!(
+            "{}/{}",
+            common::base_db_url(),
+            opts.get_database().unwrap_or("postgres")
+        )
+    };
 
     let keypair = SigningKey::generate(&mut OsRng);
     let farm_pubkey = hex::encode(ed25519_dalek::VerifyingKey::from(&keypair).as_bytes());
@@ -96,24 +112,30 @@ async fn start_farm(hub_bin: PathBuf) -> (String, Arc<FarmState>, common::TestDb
     let port = listener.local_addr().unwrap().port();
     let farm_url = format!("http://127.0.0.1:{port}");
 
-    // Ports well clear of the defaults and of the other farm suites, so a
-    // parallel run does not collide on a listening socket.
+    // A directory per test run, so two spawned hubs never meet each other's
+    // identity file — which is exactly the bug this harness surfaced.
+    let hubs_dir = std::env::temp_dir()
+        .join(format!("wavvon-e2e-{}", uuid::Uuid::new_v4().simple()))
+        .to_string_lossy()
+        .to_string();
+
     let hub_manager = Arc::new(HubManager::new(
         hub_bin.to_string_lossy().to_string(),
         farm_url.clone(),
-        9800,
-        10800,
-        common::base_db_url(),
+        base_port,
+        voice_base_port,
+        // The FULL url, database included: schema isolation keeps the base
+        // URL's database and only adds a search_path, so a base without one
+        // would put the hub somewhere other than the farm's own database.
+        farm_db_url,
+        hubs_dir.clone(),
     ));
     let state = Arc::new(FarmState::new(
         db_pool,
         keypair,
         farm_url.clone(),
         hub_manager,
-        std::env::temp_dir()
-            .join("wavvon-e2e")
-            .to_string_lossy()
-            .to_string(),
+        hubs_dir,
     ));
 
     let app = server::create_router(state.clone());
@@ -152,7 +174,7 @@ async fn a_hub_created_through_the_farm_becomes_reachable_through_it() {
         return;
     };
 
-    let (farm_url, state, _guard) = start_farm(hub_bin).await;
+    let (farm_url, state, _guard) = start_farm(hub_bin, 9800, 10800).await;
     let owner = "11".repeat(32);
     let token = token_for(&state, &owner, &farm_url);
     let client = Client::new();
@@ -318,5 +340,108 @@ async fn a_hub_created_through_the_farm_becomes_reachable_through_it() {
     );
 
     let _ = socket.close(None).await;
+    let _ = state.hub_manager.stop_hub(&hub_id).await;
+}
+
+/// The same path with `hub_isolation = 'schema'`: one database, a schema per
+/// hub, selected by `search_path` on the connection.
+///
+/// This mode exists because a managed PostgreSQL plan routinely grants one
+/// database and no `CREATEDB` — without it the farm cannot create a single hub
+/// in an entire class of hosting. And it had never been *run*: the unit tests
+/// cover building the URL, nothing had started a hub behind one.
+///
+/// The failure it guards against is silent in the worst way. If the hub's
+/// driver ignored the `options` parameter, every hub would migrate into
+/// `public` and share it again — the exact bug per-hub isolation replaced,
+/// wearing the appearance of a fix.
+#[tokio::test]
+async fn a_schema_isolated_hub_gets_its_own_schema_and_not_public() {
+    let Some(hub_bin) = hub_binary() else {
+        assert!(
+            std::env::var("WAVVON_REQUIRE_E2E").is_err(),
+            "wavvon-hub is not built, and WAVVON_REQUIRE_E2E is set"
+        );
+        eprintln!("SKIP farm_hub_e2e (schema): wavvon-hub not built");
+        return;
+    };
+
+    let (farm_url, state, _guard) = start_farm(hub_bin, 9900, 10900).await;
+    sqlx::query("UPDATE farms SET hub_isolation = 'schema' WHERE id = 1")
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    let token = token_for(&state, &"22".repeat(32), &farm_url);
+    let created: serde_json::Value = Client::new()
+        .post(format!("{farm_url}/farm/hubs"))
+        .bearer_auth(&token)
+        .json(&json!({ "name": "Schema Hub" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let hub_id = created["id"].as_str().expect("hub id").to_string();
+
+    let db_url: String = sqlx::query_scalar("SELECT db_url FROM hubs WHERE id = $1")
+        .bind(&hub_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert!(
+        db_url.contains("search_path") || db_url.contains("options"),
+        "a schema-isolated hub's URL must carry its search_path, got {db_url}"
+    );
+
+    // The hub boots and claims its serial — which means it connected, ran its
+    // migrations and heartbeated, all inside its own schema.
+    let pool = state.db.clone();
+    let id = hub_id.clone();
+    wait_for(
+        "the schema-isolated hub to start",
+        Duration::from_secs(45),
+        || {
+            let pool = pool.clone();
+            let id = id.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<String>>("SELECT hub_pubkey FROM hubs WHERE id = $1")
+                    .bind(&id)
+                    .fetch_one(&pool)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some()
+            }
+        },
+    )
+    .await;
+
+    // And the tables landed in the hub's schema, not in the farm's `public`.
+    // This is the assertion that would have caught a driver quietly dropping
+    // `options`: the hub would have looked perfectly healthy while writing
+    // into the shared namespace.
+    let schema = format!("hub_{hub_id}");
+    let in_schema: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_tables WHERE schemaname = $1 AND tablename = 'channels'",
+    )
+    .bind(&schema)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(in_schema, 1, "the hub's tables must be in {schema}");
+
+    let in_public: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_tables WHERE schemaname = 'public' AND tablename = 'channels'",
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        in_public, 0,
+        "nothing may land in public — that is the shared namespace this mode avoids"
+    );
+
     let _ = state.hub_manager.stop_hub(&hub_id).await;
 }

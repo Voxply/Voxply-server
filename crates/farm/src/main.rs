@@ -197,6 +197,9 @@ async fn main() -> Result<()> {
         voice_base_port,
         // Each hub's database is created on the same server the farm uses.
         cfg.database_url.clone(),
+        // Each hub runs in its own directory under here, so they cannot share
+        // an identity file.
+        cfg.hubs_dir.clone(),
     ));
     hub_manager.spawn_all_from_db(&db).await?;
 
