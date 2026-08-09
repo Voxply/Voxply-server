@@ -137,6 +137,10 @@ pub async fn info(State(state): State<Arc<AppState>>) -> Json<InfoResponse> {
         description: branding.description,
         icon: branding.icon,
         version: env!("CARGO_PKG_VERSION").to_string(),
+        capabilities: crate::capabilities::CAPABILITIES
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         public_key: state.hub_identity.public_key_hex(),
         min_security_level,
         min_pow_level,
@@ -176,6 +180,12 @@ pub struct InfoResponse {
     #[serde(default)]
     pub icon: Option<String>,
     pub version: String,
+    /// What this hub can do. Clients branch on membership in this list, never
+    /// on `version` — see `capabilities.rs` and decisions.md. Absent on hubs
+    /// older than 2026-08-09, which `#[serde(default)]` renders as "knows
+    /// nothing", the correct reading.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
     pub public_key: String,
     pub min_security_level: u32,
     /// Minimum PoW level required to authenticate via the structured

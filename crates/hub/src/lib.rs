@@ -3,6 +3,7 @@ pub mod auth;
 pub mod banlist_worker;
 pub mod bootstrap;
 pub mod bots;
+pub mod capabilities;
 pub mod cert_revocation_worker;
 pub mod cert_worker;
 pub mod db;
