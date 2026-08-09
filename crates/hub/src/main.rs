@@ -268,10 +268,21 @@ async fn run_doctor() -> bool {
         Ok(pool) => {
             match wavvon_hub::routes::invites::maybe_mint_first_boot_owner_invite(&pool).await {
                 Ok(Some(code)) => {
-                    let raw_host = settings
-                        .public_url
-                        .clone()
-                        .unwrap_or_else(|| format!("localhost:{}", settings.http_port));
+                    // Read the identity rather than create one: on a
+                    // farm-hosted hub the public URL contains its pubkey, and
+                    // doctor printing a localhost link for a hub that is
+                    // actually reachable at https://farm/hub/<key> would be
+                    // worse than useless. Absent (hub never started) → falls
+                    // back to whatever is configured.
+                    let pubkey = Identity::load(Path::new("hub_identity.json"))
+                        .ok()
+                        .map(|i| i.public_key_hex());
+                    let raw_host = wavvon_hub::settings::effective_public_url(
+                        settings.public_url.as_deref(),
+                        settings.farm_url.as_deref(),
+                        pubkey.as_deref(),
+                    )
+                    .unwrap_or_else(|| format!("localhost:{}", settings.http_port));
                     let host = raw_host
                         .trim_start_matches("https://")
                         .trim_start_matches("http://")
@@ -686,6 +697,24 @@ async fn main() -> Result<()> {
 
     let (hub_identity, is_new) = Identity::load_or_create(Path::new("hub_identity.json"))?;
 
+    // Where we are reachable from outside. Resolved here, after the identity
+    // exists, because a farm-hosted hub derives it from its farm's URL plus
+    // its own pubkey — the farm cannot pass it at spawn, since the key in it
+    // is generated on this very line. Everything downstream that needs a
+    // public address reads this, not `settings.public_url`.
+    let public_url = wavvon_hub::settings::effective_public_url(
+        settings.public_url.as_deref(),
+        settings.farm_url.as_deref(),
+        Some(&hub_identity.public_key_hex()),
+    );
+    if public_url.is_none() {
+        tracing::warn!(
+            "No public URL: {} is unset and this hub is not farm-managed. Voice, \
+             invite links and passkeys all need one and will be unavailable.",
+            wavvon_hub_env::PUBLIC_URL,
+        );
+    }
+
     // ---- LAN mode resolution ----
     // Must run before the TLS banner below: LAN mode can supply its own
     // self-signed cert/key when no CA cert is already configured, and it
@@ -931,13 +960,16 @@ async fn main() -> Result<()> {
                 // The /join link must be copy-pasteable: an explicit scheme in
                 // public_url wins; a bare public host is assumed TLS-fronted;
                 // the localhost fallback matches this process's own TLS state.
-                let join_scheme = match settings.public_url.as_deref() {
+                let join_scheme = match public_url.as_deref() {
                     Some(u) if u.starts_with("http://") => "http",
                     Some(_) => "https",
                     None => scheme,
                 };
-                let raw_host = settings
-                    .public_url
+                // `public_url` may carry a path (a farm-hosted hub lives under
+                // /hub/<pubkey>), so this is the whole base, not just a host —
+                // stripping the scheme and appending /join gives the right
+                // link either way.
+                let raw_host = public_url
                     .clone()
                     .unwrap_or_else(|| format!("localhost:{}", settings.http_port));
                 let host = raw_host
@@ -1015,12 +1047,10 @@ async fn main() -> Result<()> {
     let store: Arc<dyn store::HubStore> = Arc::new(PostgresStore::new(db.clone()));
 
     // Publicly-reachable host for the voice WebTransport endpoint
-    // (voice-transport-v2.md): WAVVON_PUBLIC_URL's host wins (explicit
-    // operator override), falling back to the LAN-mode advertise address
-    // when set. No public host is known otherwise — the hub doesn't guess
-    // at its own internet-facing IP.
-    let voice_udp_host: Option<String> = settings
-        .public_url
+    // (voice-transport-v2.md). Voice is dialled directly, never through the
+    // farm's HTTP proxy — a datagram carries no path to route on — so only
+    // the *host* is taken here, and the port is this hub's own allocated one.
+    let voice_udp_host: Option<String> = public_url
         .as_deref()
         .and_then(|u| Url::parse(u).ok())
         .and_then(|parsed| parsed.host_str().map(|h| h.to_string()))
@@ -1033,7 +1063,7 @@ async fn main() -> Result<()> {
         .webauthn_rp_id
         .clone()
         .or_else(|| {
-            settings.public_url.as_deref().and_then(|u| {
+            public_url.as_deref().and_then(|u| {
                 Url::parse(u)
                     .ok()
                     .and_then(|parsed| parsed.host_str().map(|h| h.to_string()))
@@ -1041,10 +1071,14 @@ async fn main() -> Result<()> {
         })
         .unwrap_or_else(|| "localhost".to_string());
 
-    let rp_origin: Url = settings
-        .public_url
+    // Origin only — scheme, host and port, never the path. WebAuthn compares
+    // the browser's origin, and a hub behind a farm (or any path-prefixing
+    // proxy) has a public URL with a path on the end; passing that whole URL
+    // would build a relying party nothing ever matches.
+    let rp_origin: Url = public_url
         .as_deref()
         .and_then(|u| Url::parse(u).ok())
+        .and_then(|parsed| Url::parse(&parsed.origin().ascii_serialization()).ok())
         .unwrap_or_else(|| {
             Url::parse(&format!("http://localhost:{}", settings.http_port)).unwrap()
         });

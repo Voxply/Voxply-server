@@ -178,11 +178,11 @@ pub const ENV_VAR_HELP: &[(&str, &str, &str)] = &[
          this many bot streams are already active; human screen shares are never counted.",
     ),
     (
-        "WAVVON_PUBLIC_URL",
+        wavvon_hub_env::PUBLIC_URL,
         "(unset)",
-        "Public HTTPS URL of this hub (e.g. https://wavvon.example.com). \
-         Used to derive the WebAuthn relying-party ID from the hostname. \
-         Required for passkey auth on non-localhost deployments",
+        "Public base URL of this hub (e.g. https://wavvon.example.com). Drives the \
+         voice endpoint, invite links and the WebAuthn relying-party ID. \
+         Farm-hosted hubs derive it from WAVVON_FARM_URL and need not set it",
     ),
     (
         "WAVVON_WEBAUTHN_RP_ID",
@@ -344,6 +344,36 @@ pub struct Settings {
     pub lan_mdns: bool,
 }
 
+/// Where this hub is actually reachable from the outside, or `None` when
+/// nothing knows.
+///
+/// Four things need it and all four fail *silently* without it: the voice
+/// WebTransport endpoint (`voice_wt_url` stays `None`, so no client can join
+/// voice at all), the first-boot owner invite link, the WebAuthn
+/// relying-party id, and the canonical URL a client stores for this hub.
+///
+/// A farm-hosted hub is the case that motivated this. The farm cannot pass the
+/// URL at spawn: it contains the hub's pubkey, and that does not exist until
+/// the hub's first boot. So the hub derives it — it is the one party holding
+/// both halves, its farm's public URL and its own key. Before this, a
+/// farm-spawned hub had no public URL and simply had no working voice.
+///
+/// An explicit `WAVVON_PUBLIC_URL` always wins: an operator fronting the farm
+/// with their own domain knows better than we do.
+pub fn effective_public_url(
+    configured: Option<&str>,
+    farm_url: Option<&str>,
+    hub_pubkey: Option<&str>,
+) -> Option<String> {
+    if let Some(url) = configured.map(str::trim).filter(|u| !u.is_empty()) {
+        return Some(url.trim_end_matches('/').to_string());
+    }
+    let farm = farm_url.map(str::trim).filter(|u| !u.is_empty())?;
+    let pubkey = hub_pubkey.map(str::trim).filter(|k| !k.is_empty())?;
+    // Serial routing: the farm's proxy resolves `/hub/<pubkey>/...`.
+    Some(format!("{}/hub/{}", farm.trim_end_matches('/'), pubkey))
+}
+
 /// Load hub settings from (in priority order, highest last):
 ///   1. Built-in defaults
 ///   2. `hub.toml` in the current working directory (optional — missing file is fine)
@@ -374,6 +404,67 @@ pub fn load() -> Result<Settings> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PK: &str = "abc123";
+
+    #[test]
+    fn an_explicit_public_url_always_wins() {
+        assert_eq!(
+            effective_public_url(
+                Some("https://mine.example"),
+                Some("https://farm.test"),
+                Some(PK)
+            ),
+            Some("https://mine.example".to_string()),
+            "an operator fronting the farm with their own domain knows better"
+        );
+    }
+
+    /// The case the whole helper exists for: the farm cannot pass this at
+    /// spawn because the pubkey in it does not exist yet.
+    #[test]
+    fn a_farm_hosted_hub_derives_its_serial_routed_url() {
+        assert_eq!(
+            effective_public_url(None, Some("https://farm.test"), Some(PK)),
+            Some("https://farm.test/hub/abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn trailing_slashes_never_double_up() {
+        assert_eq!(
+            effective_public_url(None, Some("https://farm.test/"), Some(PK)),
+            Some("https://farm.test/hub/abc123".to_string())
+        );
+        assert_eq!(
+            effective_public_url(Some("https://mine.example/"), None, None),
+            Some("https://mine.example".to_string())
+        );
+    }
+
+    /// A standalone hub with nothing configured has no public URL, and must
+    /// say so rather than invent one — guessing would produce voice endpoints
+    /// and invite links pointing at an address nobody can reach.
+    #[test]
+    fn nothing_configured_means_nothing_known() {
+        assert_eq!(effective_public_url(None, None, None), None);
+        assert_eq!(
+            effective_public_url(None, Some("https://farm.test"), None),
+            None
+        );
+        assert_eq!(effective_public_url(None, None, Some(PK)), None);
+    }
+
+    /// Empty strings are what an env var set to "" produces, and they must not
+    /// be mistaken for a configured value.
+    #[test]
+    fn empty_values_are_treated_as_unset() {
+        assert_eq!(
+            effective_public_url(Some("  "), Some("https://farm.test"), Some(PK)),
+            Some("https://farm.test/hub/abc123".to_string())
+        );
+        assert_eq!(effective_public_url(Some(""), Some(""), Some(PK)), None);
+    }
 
     /// Every key a launcher (farm, agent) may set on a spawned hub must be a
     /// key this hub actually reads.
@@ -417,6 +508,7 @@ mod tests {
         std::env::set_var(wavvon_hub_env::FARM_URL, "https://probe.farm");
         std::env::set_var(wavvon_hub_env::OWNER_PUBKEY, "abc123");
         std::env::set_var(wavvon_hub_env::FARM_HUB_ID, "hub-probe-id");
+        std::env::set_var(wavvon_hub_env::PUBLIC_URL, "https://probe.example");
 
         let s = load().expect("settings load with overrides");
 
@@ -461,6 +553,12 @@ mod tests {
             Some("hub-probe-id"),
             "{} is not read",
             wavvon_hub_env::FARM_HUB_ID
+        );
+        assert_eq!(
+            s.public_url.as_deref(),
+            Some("https://probe.example"),
+            "{} is not read",
+            wavvon_hub_env::PUBLIC_URL
         );
 
         for key in wavvon_hub_env::SPAWNABLE {

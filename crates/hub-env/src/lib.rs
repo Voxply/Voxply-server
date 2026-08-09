@@ -37,6 +37,16 @@ pub const FARM_URL: &str = "WAVVON_FARM_URL";
 /// Public key seeded as the hub owner on first boot.
 pub const OWNER_PUBKEY: &str = "WAVVON_OWNER_PUBKEY";
 
+/// Publicly-reachable base URL of this hub, when an operator front-ends it.
+///
+/// A farm-spawned hub does **not** need this set: it derives its own from
+/// `FARM_URL` plus its pubkey (see `wavvon_hub::settings::effective_public_url`),
+/// because the farm cannot know the URL at spawn time — the pubkey in it does
+/// not exist until the hub's first boot. It is here so a launcher *can*
+/// override, and because a hub that has no public URL silently loses voice,
+/// invite links and passkeys.
+pub const PUBLIC_URL: &str = "WAVVON_PUBLIC_URL";
+
 /// The farm's own row id for this hub, handed to it at spawn.
 ///
 /// The farm allocates a hub row before the process exists, so it cannot know
@@ -65,6 +75,7 @@ pub const SPAWNABLE: &[&str] = &[
     FARM_URL,
     OWNER_PUBKEY,
     FARM_HUB_ID,
+    PUBLIC_URL,
 ];
 
 #[cfg(test)]
