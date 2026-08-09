@@ -13,7 +13,14 @@ use std::sync::Arc;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
-fn base_db_url() -> String {
+/// The PostgreSQL server the suite runs against.
+///
+/// Public because a farm harness has to hand it to `HubManager`: creating a
+/// hub now provisions that hub its own database, and refuses the creation if
+/// it cannot — starting a hub on the shared default is the bug per-hub
+/// databases replaced, so there is no "skip it in tests" path that still
+/// exercises the real code.
+pub fn base_db_url() -> String {
     std::env::var("TEST_DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432".to_string())
 }
@@ -42,6 +49,24 @@ impl Drop for TestDbGuardInner {
                 ))
                 .execute(&admin_pool)
                 .await?;
+
+                // Hub databases provisioned during the test (db/provision.rs
+                // creates one per created hub). They are not children of the
+                // farm database and nothing else would ever remove them, so
+                // they would pile up on the test server exactly the way the
+                // per-test farm databases used to.
+                let strays: Vec<String> = sqlx::query_scalar(
+                    "SELECT datname FROM pg_database WHERE datname LIKE 'wavvon_hub_%'",
+                )
+                .fetch_all(&admin_pool)
+                .await
+                .unwrap_or_default();
+                for name in strays {
+                    let _ =
+                        sqlx::query(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
+                            .execute(&admin_pool)
+                            .await;
+                }
                 Ok::<(), sqlx::Error>(())
             })
         })

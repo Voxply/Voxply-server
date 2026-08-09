@@ -18,13 +18,28 @@ use crate::unix_now;
 // POST /farm/heartbeat
 // ---------------------------------------------------------------------------
 
+/// What the farm tells a hub in reply to its heartbeat.
+///
+/// The heartbeat is the only standing farm→hub channel, so it is where a hub
+/// learns its own public address. It cannot come from the environment: a
+/// rename has to reach a *running* hub, and an env var is fixed at spawn.
+/// Within one heartbeat interval every hub knows its current name.
+#[derive(Serialize, Default)]
+pub struct HeartbeatResponse {
+    /// Absolute URL this hub should advertise as its own — its canonical slug
+    /// when it has one, otherwise the pubkey form. Absent when the farm cannot
+    /// work it out (no public farm URL configured).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_url: Option<String>,
+}
+
 pub async fn receive_heartbeat(
     State(state): State<Arc<FarmState>>,
     Json(payload): Json<serde_json::Value>,
-) -> StatusCode {
+) -> (StatusCode, Json<HeartbeatResponse>) {
     let hub_pubkey = match payload.get("hub_pubkey").and_then(|v| v.as_str()) {
         Some(pk) if !pk.is_empty() => pk.to_string(),
-        _ => return StatusCode::BAD_REQUEST,
+        _ => return (StatusCode::BAD_REQUEST, Json(HeartbeatResponse::default())),
     };
     let online_users = payload
         .get("online_users")
@@ -109,8 +124,13 @@ pub async fn receive_heartbeat(
     .await;
 
     match known_count {
-        Ok(0) => return StatusCode::FORBIDDEN,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+        Ok(0) => return (StatusCode::FORBIDDEN, Json(HeartbeatResponse::default())),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(HeartbeatResponse::default()),
+            )
+        }
         Ok(_) => {}
     }
 
@@ -143,7 +163,27 @@ pub async fn receive_heartbeat(
     .execute(&state.db)
     .await;
 
-    StatusCode::OK
+    // Tell the hub where it currently lives. Its canonical slug if it has one,
+    // otherwise the pubkey form — which always resolves and needs no lookup.
+    let canonical_url = {
+        let hub_id: Option<String> =
+            sqlx::query_scalar("SELECT id FROM hubs WHERE hub_pubkey = $1 AND deleted_at IS NULL")
+                .bind(&hub_pubkey)
+                .fetch_optional(&state.db)
+                .await
+                .ok()
+                .flatten();
+        let base = state.farm_url.trim_end_matches('/');
+        match hub_id {
+            Some(id) => match crate::routes::slugs::canonical_slug(&state.db, &id).await {
+                Some(slug) => Some(format!("{base}/hub/{slug}")),
+                None => Some(format!("{base}/hub/{hub_pubkey}")),
+            },
+            None => None,
+        }
+    };
+
+    (StatusCode::OK, Json(HeartbeatResponse { canonical_url }))
 }
 
 // ---------------------------------------------------------------------------

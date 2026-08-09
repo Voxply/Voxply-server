@@ -714,6 +714,7 @@ async fn spawn_real_hub() -> (String, Arc<AppState>, common::TestDbGuard) {
         voice_zones: RwLock::new(HashMap::new()),
         voice_udp_port: 0,
         voice_wt_url: None,
+        canonical_url: Arc::new(RwLock::new(None)),
         voice_cert_hash: RwLock::new(None),
         voice_event_tx: broadcast::channel(16).0,
         dm_tx: broadcast::channel(16).0,

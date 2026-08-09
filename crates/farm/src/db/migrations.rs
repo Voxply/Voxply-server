@@ -206,5 +206,104 @@ pub async fn run(pool: &PgPool) -> Result<()> {
         .execute(pool)
         .await;
 
+    // Per-hub PostgreSQL connection URL (db/provision.rs).
+    //
+    // Replaces `db_path`, a SQLite-era file path nothing consumed: the farm
+    // passed no database configuration at all, so every hub it spawned fell
+    // back to the same default URL and they all shared one database. `db_path`
+    // stays (additive-only) but is dead.
+    //
+    // Nullable because rows created before this exist; a hub with no db_url
+    // gets one provisioned on its next spawn.
+    let _ = sqlx::query("ALTER TABLE hubs ADD COLUMN db_url TEXT")
+        .execute(pool)
+        .await;
+
+    // Placement capacity (routes/placement.rs). How many hubs each node may
+    // hold: a registered server agent, and the farm's own process.
+    //
+    // NULL / 0 means unlimited, matching `max_hubs_per_user`. Before this,
+    // placement was `map.iter().next()` — the first entry of a HashMap
+    // iteration — so "server 1 holds 5 hubs, server 2 holds 3" could not be
+    // expressed at all and every hub landed wherever the hash order put it.
+    let _ = sqlx::query("ALTER TABLE servers ADD COLUMN max_hubs INTEGER")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE farms ADD COLUMN max_local_hubs BIGINT NOT NULL DEFAULT 0")
+        .execute(pool)
+        .await;
+
+    // How hubs' data is separated: `database` (one each, needs CREATEDB) or
+    // `schema` (one each inside the farm's own database). See db/provision.rs.
+    //
+    // Default `database` because it separates more. `schema` exists because a
+    // managed PostgreSQL plan routinely gives one database and no CREATEDB —
+    // without it the farm cannot create a single hub in those environments.
+    let _ = sqlx::query(
+        "ALTER TABLE farms ADD COLUMN hub_isolation TEXT NOT NULL DEFAULT 'database'
+             CHECK (hub_isolation IN ('database', 'schema'))",
+    )
+    .execute(pool)
+    .await;
+
+    // Human-readable hub addresses. See `slug.rs` for why a slug is an alias
+    // and never the identity.
+    //
+    // `slug` is the PRIMARY KEY and holds the **lowercase** form, so
+    // case-variant impersonation is impossible by construction rather than by
+    // remembering to lower() at every call site. `display_slug` keeps the
+    // capitalisation the owner typed, for showing back.
+    //
+    // A row is never deleted. Releasing sets `released_at`: the slug stops
+    // resolving and stops counting against the hub's quota, but the row
+    // remains, which is what lets the cooling-off window be enforced (only the
+    // hub that released it may reclaim it until then) and what makes the
+    // history visible to an operator afterwards.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS hub_slugs (
+            slug             TEXT PRIMARY KEY,
+            display_slug     TEXT NOT NULL,
+            hub_id           TEXT NOT NULL REFERENCES hubs(id),
+            is_canonical     BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at       BIGINT NOT NULL,
+            released_at      BIGINT,
+            last_resolved_at BIGINT
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    // Resolution reads (slug WHERE released_at IS NULL) on every proxied
+    // request, and the quota check counts live slugs per hub.
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS hub_slugs_hub_live_idx
+             ON hub_slugs (hub_id) WHERE released_at IS NULL",
+    )
+    .execute(pool)
+    .await?;
+
+    // At most one canonical slug per hub — it is the address the hub publishes
+    // and clients store, so "which one" can never be ambiguous.
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS hub_slugs_one_canonical_idx
+             ON hub_slugs (hub_id) WHERE is_canonical AND released_at IS NULL",
+    )
+    .execute(pool)
+    .await?;
+
+    // How many live slugs one hub may hold. Farm policy, like
+    // max_hubs_per_user — the farm owner sets the ceiling, the hub owner
+    // operates inside it and decides which names to keep.
+    let _ = sqlx::query("ALTER TABLE farms ADD COLUMN max_slugs_per_hub BIGINT NOT NULL DEFAULT 5")
+        .execute(pool)
+        .await;
+
+    // Days a released slug stays reserved for the hub that gave it up before
+    // returning to the pool. 0 disables the wait entirely.
+    let _ =
+        sqlx::query("ALTER TABLE farms ADD COLUMN slug_cooloff_days BIGINT NOT NULL DEFAULT 60")
+            .execute(pool)
+            .await;
+
     Ok(())
 }

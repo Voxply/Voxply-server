@@ -6,3 +6,4 @@ pub mod heartbeat;
 pub mod hubs;
 pub mod revoke;
 pub mod servers;
+pub mod slugs;

@@ -68,7 +68,21 @@ pub async fn server_version_num(pool: &PgPool) -> Result<i32> {
         .with_context(|| format!("PostgreSQL reported an unparseable version: {raw:?}"))
 }
 
-/// Exact row count per table in the `public` schema, keyed by table name.
+/// The schema this hub's tables actually live in.
+///
+/// Normally `public`. A farm using schema isolation hands each hub a
+/// `search_path` instead, so its tables are in `hub_<id>` — and everything
+/// here that once said `schemaname = 'public'` would have found nothing,
+/// reported zero tables, and called the backup a success.
+pub async fn current_schema(pool: &PgPool) -> Result<String> {
+    sqlx::query_scalar::<_, Option<String>>("SELECT current_schema()")
+        .fetch_one(pool)
+        .await
+        .context("could not read the current schema")?
+        .context("this connection has no schema on its search_path")
+}
+
+/// Exact row count per table in this hub's schema, keyed by table name.
 ///
 /// Deliberately `COUNT(*)` and not `pg_stat_user_tables.n_live_tup`: the
 /// planner's estimate is close enough for query planning and useless for
@@ -76,9 +90,11 @@ pub async fn server_version_num(pool: &PgPool) -> Result<i32> {
 /// restore, and a community hub has neither the table count nor the row count
 /// for that to be slow.
 pub async fn row_counts(pool: &PgPool) -> Result<std::collections::BTreeMap<String, i64>> {
+    let schema = current_schema(pool).await?;
     let tables: Vec<String> = sqlx::query_scalar(
-        "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename",
+        "SELECT tablename FROM pg_tables WHERE schemaname = $1 ORDER BY tablename",
     )
+    .bind(&schema)
     .fetch_all(pool)
     .await
     .context("could not list tables")?;
@@ -100,7 +116,9 @@ pub async fn row_counts(pool: &PgPool) -> Result<std::collections::BTreeMap<Stri
 
 /// True when the target database has no tables of its own yet.
 pub async fn is_empty(pool: &PgPool) -> Result<bool> {
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pg_tables WHERE schemaname = 'public'")
+    let schema = current_schema(pool).await?;
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pg_tables WHERE schemaname = $1")
+        .bind(&schema)
         .fetch_one(pool)
         .await
         .context("could not inspect the destination database")?;
@@ -112,13 +130,23 @@ pub async fn is_empty(pool: &PgPool) -> Result<bool> {
 /// `--no-owner --no-acl` so the archive restores under whatever role the
 /// destination uses. A hub's data does not depend on role names, and carrying
 /// them turns "restore onto a fresh server" into "first recreate my roles".
-pub fn dump(db_url: &str, out: &Path) -> Result<()> {
+///
+/// `--schema` is explicit rather than implied by the connection's
+/// `search_path`: a farm using schema isolation puts this hub's tables in
+/// `hub_<id>` and its siblings' in the same database, so a dump that trusted
+/// the default would either miss everything or take everyone's.
+///
+/// A schema-mode archive names its schema inside, so it restores into a
+/// database where that schema is free. Restoring one hub's dump *as* another
+/// hub is not something this does.
+pub fn dump(db_url: &str, out: &Path, schema: &str) -> Result<()> {
     run(
         "pg_dump",
         &[
             "--format=custom",
             "--no-owner",
             "--no-acl",
+            &format!("--schema={schema}"),
             "--file",
             &out.to_string_lossy(),
             db_url,

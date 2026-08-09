@@ -104,6 +104,9 @@ pub struct ServerEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_seen_at: Option<i64>,
     pub running_hub_count: i64,
+    /// How many hubs this server may hold. Absent means unlimited.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_hubs: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -117,8 +120,10 @@ pub async fn list_servers(
 ) -> Result<Json<ListServersResponse>, (StatusCode, Json<serde_json::Value>)> {
     require_admin_pub(&headers, &state).await?;
 
-    let rows: Vec<(String, String, Option<String>, Option<i64>)> = sqlx::query_as(
-        "SELECT id, name, region, last_seen_at FROM servers WHERE deleted_at IS NULL ORDER BY registered_at",
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(String, String, Option<String>, Option<i64>, Option<i32>)> = sqlx::query_as(
+        "SELECT id, name, region, last_seen_at, max_hubs FROM servers
+         WHERE deleted_at IS NULL ORDER BY registered_at",
     )
     .fetch_all(&state.db)
     .await
@@ -155,7 +160,7 @@ pub async fn list_servers(
 
     let servers = rows
         .into_iter()
-        .map(|(id, name, region, last_seen_at)| {
+        .map(|(id, name, region, last_seen_at, max_hubs)| {
             let connected = connected_ids.contains(&id);
             let running_hub_count = hub_counts.get(&id).copied().unwrap_or(0);
             ServerEntry {
@@ -165,6 +170,7 @@ pub async fn list_servers(
                 connected,
                 last_seen_at,
                 running_hub_count,
+                max_hubs: max_hubs.map(|m| m as i64),
             }
         })
         .collect();
@@ -391,4 +397,78 @@ pub async fn pick_agent(
 ) -> Option<(String, tokio::sync::mpsc::Sender<String>)> {
     let map = senders.read().await;
     map.iter().next().map(|(id, s)| (id.clone(), s.clone()))
+}
+
+// ---------------------------------------------------------------------------
+// PATCH /farm/admin/servers/{server_id}
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct UpdateServerRequest {
+    /// How many hubs this server may hold. `null` clears the cap (unlimited).
+    ///
+    /// Tri-state on purpose: omitted means "leave it alone", `null` means
+    /// "no limit". Collapsing the two is the omitted-vs-null trap that has
+    /// already cost this project two features (CLAUDE.md).
+    #[serde(default, deserialize_with = "deserialize_some")]
+    pub max_hubs: Option<Option<i64>>,
+}
+
+fn deserialize_some<'de, D>(deserializer: D) -> Result<Option<Option<i64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(deserializer).map(Some)
+}
+
+/// Set a server's hub capacity (farm admin).
+///
+/// Lowering it below what the server already holds is allowed and does not
+/// move anything: the cap governs *new* placements. Evicting a running
+/// community to satisfy a number the operator just typed would be worse than
+/// leaving one server briefly over its limit.
+pub async fn update_server(
+    axum::extract::Path(server_id): axum::extract::Path<String>,
+    headers: HeaderMap,
+    State(state): State<Arc<FarmState>>,
+    Json(req): Json<UpdateServerRequest>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    require_admin_pub(&headers, &state).await?;
+
+    let Some(max_hubs) = req.max_hubs else {
+        return Ok(StatusCode::NO_CONTENT);
+    };
+
+    if let Some(n) = max_hubs {
+        if n < 0 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_value",
+                    "details": "max_hubs must be zero or more, or null for unlimited",
+                })),
+            ));
+        }
+    }
+
+    let updated =
+        sqlx::query("UPDATE servers SET max_hubs = $1 WHERE id = $2 AND deleted_at IS NULL")
+            .bind(max_hubs.map(|n| n as i32))
+            .bind(&server_id)
+            .execute(&state.db)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("db_error: {e}")})),
+                )
+            })?;
+
+    if updated.rows_affected() == 0 {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "server_not_found"})),
+        ));
+    }
+    Ok(StatusCode::NO_CONTENT)
 }

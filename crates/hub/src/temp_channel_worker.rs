@@ -12,8 +12,8 @@
 //!    right after boot, so the very first tick stamps every surviving temp
 //!    channel and it ages out through the same path below. One code path,
 //!    no separate boot-time sweep.
-//! 2. Deletes temp channels whose `empty_since` is older than the 60s grace
-//!    period, using the same manual multi-table delete `delete_channel`
+//! 2. Deletes temp channels whose `empty_since` is older than the
+//!    `GRACE_SECS` grace period, using the same manual multi-table delete `delete_channel`
 //!    uses (there's no DB-level `ON DELETE CASCADE` on `messages.channel_id`
 //!    -- only `channel_permission_overwrites`, `channel_pins`, and
 //!    `upload_files` cascade automatically).

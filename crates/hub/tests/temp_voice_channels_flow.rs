@@ -48,6 +48,7 @@ async fn start_hub() -> (String, Arc<AppState>, common::TestDbGuard) {
         voice_zones: RwLock::new(HashMap::new()),
         voice_udp_port: 0,
         voice_wt_url: None,
+        canonical_url: Arc::new(RwLock::new(None)),
         voice_cert_hash: RwLock::new(None),
         voice_event_tx,
         dm_tx: broadcast::channel(16).0,
@@ -353,9 +354,17 @@ async fn spawn_name_collision_gets_numbered_suffix() {
     assert_eq!(third.name, "Alice's room 3");
 }
 
-/// GC deletes a temp channel once its `empty_since` is past the 60s grace
-/// period, but leaves a freshly-stamped one alone. Drives `tick()` directly
-/// against seeded rows instead of waiting on a real clock.
+/// GC deletes a temp channel once its `empty_since` is past the grace period
+/// (`temp_channel_worker::GRACE_SECS`), but leaves a freshly-stamped one
+/// alone. Drives `tick()` directly against seeded rows instead of waiting on a
+/// real clock.
+///
+/// Both seeded ages are deliberately well clear of the boundary. The "fresh"
+/// row used to sit at exactly `now - GRACE_SECS`, which is one second from
+/// deletion: the worker takes its own `now`, so a single second elapsing
+/// between the two moved the cutoff past the row and the test failed. It only
+/// showed up under parallel load, where that second is easy to lose — a
+/// boundary bug wearing a flake's clothes.
 #[tokio::test]
 async fn gc_deletes_only_past_grace_period() {
     let (state, _guard) = db_only_state().await;
@@ -376,13 +385,13 @@ async fn gc_deletes_only_past_grace_period() {
         .id;
 
     sqlx::query("UPDATE channels SET empty_since = $1 WHERE id = $2")
-        .bind(now - 61)
+        .bind(now - (temp_channel_worker::GRACE_SECS * 2))
         .bind(&expired)
         .execute(&state.db)
         .await
         .unwrap();
     sqlx::query("UPDATE channels SET empty_since = $1 WHERE id = $2")
-        .bind(now - 30)
+        .bind(now - (temp_channel_worker::GRACE_SECS / 2))
         .bind(&fresh)
         .execute(&state.db)
         .await
@@ -577,7 +586,7 @@ async fn channels_updated_broadcast_on_spawn_and_gc() {
     // Now drive GC directly and confirm a second broadcast on deletion.
     let now = wavvon_hub::auth::handlers::unix_timestamp();
     sqlx::query("UPDATE channels SET empty_since = $1 WHERE id = $2")
-        .bind(now - 61)
+        .bind(now - (temp_channel_worker::GRACE_SECS * 2))
         .bind(&temp_channel_id)
         .execute(&state.db)
         .await
@@ -630,6 +639,7 @@ async fn db_only_state() -> (Arc<AppState>, common::TestDbGuard) {
         voice_zones: RwLock::new(HashMap::new()),
         voice_udp_port: 0,
         voice_wt_url: None,
+        canonical_url: Arc::new(RwLock::new(None)),
         voice_cert_hash: RwLock::new(None),
         voice_event_tx,
         dm_tx: broadcast::channel(16).0,

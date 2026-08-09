@@ -1119,6 +1119,10 @@ async fn main() -> Result<()> {
         voice_next_sender_id: RwLock::new(HashMap::new()),
         voice_udp_port,
         voice_wt_url,
+        // Seeded with what we can work out ourselves; a farm-managed hub has
+        // this replaced by the farm's answer on the first heartbeat, which is
+        // also how a later rename reaches it.
+        canonical_url: Arc::new(RwLock::new(public_url.clone())),
         voice_cert_hash: RwLock::new(None),
         voice_event_tx,
         dm_tx,
@@ -1277,12 +1281,28 @@ async fn main() -> Result<()> {
                     "storage_bytes": db_size,
                     "uptime_seconds": uptime,
                 });
-                let _ = hb_state
+                // The reply carries the address the farm currently publishes
+                // for us. Adopting it here is what makes a rename propagate to
+                // every connected client within one interval, without a
+                // restart — clients re-read /info on connect and on
+                // hub_updated, and take the new URL from there.
+                if let Ok(resp) = hb_state
                     .http_client
                     .post(format!("{hb_url}/farm/heartbeat"))
                     .json(&payload)
                     .send()
-                    .await;
+                    .await
+                {
+                    if let Ok(body) = resp.json::<serde_json::Value>().await {
+                        if let Some(url) = body.get("canonical_url").and_then(|v| v.as_str()) {
+                            let mut current = hb_state.canonical_url.write().await;
+                            if current.as_deref() != Some(url) {
+                                tracing::info!(canonical_url = url, "Farm reports our address");
+                                *current = Some(url.to_string());
+                            }
+                        }
+                    }
+                }
             }
         });
     }
@@ -1504,6 +1524,10 @@ async fn backup(out_path: &str, db_url: &str) -> anyhow::Result<()> {
         .context("Cannot open the database to back it up")?;
 
     let server_version_num = db::dump::server_version_num(&pool).await?;
+    // Whatever schema this hub actually lives in: `public` normally, or one of
+    // its own when a farm separates hubs by schema rather than by database.
+    // Recorded in the archive so a restore knows what it is holding.
+    let schema = db::dump::current_schema(&pool).await?;
     let row_counts = db::dump::row_counts(&pool).await?;
 
     // Dumped to a temp file first: the tar is written last, so a pg_dump that
@@ -1512,7 +1536,7 @@ async fn backup(out_path: &str, db_url: &str) -> anyhow::Result<()> {
     let staging = tempfile::tempdir()?;
     let dump_path = staging.path().join("database.dump");
     println!("Dumping the database…");
-    db::dump::dump(db_url, &dump_path)?;
+    db::dump::dump(db_url, &dump_path, &schema)?;
 
     let file = std::fs::File::create(out_path)?;
     let gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
@@ -1541,6 +1565,7 @@ async fn backup(out_path: &str, db_url: &str) -> anyhow::Result<()> {
         "pg_server_version_num": server_version_num,
         // Compared after the restore, so a partial one is reported as partial.
         "row_counts": row_counts,
+        "schema": schema,
         "uploads_included": uploads_included,
     });
     let meta_bytes = serde_json::to_vec_pretty(&meta)?;

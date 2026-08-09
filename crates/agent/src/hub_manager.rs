@@ -27,7 +27,7 @@ impl HubManager {
     pub async fn spawn_hub(
         &self,
         hub_id: &str,
-        db_path: &str,
+        db_url: &str,
         port: u16,
         voice_port: u16,
         owner_pubkey: Option<&str>,
@@ -35,7 +35,7 @@ impl HubManager {
     ) -> Result<()> {
         // See the same block in farm/src/hub_manager.rs: these names used to
         // be literals, and WAVVON_HUB_HTTP_PORT was one the hub never reads,
-        // so the assigned port was silently ignored. `db_path` is likewise
+        // so the assigned port was silently ignored. `db_url` is likewise
         // still a SQLite-era file path with no PostgreSQL provisioning behind
         // it, so no database var is passed and the hub uses its own default.
         let bin = std::env::var(wavvon_hub_env::HUB_BIN).unwrap_or_else(|_| self.hub_bin.clone());
@@ -56,7 +56,7 @@ impl HubManager {
             .env(wavvon_hub_env::FARM_HUB_ID, hub_id);
         tracing::warn!(
             hub_id,
-            db_path,
+            db_url,
             "no per-hub database provisioning: this hub will use the default \
              WAVVON_DATABASE_URL and share it with every other spawned hub"
         );
@@ -91,14 +91,14 @@ impl HubManager {
     pub async fn restart_hub(
         &self,
         hub_id: &str,
-        db_path: &str,
+        db_url: &str,
         port: u16,
         voice_port: u16,
         owner_pubkey: Option<&str>,
         farm_url: Option<&str>,
     ) -> Result<()> {
         self.stop_hub(hub_id).await?;
-        self.spawn_hub(hub_id, db_path, port, voice_port, owner_pubkey, farm_url)
+        self.spawn_hub(hub_id, db_url, port, voice_port, owner_pubkey, farm_url)
             .await
     }
 

@@ -195,6 +195,8 @@ async fn main() -> Result<()> {
         farm_url.clone(),
         cfg.hub_base_port,
         voice_base_port,
+        // Each hub's database is created on the same server the farm uses.
+        cfg.database_url.clone(),
     ));
     hub_manager.spawn_all_from_db(&db).await?;
 

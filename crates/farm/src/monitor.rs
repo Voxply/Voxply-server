@@ -95,7 +95,7 @@ pub async fn tick(state: &FarmState) -> Result<(), sqlx::Error> {
         Option<String>,
         String,
     )> = sqlx::query_as(
-        "SELECT h.id, h.db_path, h.process_port, h.voice_port, h.restart_attempts, h.last_restart_at,
+        "SELECT h.id, h.db_url, h.process_port, h.voice_port, h.restart_attempts, h.last_restart_at,
                 COALESCE(hb.last_seen_at, h.created_at) AS effective_last_seen,
                 h.server_id, h.owner_pubkey
          FROM hubs h
@@ -110,7 +110,7 @@ pub async fn tick(state: &FarmState) -> Result<(), sqlx::Error> {
 
     for (
         hub_id,
-        db_path,
+        db_url,
         port,
         voice_port,
         attempts,
@@ -130,7 +130,7 @@ pub async fn tick(state: &FarmState) -> Result<(), sqlx::Error> {
                         .send_restart_to_agent(
                             server_id,
                             &hub_id,
-                            &db_path,
+                            &db_url,
                             port as u16,
                             voice_port,
                             Some(&owner_pubkey),
@@ -146,7 +146,7 @@ pub async fn tick(state: &FarmState) -> Result<(), sqlx::Error> {
                     }
                 } else if let Err(e) = state
                     .hub_manager
-                    .restart_hub(&hub_id, &db_path, port as u16, voice_port)
+                    .restart_hub(&hub_id, &db_url, port as u16, voice_port)
                     .await
                 {
                     tracing::warn!(hub_id, error = %e, "Auto-restart failed to spawn hub");

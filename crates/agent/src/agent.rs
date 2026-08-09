@@ -66,7 +66,7 @@ async fn handle_message(
         }
         "spawn_hub" => {
             let hub_id = msg.get("hub_id")?.as_str()?.to_string();
-            let db_path = msg.get("db_path")?.as_str()?.to_string();
+            let db_url = msg.get("db_url")?.as_str()?.to_string();
             let port = msg.get("port")?.as_u64()? as u16;
             // Fall back to the default when an older farm doesn't send it —
             // avoids a fatal bind collision if two hubs happen to spawn.
@@ -86,7 +86,7 @@ async fn handle_message(
 
             match manager.spawn_hub(
                 &hub_id,
-                &db_path,
+                &db_url,
                 port,
                 voice_port,
                 owner_pubkey.as_deref(),
@@ -98,7 +98,7 @@ async fn handle_message(
         }
         "restart_hub" => {
             let hub_id = msg.get("hub_id")?.as_str()?.to_string();
-            let db_path = msg.get("db_path")?.as_str()?.to_string();
+            let db_url = msg.get("db_url")?.as_str()?.to_string();
             let port = msg.get("port")?.as_u64()? as u16;
             let voice_port = msg
                 .get("voice_port")
@@ -117,7 +117,7 @@ async fn handle_message(
             match manager
                 .restart_hub(
                     &hub_id,
-                    &db_path,
+                    &db_url,
                     port,
                     voice_port,
                     owner_pubkey.as_deref(),

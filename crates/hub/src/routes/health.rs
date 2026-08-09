@@ -164,6 +164,7 @@ pub async fn info(State(state): State<Arc<AppState>>) -> Json<InfoResponse> {
         voice_cert_hash: state.voice_cert_hash.read().await.clone(),
         timezone,
         birthdays_enabled,
+        canonical_url: state.canonical_url.read().await.clone(),
     })
 }
 
@@ -272,6 +273,19 @@ pub struct InfoResponse {
     /// true when never configured.
     #[serde(default = "default_true")]
     pub birthdays_enabled: bool,
+    /// The address this hub says clients should use for it.
+    ///
+    /// Behind a farm this is the hub's canonical slug URL and it **changes**
+    /// when the owner renames the hub — clients re-read it on connect and on
+    /// `hub_updated` and update their stored address, so a rename reaches
+    /// everyone without breaking a single session. Absent when the hub has no
+    /// public address at all.
+    ///
+    /// This never replaces `public_key` as the hub's identity: a client keeps
+    /// indexing by key and follows this only for *where* to reach it. That is
+    /// what stops a changed address from silently becoming a different hub.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_url: Option<String>,
 }
 
 fn default_true() -> bool {

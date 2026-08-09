@@ -51,6 +51,8 @@ async fn start_farm() -> (String, Arc<FarmState>, common::TestDbGuard) {
         farm_url.clone(),
         9200,
         10200,
+        // Creating a hub provisions it a database on this server.
+        common::base_db_url(),
     ));
     let state = Arc::new(FarmState::new(
         db_pool,
@@ -237,5 +239,104 @@ async fn websocket_upgrade_bridges_to_stub_hub() {
     assert_eq!(
         reply,
         TungsteniteMessage::Text("hello-through-the-bridge".into())
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Slug routing — the same resolution, the other key space
+// ---------------------------------------------------------------------------
+
+/// Give `hub_id` a live slug.
+async fn insert_slug(state: &FarmState, hub_id: &str, slug: &str) {
+    sqlx::query(
+        "INSERT INTO hub_slugs (slug, display_slug, hub_id, is_canonical, created_at)
+         VALUES ($1, $2, $3, TRUE, $4)",
+    )
+    .bind(slug.to_ascii_lowercase())
+    .bind(slug)
+    .bind(hub_id)
+    .bind(unix_now())
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+/// The point of the whole slug design: a readable address reaches the hub, and
+/// the pubkey keeps working beside it. Two ways in, one hub, never a choice
+/// between them.
+#[tokio::test]
+async fn a_slug_and_the_pubkey_both_reach_the_same_hub() {
+    let (farm_url, state, _guard) = start_farm().await;
+    let hub_port = start_stub_hub().await;
+    let serial = random_serial();
+    insert_hub_row(&state, "hub00010", &serial, Some(hub_port), false).await;
+    insert_slug(&state, "hub00010", "MangiaDaPippo").await;
+
+    let client = Client::new();
+    for address in [serial.clone(), "MangiaDaPippo".to_string()] {
+        let resp = client
+            .get(format!("{farm_url}/hub/{address}/info"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "address {address} should route");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["name"], "stub-hub");
+    }
+}
+
+/// Routing is case-insensitive, so mistyping the capitals of a hub's address
+/// reaches that hub rather than whoever registered the variant.
+#[tokio::test]
+async fn a_slug_resolves_whatever_the_capitalisation() {
+    let (farm_url, state, _guard) = start_farm().await;
+    let hub_port = start_stub_hub().await;
+    insert_hub_row(&state, "hub00011", &random_serial(), Some(hub_port), false).await;
+    insert_slug(&state, "hub00011", "MangiaDaPippo").await;
+
+    let client = Client::new();
+    for address in ["mangiadapippo", "MANGIADAPIPPO", "MangiaDaPippo"] {
+        let resp = client
+            .get(format!("{farm_url}/hub/{address}/info"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "address {address} should route");
+    }
+}
+
+/// A released slug stops resolving immediately — that is what makes releasing
+/// it meaningful, and what the cooling-off window then protects.
+#[tokio::test]
+async fn a_released_slug_stops_routing_but_the_pubkey_does_not() {
+    let (farm_url, state, _guard) = start_farm().await;
+    let hub_port = start_stub_hub().await;
+    let serial = random_serial();
+    insert_hub_row(&state, "hub00012", &serial, Some(hub_port), false).await;
+    insert_slug(&state, "hub00012", "pippo").await;
+
+    sqlx::query("UPDATE hub_slugs SET released_at = $1 WHERE slug = 'pippo'")
+        .bind(unix_now())
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    let client = Client::new();
+    let gone = client
+        .get(format!("{farm_url}/hub/pippo/info"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gone.status(), 404);
+
+    let still_there = client
+        .get(format!("{farm_url}/hub/{serial}/info"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        still_there.status(),
+        200,
+        "the pubkey is the address of last resort and must never stop working"
     );
 }

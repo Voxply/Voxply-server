@@ -277,6 +277,13 @@ pub struct AppState {
     /// LAN-mode advertise address, both paired with `voice_udp_port`.
     /// Surfaced on `/info` and in `voice_joined` — see voice-transport-v2.md.
     pub voice_wt_url: Option<String>,
+    /// The address clients should store for this hub, published on `/info`.
+    ///
+    /// Starts as the locally-derived public URL and is replaced by whatever
+    /// the farm reports in its heartbeat response — that is how a hub learns
+    /// it has been given a new name, without a restart. `RwLock` because the
+    /// heartbeat task writes it while request handlers read it.
+    pub canonical_url: Arc<RwLock<Option<String>>>,
     /// Hex SHA-256 digest of the WT endpoint's current self-signed
     /// certificate. `None` when a CA-issued cert (`WAVVON_TLS_CERT`/`_KEY`)
     /// is in use, or before the cert has been generated. Rotates in place

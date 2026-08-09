@@ -53,6 +53,8 @@ async fn setup() -> (TestServer, Arc<FarmState>, common::TestDbGuard) {
         farm_url.to_string(),
         9100,
         10100,
+        // Creating a hub provisions it a database on this server.
+        common::base_db_url(),
     ));
     let state = Arc::new(FarmState::new(
         db,

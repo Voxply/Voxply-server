@@ -65,7 +65,7 @@ impl FarmState {
         &self,
         server_id: &str,
         hub_id: &str,
-        db_path: &str,
+        db_url: &str,
         port: u16,
         voice_port: u16,
         owner_pubkey: Option<&str>,
@@ -78,7 +78,7 @@ impl FarmState {
         let cmd = serde_json::json!({
             "type": "restart_hub",
             "hub_id": hub_id,
-            "db_path": db_path,
+            "db_url": db_url,
             "port": port,
             "voice_port": voice_port,
             "owner_pubkey": owner_pubkey,

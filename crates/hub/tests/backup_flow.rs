@@ -114,7 +114,10 @@ async fn dump_restores_every_row_into_an_empty_database() {
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let archive = tmp.path().join("database.dump");
-    db::dump::dump(&src_url, &archive).expect("pg_dump");
+    let schema = db::dump::current_schema(&src)
+        .await
+        .expect("current schema");
+    db::dump::dump(&src_url, &archive, &schema).expect("pg_dump");
     assert!(archive.metadata().expect("dump file").len() > 0);
 
     let (dst, dst_url) = fresh_db(dst_name).await;

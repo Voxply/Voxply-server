@@ -28,17 +28,67 @@ pub struct HubManager {
     /// Base port for allocating new hub voice (WebTransport/QUIC over UDP) ports.
     /// Separate range from `base_port` so the two never collide.
     voice_base_port: u16,
+    /// The farm's own PostgreSQL URL. Each hub's database is created on this
+    /// server and derived from this URL (db/provision.rs).
+    db_base_url: String,
 }
 
 impl HubManager {
-    pub fn new(hub_bin: String, farm_url: String, base_port: u16, voice_base_port: u16) -> Self {
+    pub fn new(
+        hub_bin: String,
+        farm_url: String,
+        base_port: u16,
+        voice_base_port: u16,
+        db_base_url: String,
+    ) -> Self {
         Self {
             hubs: RwLock::new(HashMap::new()),
             hub_bin,
             farm_url,
             base_port,
             voice_base_port,
+            db_base_url,
         }
+    }
+
+    /// This hub's database URL, creating the database on first use.
+    ///
+    /// Central because every spawn path needs it and none of them may skip it:
+    /// a hub without its own database silently falls back to the shared default
+    /// and starts reading another community's messages. Persisted on the row so
+    /// the work happens once.
+    pub async fn ensure_db_url(&self, db: &PgPool, hub_id: &str) -> Result<String> {
+        let existing: Option<Option<String>> =
+            sqlx::query_scalar("SELECT db_url FROM hubs WHERE id = $1")
+                .bind(hub_id)
+                .fetch_optional(db)
+                .await
+                .context("could not read the hub's database URL")?;
+        if let Some(Some(url)) = existing {
+            if !url.is_empty() {
+                return Ok(url);
+            }
+        }
+
+        let isolation: String = sqlx::query_scalar("SELECT hub_isolation FROM farms WHERE id = 1")
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "database".to_string());
+        let isolation = crate::db::provision::Isolation::from_setting(&isolation);
+
+        let url = crate::db::provision::provision_hub(db, &self.db_base_url, hub_id, isolation)
+            .await
+            .with_context(|| format!("could not give hub {hub_id} a place of its own"))?;
+
+        sqlx::query("UPDATE hubs SET db_url = $1 WHERE id = $2")
+            .bind(&url)
+            .bind(hub_id)
+            .execute(db)
+            .await
+            .context("could not record the hub's database URL")?;
+        Ok(url)
     }
 
     /// Allocate the next free HTTP port for a new hub process.
@@ -78,7 +128,7 @@ impl HubManager {
     pub async fn spawn_hub(
         &self,
         hub_id: &str,
-        db_path: &str,
+        db_url: &str,
         port: u16,
         voice_port: u16,
         owner_pubkey: Option<&str>,
@@ -102,25 +152,15 @@ impl HubManager {
             // Our row id for this hub. It reports this back on its first
             // heartbeat, which is the only way we learn its pubkey and can
             // start routing `/hub/<serial>` to it.
-            .env(wavvon_hub_env::FARM_HUB_ID, hub_id);
+            .env(wavvon_hub_env::FARM_HUB_ID, hub_id)
+            // This hub's own database (db/provision.rs). Passing nothing here
+            // is what made every farm-spawned hub fall back to the same default
+            // URL and share one database with all the others — invisibly, since
+            // the farm was setting WAVVON_HUB_DB, a name the hub never read.
+            .env(wavvon_hub_env::DATABASE_URL, db_url);
         if let Some(pk) = owner_pubkey {
             cmd.env(wavvon_hub_env::OWNER_PUBKEY, pk);
         }
-
-        // `db_path` is still a leftover SQLite-era file path
-        // (`{hubs_dir}/{hub_id}.db`) and there is no per-hub PostgreSQL
-        // provisioning yet, so nothing is passed for the hub's database and
-        // it falls back to its own default. Two hubs on one box therefore
-        // share a database. That used to be invisible — the farm set
-        // WAVVON_HUB_DB, which the hub has never read, so it looked handled.
-        // Warn until provisioning lands (ROADMAP: farm multi-node data plane
-        // lists per-node PostgreSQL as a prerequisite).
-        tracing::warn!(
-            hub_id,
-            db_path,
-            "no per-hub database provisioning: this hub will use the default \
-             WAVVON_DATABASE_URL and share it with every other farm-spawned hub"
-        );
         let child = cmd.spawn().with_context(|| {
             format!("Failed to spawn hub process for {hub_id} (binary: {bin:?})")
         })?;
@@ -151,18 +191,17 @@ impl HubManager {
         Ok(())
     }
 
-    /// Restart a hub process: stop it then re-spawn with the same db_path, port
+    /// Restart a hub process: stop it then re-spawn with the same db_url, port
     /// and voice_port.
     pub async fn restart_hub(
         &self,
         hub_id: &str,
-        db_path: &str,
+        db_url: &str,
         port: u16,
         voice_port: u16,
     ) -> Result<()> {
         self.stop_hub(hub_id).await?;
-        self.spawn_hub(hub_id, db_path, port, voice_port, None)
-            .await
+        self.spawn_hub(hub_id, db_url, port, voice_port, None).await
     }
 
     /// Whether a hub process is currently tracked as running.
@@ -184,15 +223,31 @@ impl HubManager {
         // process_port/voice_port are INTEGER (i32) — decoding as i64 fails sqlx's
         // type check at runtime (same latent bug the proxy had; see proxy.rs).
         #[allow(clippy::type_complexity)]
-        let rows: Vec<(String, String, i32, Option<i32>, Option<String>)> = sqlx::query_as(
-            "SELECT id, db_path, process_port, voice_port, owner_pubkey FROM hubs
+        let rows: Vec<(String, i32, Option<i32>, Option<String>)> = sqlx::query_as(
+            "SELECT id, process_port, voice_port, owner_pubkey FROM hubs
              WHERE suspended_at IS NULL AND deleted_at IS NULL AND process_port IS NOT NULL",
         )
         .fetch_all(db)
         .await
         .context("Failed to query hubs for startup spawn")?;
 
-        for (hub_id, db_path, port, voice_port, owner_pubkey) in rows {
+        for (hub_id, port, voice_port, owner_pubkey) in rows {
+            // Hubs that predate per-hub databases have no `db_url`; this
+            // provisions one on the spot. A failure here skips the hub rather
+            // than starting it against the shared default, which is the
+            // condition this whole mechanism exists to end.
+            let db_url = match self.ensure_db_url(db, &hub_id).await {
+                Ok(url) => url,
+                Err(e) => {
+                    tracing::error!(
+                        hub_id,
+                        error = %e,
+                        "No database for this hub — not starting it. Starting it anyway would \
+                         put it back on the database every other hub shares."
+                    );
+                    continue;
+                }
+            };
             let port = port as u16;
             let voice_port = match voice_port {
                 Some(vp) => vp as u16,
@@ -207,7 +262,7 @@ impl HubManager {
                 }
             };
             if let Err(e) = self
-                .spawn_hub(&hub_id, &db_path, port, voice_port, owner_pubkey.as_deref())
+                .spawn_hub(&hub_id, &db_url, port, voice_port, owner_pubkey.as_deref())
                 .await
             {
                 tracing::warn!(hub_id, error = %e, "Failed to spawn hub on startup (skipping)");
@@ -223,7 +278,7 @@ impl HubManager {
         self: &Arc<Self>,
         db: &PgPool,
         hub_id: &str,
-        db_path: &str,
+        db_url: &str,
         owner_pubkey: Option<&str>,
     ) -> Result<(u16, u16)> {
         let port = self.allocate_port().await;
@@ -238,7 +293,7 @@ impl HubManager {
             .await
             .context("Failed to persist hub ports")?;
 
-        self.spawn_hub(hub_id, db_path, port, voice_port, owner_pubkey)
+        self.spawn_hub(hub_id, db_url, port, voice_port, owner_pubkey)
             .await?;
         Ok((port, voice_port))
     }

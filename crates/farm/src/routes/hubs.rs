@@ -23,7 +23,7 @@ use crate::unix_now;
 // ---------------------------------------------------------------------------
 
 /// Extract and verify a Bearer farm token. Returns the `sub` (canonical pubkey) on success.
-fn require_auth(
+pub(crate) fn require_auth(
     headers: &HeaderMap,
     farm_pubkey: &str,
 ) -> Result<crate::token::FarmTokenPayload, (StatusCode, Json<serde_json::Value>)> {
@@ -47,7 +47,7 @@ fn require_auth(
 }
 
 /// Returns the admin pubkey stored in the `farms` singleton row, or `None`.
-async fn get_admin_pubkey(db: &sqlx::PgPool) -> Option<String> {
+pub(crate) async fn get_admin_pubkey(db: &sqlx::PgPool) -> Option<String> {
     sqlx::query_scalar::<_, Option<String>>("SELECT admin_pubkey FROM farms WHERE id = 1")
         .fetch_optional(db)
         .await
@@ -175,6 +175,11 @@ pub struct CreateHubRequest {
     pub name: String,
     pub description: Option<String>,
     pub visibility: Option<String>,
+    /// Put this hub on a named server. Omitted, the emptiest node takes it
+    /// (placement.rs). Named and full, the request is refused rather than
+    /// placed elsewhere — see `choose`.
+    #[serde(default)]
+    pub server_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -333,6 +338,25 @@ pub async fn create_hub(
 
     let now = unix_now();
 
+    // Decide where this hub goes *before* creating its row (placement.rs).
+    // Choosing afterwards counts the hub against its own node's capacity, so a
+    // node capped at one would refuse the very first hub placed on it.
+    // Refused rather than overflowed: an operator caps a node for a reason we
+    // cannot see from here.
+    let nodes = collect_nodes(&state).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("db_error: {e}")})),
+        )
+    })?;
+    let chosen = crate::placement::choose(&nodes, req.server_id.as_deref()).map_err(|e| {
+        (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": e.code(), "details": e.message()})),
+        )
+    })?;
+    let chosen = chosen.server_id.clone();
+
     // Determine the DB path from the hubs_dir configured in FarmState.
     let hubs_dir = &state.hubs_dir;
     let db_path = format!("{}/{}.db", hubs_dir.trim_end_matches('/'), hub_id);
@@ -365,14 +389,46 @@ pub async fn create_hub(
         )
     })?;
 
-    // Try to delegate to a connected server agent; fall back to local spawn.
-    let launched = if let Some((server_id, sender)) = pick_agent(&state.agent_senders).await {
+    // This hub's own database, created before anything is spawned. A failure
+    // here fails the whole creation: a hub started without one falls back to
+    // the shared default and reads another community's data, which is precisely
+    // the bug per-hub provisioning replaced.
+    let db_url = match state.hub_manager.ensure_db_url(&state.db, &hub_id).await {
+        Ok(url) => url,
+        Err(e) => {
+            let _ = sqlx::query("UPDATE hubs SET deleted_at = $1 WHERE id = $2")
+                .bind(now)
+                .bind(&hub_id)
+                .execute(&state.db)
+                .await;
+            tracing::error!(hub_id, error = %e, "Hub creation failed: no database");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "database_provisioning_failed",
+                    "details": e.to_string(),
+                })),
+            ));
+        }
+    };
+
+    let launched = if let Some(server_id) = chosen {
+        let sender = state.agent_senders.read().await.get(&server_id).cloned();
+        // `choose` only returns connected agents, so this is belt and braces —
+        // but an agent can drop between the two, and silently spawning locally
+        // after the operator picked a server would be the wrong repair.
+        let Some(sender) = sender else {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "agent_offline"})),
+            ));
+        };
         let port = state.hub_manager.allocate_port().await;
         let voice_port = state.hub_manager.allocate_voice_port().await;
         let cmd = serde_json::json!({
             "type": "spawn_hub",
             "hub_id": hub_id,
-            "db_path": db_path,
+            "db_url": db_url,
             "port": port,
             "voice_port": voice_port,
             "owner_pubkey": payload.sub,
@@ -393,7 +449,7 @@ pub async fn create_hub(
     if !launched {
         match state
             .hub_manager
-            .allocate_and_spawn(&state.db, &hub_id, &db_path, Some(payload.sub.as_str()))
+            .allocate_and_spawn(&state.db, &hub_id, &db_url, Some(payload.sub.as_str()))
             .await
         {
             Ok((port, voice_port)) => {
@@ -562,8 +618,8 @@ pub async fn force_restart_hub(
     }
 
     #[allow(clippy::type_complexity)]
-    let row: Option<(String, Option<i32>, Option<i32>, Option<String>, String)> = sqlx::query_as(
-        "SELECT db_path, process_port, voice_port, server_id, owner_pubkey FROM hubs
+    let row: Option<(Option<i32>, Option<i32>, Option<String>, String)> = sqlx::query_as(
+        "SELECT process_port, voice_port, server_id, owner_pubkey FROM hubs
          WHERE id = $1 AND deleted_at IS NULL",
     )
     .bind(&hub_id)
@@ -576,7 +632,7 @@ pub async fn force_restart_hub(
         )
     })?;
 
-    let (db_path, process_port, voice_port, server_id, owner_pubkey) = row.ok_or_else(|| {
+    let (process_port, voice_port, server_id, owner_pubkey) = row.ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "hub_not_found"})),
@@ -592,13 +648,29 @@ pub async fn force_restart_hub(
 
     let voice_port = state.resolve_voice_port(&hub_id, voice_port).await;
 
+    // Provisions on the spot for a hub that predates per-hub databases, so an
+    // admin restart is also the repair path.
+    let db_url = state
+        .hub_manager
+        .ensure_db_url(&state.db, &hub_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "database_provisioning_failed",
+                    "details": e.to_string(),
+                })),
+            )
+        })?;
+
     if let Some(server_id) = server_id {
         // Agent-hosted hub — delegate the restart over the agent's WebSocket.
         if state
             .send_restart_to_agent(
                 &server_id,
                 &hub_id,
-                &db_path,
+                &db_url,
                 port as u16,
                 voice_port,
                 Some(&owner_pubkey),
@@ -618,7 +690,7 @@ pub async fn force_restart_hub(
         // 500 — it's logged, and the fleet view already surfaces online status.
         if let Err(e) = state
             .hub_manager
-            .restart_hub(&hub_id, &db_path, port as u16, voice_port)
+            .restart_hub(&hub_id, &db_url, port as u16, voice_port)
             .await
         {
             tracing::warn!(hub_id, error = %e, "Force-restart failed to spawn hub process");
@@ -712,14 +784,51 @@ pub async fn delete_hub(
 }
 
 // ---------------------------------------------------------------------------
-// Helper: pick any connected server agent sender
+// Helper: the nodes a hub could be placed on, with their current load
 // ---------------------------------------------------------------------------
 
-async fn pick_agent(
-    senders: &Arc<
-        tokio::sync::RwLock<std::collections::HashMap<String, tokio::sync::mpsc::Sender<String>>>,
-    >,
-) -> Option<(String, tokio::sync::mpsc::Sender<String>)> {
-    let map = senders.read().await;
-    map.iter().next().map(|(id, s)| (id.clone(), s.clone()))
+/// Every connected agent plus the farm's own process, each with how many hubs
+/// it holds and how many it may.
+///
+/// Only *connected* agents are listed: a registered server whose agent is
+/// offline cannot be handed a spawn command, so offering it as a target would
+/// only produce a hub that never starts.
+async fn collect_nodes(state: &FarmState) -> Result<Vec<crate::placement::Node>, sqlx::Error> {
+    let counts: Vec<(Option<String>, i64)> = sqlx::query_as(
+        "SELECT server_id, COUNT(*) FROM hubs WHERE deleted_at IS NULL GROUP BY server_id",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    let used: std::collections::HashMap<Option<String>, i64> = counts.into_iter().collect();
+
+    let caps: Vec<(String, Option<i32>)> =
+        sqlx::query_as("SELECT id, max_hubs FROM servers WHERE deleted_at IS NULL")
+            .fetch_all(&state.db)
+            .await?;
+    let caps: std::collections::HashMap<String, Option<i32>> = caps.into_iter().collect();
+
+    let local_cap: i64 = sqlx::query_scalar("SELECT max_local_hubs FROM farms WHERE id = 1")
+        .fetch_optional(&state.db)
+        .await?
+        .unwrap_or(0);
+
+    let connected = state.agent_senders.read().await;
+    let mut nodes: Vec<crate::placement::Node> = connected
+        .keys()
+        .map(|id| crate::placement::Node {
+            in_use: *used.get(&Some(id.clone())).unwrap_or(&0),
+            // A registered server with no cap set is unlimited.
+            capacity: caps.get(id).copied().flatten().map(|c| c as i64),
+            server_id: Some(id.clone()),
+        })
+        .collect();
+
+    nodes.push(crate::placement::Node {
+        server_id: None,
+        in_use: *used.get(&None).unwrap_or(&0),
+        // 0 means unlimited, matching max_hubs_per_user.
+        capacity: if local_cap > 0 { Some(local_cap) } else { None },
+    });
+
+    Ok(nodes)
 }

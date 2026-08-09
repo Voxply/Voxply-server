@@ -44,6 +44,8 @@ async fn setup() -> (TestServer, Arc<FarmState>, common::TestDbGuard) {
         "https://farm.test".to_string(),
         9400,
         10400,
+        // Creating a hub provisions it a database on this server.
+        common::base_db_url(),
     ));
     let state = Arc::new(FarmState::new(
         db_pool,
