@@ -1294,6 +1294,15 @@ async fn main() -> Result<()> {
                     .await
                 {
                     if let Ok(body) = resp.json::<serde_json::Value>().await {
+                        if let Ok(siblings) =
+                            serde_json::from_value::<Vec<wavvon_hub::farm_siblings::Sibling>>(
+                                body.get("siblings")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null),
+                            )
+                        {
+                            wavvon_hub::farm_siblings::reconcile(&hb_state.db, &siblings).await;
+                        }
                         if let Some(url) = body.get("canonical_url").and_then(|v| v.as_str()) {
                             let mut current = hb_state.canonical_url.write().await;
                             if current.as_deref() != Some(url) {

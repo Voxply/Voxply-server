@@ -187,6 +187,12 @@ pub fn create_router_full(
                 .patch(routes::banlist::update_source),
         )
         .route("/admin/banlist/entries", get(routes::banlist::list_entries))
+        // "Does this member have history elsewhere?" — the question the
+        // soft-flag policy exists to answer, which nothing could ask before.
+        .route(
+            "/moderation/history/{pubkey}",
+            get(routes::banlist::user_history),
+        )
         .route(
             "/admin/banlist/overrides",
             get(routes::banlist::list_overrides).post(routes::banlist::add_override),

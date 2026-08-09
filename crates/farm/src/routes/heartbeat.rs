@@ -31,6 +31,27 @@ pub struct HeartbeatResponse {
     /// work it out (no public farm URL configured).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canonical_url: Option<String>,
+    /// The other hubs on this farm.
+    ///
+    /// Offered, not imposed. A hub uses these to subscribe to its siblings'
+    /// ban lists in `soft-flag` (history, never a block) and to trust them as
+    /// certification issuers, so somebody vouched for on one hub of a farm is
+    /// not a stranger on the next — the anti-bot story, built out of the
+    /// federation primitives that already exist rather than a farm-level
+    /// reputation store, which is a thing this project has said it will not
+    /// build.
+    ///
+    /// A hub wires each sibling in **once**. If its owner later unsubscribes,
+    /// it stays unsubscribed: a compromised sibling has to be cuttable, and an
+    /// admin decision the farm silently reverts every minute is not a decision.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub siblings: Vec<Sibling>,
+}
+
+#[derive(Serialize)]
+pub struct Sibling {
+    pub hub_pubkey: String,
+    pub hub_url: String,
 }
 
 pub async fn receive_heartbeat(
@@ -183,7 +204,45 @@ pub async fn receive_heartbeat(
         }
     };
 
-    (StatusCode::OK, Json(HeartbeatResponse { canonical_url }))
+    // Every other live hub on this farm, addressed by its canonical slug so
+    // the URL survives a rename. Only hubs that have claimed a serial: one
+    // without a pubkey cannot be verified as a ban-list issuer or a cert
+    // issuer, which is the whole basis for trusting it.
+    let siblings = {
+        let base = state.farm_url.trim_end_matches('/');
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT h.id, h.hub_pubkey, s.slug
+             FROM hubs h
+             LEFT JOIN hub_slugs s
+                    ON s.hub_id = h.id AND s.is_canonical AND s.released_at IS NULL
+             WHERE h.hub_pubkey IS NOT NULL
+               AND h.hub_pubkey <> $1
+               AND h.deleted_at IS NULL
+               AND h.suspended_at IS NULL",
+        )
+        .bind(&hub_pubkey)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+
+        rows.into_iter()
+            .map(|(_, pubkey, slug)| {
+                let address = slug.unwrap_or_else(|| pubkey.clone());
+                Sibling {
+                    hub_url: format!("{base}/hub/{address}"),
+                    hub_pubkey: pubkey,
+                }
+            })
+            .collect()
+    };
+
+    (
+        StatusCode::OK,
+        Json(HeartbeatResponse {
+            canonical_url,
+            siblings,
+        }),
+    )
 }
 
 // ---------------------------------------------------------------------------

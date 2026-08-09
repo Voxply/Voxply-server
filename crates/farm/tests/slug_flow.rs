@@ -410,3 +410,69 @@ async fn a_refused_placement_leaves_no_hub_row() {
         .unwrap();
     assert_eq!(live, 0, "a refused creation must not leave a live hub row");
 }
+
+// ---------------------------------------------------------------------------
+// Sibling wiring — the farm offers, the hub decides
+// ---------------------------------------------------------------------------
+
+/// The heartbeat reports a hub's siblings so it can subscribe to their ban
+/// lists in soft-flag and trust their certifications — the anti-bot story
+/// built from federation primitives, not a farm-level reputation store.
+#[tokio::test]
+async fn the_heartbeat_reports_sibling_hubs_by_their_current_address() {
+    let h = setup().await;
+    let a = "aa".repeat(32);
+    let b = "bb".repeat(32);
+    insert_hub(&h, "hub-a", Some(&a)).await;
+    insert_hub(&h, "hub-b", Some(&b)).await;
+    claim(&h, "hub-b", "OsteriaPippo").await;
+
+    let body: serde_json::Value = h
+        .server
+        .post("/farm/heartbeat")
+        .json(&json!({ "hub_id": "hub-a", "hub_pubkey": a }))
+        .await
+        .json();
+
+    let siblings = body["siblings"].as_array().expect("siblings array");
+    assert_eq!(siblings.len(), 1, "a hub is not its own sibling");
+    assert_eq!(siblings[0]["hub_pubkey"], b);
+    assert_eq!(
+        siblings[0]["hub_url"], "https://farm.test/hub/osteriapippo",
+        "addressed by canonical slug, so the URL survives a rename"
+    );
+}
+
+/// A suspended hub is not offered: wiring trust to a hub the farm has just
+/// taken offline is the opposite of what an operator meant by suspending it.
+#[tokio::test]
+async fn suspended_and_unclaimed_hubs_are_not_offered_as_siblings() {
+    let h = setup().await;
+    let a = "aa".repeat(32);
+    insert_hub(&h, "hub-a", Some(&a)).await;
+    insert_hub(&h, "hub-b", Some(&"bb".repeat(32))).await;
+    // Never claimed a serial: unverifiable as an issuer, so not offered.
+    insert_hub(&h, "hub-c", None).await;
+
+    sqlx::query("UPDATE hubs SET suspended_at = $1 WHERE id = 'hub-b'")
+        .bind(unix_now())
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+
+    let body: serde_json::Value = h
+        .server
+        .post("/farm/heartbeat")
+        .json(&json!({ "hub_id": "hub-a", "hub_pubkey": a }))
+        .await
+        .json();
+
+    assert!(
+        body["siblings"]
+            .as_array()
+            .map(|a| a.is_empty())
+            .unwrap_or(true),
+        "got {}",
+        body["siblings"]
+    );
+}
