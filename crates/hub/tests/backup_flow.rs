@@ -84,7 +84,7 @@ async fn dump_restores_every_row_into_an_empty_database() {
              is supposed to have the PostgreSQL client tools installed"
         );
         eprintln!(
-            "SKIP backup_flow: pg_dump not found \
+            "WAVVON-TEST-SKIPPED: backup_flow — pg_dump not found \
              (set WAVVON_PG_BIN_DIR or install postgresql-client)"
         );
         return;
@@ -244,7 +244,7 @@ async fn a_hub_in_its_own_schema_backs_up_that_schema() {
             std::env::var("WAVVON_REQUIRE_PG_TOOLS").is_err(),
             "pg_dump not found, and WAVVON_REQUIRE_PG_TOOLS is set"
         );
-        eprintln!("SKIP the pg_dump half: pg_dump not found");
+        eprintln!("WAVVON-TEST-SKIPPED: backup_flow pg_dump half — pg_dump not found");
     }
 
     drop(scoped);

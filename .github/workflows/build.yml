@@ -85,4 +85,26 @@ jobs:
           TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432
           WAVVON_REQUIRE_PG_TOOLS: "1"
           WAVVON_REQUIRE_E2E: "1"
-        run: cargo test --workspace
+        # `--nocapture` is load-bearing, not verbosity: cargo swallows the
+        # output of tests that pass, so a skip notice printed by a passing test
+        # never reaches this log and the guard below would grep a file that
+        # could not contain what it looks for. Found by testing the guard.
+        run: |
+          set -o pipefail
+          cargo test --workspace -- --nocapture 2>&1 | tee cargo-test.log
+
+      # A test that skips itself is a test that can stop running with nobody
+      # noticing, and it reports as green while it does. The per-test
+      # WAVVON_REQUIRE_* guards catch the ones we remembered to guard; this
+      # catches the ones we did not, and needs no discipline from whoever
+      # writes the next skippable test.
+      #
+      # Every skip prints `WAVVON-TEST-SKIPPED:` — one token, deliberately
+      # unlike anything else in the output, so this cannot false-positive on a
+      # log line that merely says "skip".
+      - name: No test may skip itself in CI
+        run: |
+          if grep -n "WAVVON-TEST-SKIPPED:" cargo-test.log; then
+            echo "::error::A test skipped itself. Either make its prerequisite available in CI, or delete the test — a green run that did not execute it is worse than no test."
+            exit 1
+          fi

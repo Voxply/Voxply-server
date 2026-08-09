@@ -170,7 +170,7 @@ async fn a_hub_created_through_the_farm_becomes_reachable_through_it() {
             "wavvon-hub is not built, and WAVVON_REQUIRE_E2E is set — this \
              environment is supposed to run the end-to-end path"
         );
-        eprintln!("SKIP farm_hub_e2e: wavvon-hub not built (run `cargo build --workspace`)");
+        eprintln!("WAVVON-TEST-SKIPPED: farm_hub_e2e — wavvon-hub not built");
         return;
     };
 
@@ -362,7 +362,7 @@ async fn a_schema_isolated_hub_gets_its_own_schema_and_not_public() {
             std::env::var("WAVVON_REQUIRE_E2E").is_err(),
             "wavvon-hub is not built, and WAVVON_REQUIRE_E2E is set"
         );
-        eprintln!("SKIP farm_hub_e2e (schema): wavvon-hub not built");
+        eprintln!("WAVVON-TEST-SKIPPED: farm_hub_e2e schema — wavvon-hub not built");
         return;
     };
 
