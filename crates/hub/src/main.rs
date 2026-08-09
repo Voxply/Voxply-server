@@ -412,11 +412,7 @@ async fn main() -> Result<()> {
     // are handled above before settings are loaded.
     let subcommand = std::env::args().nth(1);
     if subcommand.as_deref() == Some("migrate") {
-        // WAVVON_DATABASE_URL is the documented config var (same one the
-        // server path resolves via Settings); DATABASE_URL kept as fallback.
-        let db_url = std::env::var("WAVVON_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/wavvon".to_string());
+        let db_url = cli_database_url();
         let db = PgPoolOptions::new()
             .max_connections(1)
             .connect(&db_url)
@@ -467,8 +463,7 @@ async fn main() -> Result<()> {
 
     if subcommand.as_deref() == Some("admin") {
         let admin_cmd = std::env::args().nth(2).unwrap_or_default();
-        let db_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/wavvon".to_string());
+        let db_url = cli_database_url();
         let db = PgPoolOptions::new()
             .max_connections(1)
             .connect(&db_url)
@@ -1383,6 +1378,21 @@ async fn run_self_update(check_only: bool) -> anyhow::Result<()> {
     println!("Update applied (v{latest}). Restart the server to activate the new version.");
 
     Ok(())
+}
+
+/// The database URL for CLI subcommands that run before `Settings` is loaded
+/// (`migrate`, `admin`).
+///
+/// These used to resolve it independently and disagreed: `migrate` read
+/// `WAVVON_DATABASE_URL` while `admin` read only the unprefixed
+/// `DATABASE_URL`, so `admin users set-owner` — the ownership bootstrap —
+/// silently hit the built-in default on any hub configured the documented
+/// way. `WAVVON_DATABASE_URL` is the documented variable (the one `Settings`
+/// resolves for the server path); the unprefixed name stays as a fallback.
+fn cli_database_url() -> String {
+    std::env::var(wavvon_hub_env::DATABASE_URL)
+        .or_else(|_| std::env::var("DATABASE_URL"))
+        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/wavvon".to_string())
 }
 
 fn backup(out_path: &str) -> anyhow::Result<()> {
