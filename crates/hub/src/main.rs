@@ -1085,12 +1085,31 @@ async fn main() -> Result<()> {
 
     let hub_display_name = "Wavvon Hub";
 
+    // A relying party the browser will refuse must not take the hub down with
+    // it. This used to `.expect()`, and the first farm-hosted hub to boot found
+    // out why that was wrong: a farm reached at an IP derives an rp_id of
+    // `127.0.0.1`, WebAuthn requires an effective *domain*, and the whole
+    // process died at startup. Losing passkeys on a hub that could never have
+    // offered them is the correct outcome; refusing to start is not — and on a
+    // farm it takes out a community per misconfigured address.
     let webauthn = Arc::new(
         WebauthnBuilder::new(&rp_id, &rp_origin)
-            .expect("Invalid WebAuthn rp_id/origin combination")
-            .rp_name(hub_display_name)
-            .build()
-            .expect("Failed to build Webauthn instance"),
+            .and_then(|b| b.rp_name(hub_display_name).build())
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    rp_id,
+                    rp_origin = %rp_origin,
+                    error = %e,
+                    "WebAuthn is unavailable on this hub: passkey registration and \
+                     sign-in will fail. A relying-party id must be a domain — an IP \
+                     address or a bare host cannot be one. Set WAVVON_WEBAUTHN_RP_ID, \
+                     or reach this hub by hostname."
+                );
+                let fallback = Url::parse("http://localhost").expect("static URL");
+                WebauthnBuilder::new("localhost", &fallback)
+                    .and_then(|b| b.rp_name(hub_display_name).build())
+                    .expect("the localhost relying party is always valid")
+            }),
     );
 
     let device_token_ttl_secs = (settings.device_token_ttl_days as i64) * 86400;
@@ -1267,8 +1286,13 @@ async fn main() -> Result<()> {
             );
         }
         tokio::spawn(async move {
+            // The first tick fires immediately, on purpose. This used to be
+            // skipped, which meant a freshly spawned hub said nothing for a
+            // full minute — and the first heartbeat is what claims its serial,
+            // so for that minute the farm had a hub it could not route to and
+            // its monitor had no evidence it was alive. Announce on boot, then
+            // every 60s.
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            interval.tick().await; // skip the immediate first tick
             loop {
                 interval.tick().await;
                 let online = hb_state.online_users.read().await.len() as u64;

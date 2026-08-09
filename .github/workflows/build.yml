@@ -72,8 +72,17 @@ jobs:
       - name: Install PostgreSQL client tools
         run: sudo apt-get update && sudo apt-get install -y postgresql-client
 
+      # farm_hub_e2e drives the farm against a real wavvon-hub process — the
+      # only test that covers the path where three silent bugs lived (the
+      # unclaimed serial, the underivable public URL, the shared database).
+      # It needs the binary built, and WAVVON_REQUIRE_E2E turns its
+      # not-built skip into a failure so it cannot quietly stop running.
+      - name: Build binaries (needed by the farm end-to-end test)
+        run: cargo build --workspace
+
       - name: Cargo test
         env:
           TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432
           WAVVON_REQUIRE_PG_TOOLS: "1"
+          WAVVON_REQUIRE_E2E: "1"
         run: cargo test --workspace
