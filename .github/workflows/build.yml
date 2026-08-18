@@ -69,8 +69,13 @@ jobs:
       # skips itself when they are absent so a Windows dev box can still run
       # the suite. Install them here and require them (below), or that skip
       # quietly becomes permanent.
-      - name: Install PostgreSQL client tools
-        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: Install PostgreSQL client tools matching the server
+        env:
+          PG_IMAGE_TAG: ${{ matrix.postgres }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y "postgresql-client-${PG_IMAGE_TAG%%-*}"
+          pg_dump --version
 
       # farm_hub_e2e drives the farm against a real wavvon-hub process — the
       # only test that covers the path where three silent bugs lived (the
