@@ -78,7 +78,8 @@ jobs:
           echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main"             | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
           sudo apt-get update
           sudo apt-get install -y "postgresql-client-${PG_IMAGE_TAG%%-*}"
-          pg_dump --version
+          echo "/usr/lib/postgresql/${PG_IMAGE_TAG%%-*}/bin" >> "$GITHUB_PATH"
+          "/usr/lib/postgresql/${PG_IMAGE_TAG%%-*}/bin/pg_dump" --version
 
       # farm_hub_e2e drives the farm against a real wavvon-hub process — the
       # only test that covers the path where three silent bugs lived (the
