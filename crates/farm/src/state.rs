@@ -94,7 +94,7 @@ impl FarmState {
         if let Some(vp) = existing {
             return vp as u16;
         }
-        let vp = self.hub_manager.allocate_voice_port().await;
+        let vp = self.hub_manager.allocate_voice_port(&self.db).await;
         let _ = sqlx::query("UPDATE hubs SET voice_port = $1 WHERE id = $2")
             .bind(vp as i32)
             .bind(hub_id)

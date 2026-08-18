@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use rand::rngs::OsRng;
 use reqwest::Client;
 use serde_json::json;
@@ -85,7 +85,6 @@ async fn start_farm(
     // Reconstruct the URL of the database this test is using, so hubs are
     // provisioned inside it rather than wherever a database-less URL lands.
     let farm_db_url = {
-        use sqlx::ConnectOptions;
         let opts = db_pool.connect_options();
         format!(
             "{}/{}",

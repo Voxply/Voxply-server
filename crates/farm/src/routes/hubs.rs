@@ -423,8 +423,8 @@ pub async fn create_hub(
                 Json(serde_json::json!({"error": "agent_offline"})),
             ));
         };
-        let port = state.hub_manager.allocate_port().await;
-        let voice_port = state.hub_manager.allocate_voice_port().await;
+        let port = state.hub_manager.allocate_port(&state.db).await;
+        let voice_port = state.hub_manager.allocate_voice_port(&state.db).await;
         let cmd = serde_json::json!({
             "type": "spawn_hub",
             "hub_id": hub_id,

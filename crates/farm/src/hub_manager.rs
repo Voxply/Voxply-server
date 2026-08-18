@@ -3,13 +3,22 @@
 /// Owns the map of running hub child processes and exposes spawn/stop/restart
 /// operations. On farm startup `spawn_all_from_db` re-spawns every non-suspended,
 /// non-deleted hub found in the `hubs` table.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use sqlx::PgPool;
 use tokio::process::Child;
 use tokio::sync::RwLock;
+
+/// First number at or above `base` that nobody holds.
+fn first_gap(base: u16, occupied: &HashSet<u16>) -> u16 {
+    let mut port = base;
+    while occupied.contains(&port) {
+        port += 1;
+    }
+    port
+}
 
 struct HubProcess {
     port: u16,
@@ -96,29 +105,65 @@ impl HubManager {
         Ok(url)
     }
 
-    /// Allocate the next free HTTP port for a new hub process.
-    /// Scans occupied ports and returns `base_port + N` where N is the first gap.
-    pub async fn allocate_port(&self) -> u16 {
+    /// Every port already handed out: the children this process is running,
+    /// plus every port persisted on a hub row that still exists.
+    ///
+    /// The persisted half is the half that matters. `self.hubs` only ever
+    /// holds hubs this farm spawned successfully, so a hub whose spawn failed
+    /// and every agent-hosted hub — which runs on another node and never
+    /// enters the map at all — reserved nothing, and the next allocation
+    /// handed out the same number again. `process_port` is what the proxy
+    /// routes on, so two rows sharing one is two hubs at one address.
+    ///
+    /// Suspended hubs keep their ports: they are resumable, and resuming onto
+    /// a port someone else took is the same collision, later.
+    async fn occupied_ports(&self, db: &PgPool) -> (HashSet<u16>, HashSet<u16>) {
         let hubs = self.hubs.read().await;
-        let mut port = self.base_port;
-        let occupied: std::collections::HashSet<u16> = hubs.values().map(|h| h.port).collect();
-        while occupied.contains(&port) {
-            port += 1;
+        let mut http: HashSet<u16> = hubs.values().map(|h| h.port).collect();
+        let mut voice: HashSet<u16> = hubs.values().map(|h| h.voice_port).collect();
+        drop(hubs);
+
+        match sqlx::query_as::<_, (Option<i32>, Option<i32>)>(
+            "SELECT process_port, voice_port FROM hubs WHERE deleted_at IS NULL",
+        )
+        .fetch_all(db)
+        .await
+        {
+            Ok(rows) => {
+                for (port, voice_port) in rows {
+                    if let Some(p) = port {
+                        http.insert(p as u16);
+                    }
+                    if let Some(vp) = voice_port {
+                        voice.insert(vp as u16);
+                    }
+                }
+            }
+            // Falling back to the in-memory view silently is how this bug
+            // worked in the first place — say so, loudly.
+            Err(e) => tracing::error!(
+                error = %e,
+                "Could not read allocated ports; allocating from running hubs only,                  which may hand out a port another hub already holds"
+            ),
         }
-        port
+        (http, voice)
+    }
+
+    /// Allocate the next free HTTP port for a new hub process.
+    /// Returns `base_port + N` where N is the first gap.
+    // ponytail: read-then-write, so two concurrent creates can still pick the
+    // same port. A partial unique index on process_port would make that loud
+    // if hub creation ever runs concurrently enough to matter.
+    pub async fn allocate_port(&self, db: &PgPool) -> u16 {
+        let (occupied, _) = self.occupied_ports(db).await;
+        first_gap(self.base_port, &occupied)
     }
 
     /// Allocate the next free voice port for a new hub process. Same first-gap
     /// strategy as `allocate_port`, over the separate `voice_base_port` range.
-    pub async fn allocate_voice_port(&self) -> u16 {
-        let hubs = self.hubs.read().await;
-        let mut port = self.voice_base_port;
-        let occupied: std::collections::HashSet<u16> =
-            hubs.values().map(|h| h.voice_port).collect();
-        while occupied.contains(&port) {
-            port += 1;
-        }
-        port
+    pub async fn allocate_voice_port(&self, db: &PgPool) -> u16 {
+        let (_, occupied) = self.occupied_ports(db).await;
+        first_gap(self.voice_base_port, &occupied)
     }
 
     /// Spawn a hub child process.
@@ -270,7 +315,7 @@ impl HubManager {
             let voice_port = match voice_port {
                 Some(vp) => vp as u16,
                 None => {
-                    let vp = self.allocate_voice_port().await;
+                    let vp = self.allocate_voice_port(db).await;
                     let _ = sqlx::query("UPDATE hubs SET voice_port = $1 WHERE id = $2")
                         .bind(vp as i32)
                         .bind(&hub_id)
@@ -299,8 +344,8 @@ impl HubManager {
         db_url: &str,
         owner_pubkey: Option<&str>,
     ) -> Result<(u16, u16)> {
-        let port = self.allocate_port().await;
-        let voice_port = self.allocate_voice_port().await;
+        let port = self.allocate_port(db).await;
+        let voice_port = self.allocate_voice_port(db).await;
 
         // Persist ports before spawning so a restart can re-use them.
         sqlx::query("UPDATE hubs SET process_port = $1, voice_port = $2 WHERE id = $3")
