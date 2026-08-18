@@ -160,6 +160,19 @@ pub fn dump(db_url: &str, out: &Path, schema: &str) -> Result<()> {
 /// `--exit-on-error` is the point: without it `pg_restore` reports every
 /// failure and still exits 0, so a restore that dropped half the schema looks
 /// exactly like one that worked.
+///
+/// `--clean --if-exists` is what makes that survivable on a `public`-schema
+/// hub. pg_dump 14 and older write `CREATE SCHEMA public` into the archive,
+/// and every destination database already has `public` — so the first TOC
+/// entry failed and `--exit-on-error` turned that into a failed restore, on
+/// every PostgreSQL 14 client. 14 is the declared floor, so this was the
+/// low end of the supported range, not an exotic setup. pg_dump 15+ stopped
+/// emitting the line, which is why it only ever failed in CI.
+///
+/// The drops are guarded by `--if-exists`, so into the empty database a
+/// restore normally targets they are all no-ops. With `--force` into a
+/// populated one they now replace what the archive covers instead of merging
+/// rows into it — which is what "restore over this hub" should mean.
 pub fn restore(db_url: &str, archive: &Path) -> Result<()> {
     run(
         "pg_restore",
@@ -167,6 +180,8 @@ pub fn restore(db_url: &str, archive: &Path) -> Result<()> {
             "--no-owner",
             "--no-acl",
             "--exit-on-error",
+            "--clean",
+            "--if-exists",
             "--dbname",
             db_url,
             &archive.to_string_lossy(),

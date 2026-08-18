@@ -345,15 +345,10 @@ async fn key_offer_unknown_recipient_is_silently_dropped() {
     // The connection must remain alive — we can still receive voice_joined
     // (already consumed) so we just verify no error arrives within 1 s.
     let no_error = tokio::time::timeout(std::time::Duration::from_millis(500), async {
-        loop {
-            match rx_a.next().await {
-                Some(Ok(TsMessage::Text(raw))) => {
-                    let v: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
-                    if v.get("type").and_then(|t| t.as_str()) == Some("error") {
-                        panic!("unexpected error from hub: {v}");
-                    }
-                }
-                _ => break,
+        while let Some(Ok(TsMessage::Text(raw))) = rx_a.next().await {
+            let v: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+            if v.get("type").and_then(|t| t.as_str()) == Some("error") {
+                panic!("unexpected error from hub: {v}");
             }
         }
     })
