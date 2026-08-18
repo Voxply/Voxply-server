@@ -325,7 +325,7 @@ impl FromRequestParts<Arc<AppState>> for AuthUser {
         // -----------------------------------------------------------------
         let public_key = if token.contains('.') {
             // --- Farm token path (shared with the WebSocket handshake) ---
-            resolve_farm_token(&state, token).await?
+            resolve_farm_token(state, token).await?
         } else {
             // --- Legacy opaque hub-token path (unchanged) ---
             // Try sessions first.
