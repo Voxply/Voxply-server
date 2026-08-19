@@ -71,8 +71,14 @@ RUN cargo build --release -p wavvon-hub
 # ── runtime ───────────────────────────────────────────────────────────────────
 FROM debian:trixie-slim
 
+# postgresql-client: `wavvon-hub backup` / `restore` shell out to
+# pg_dump/pg_restore. Without them in the image the backup command an operator
+# is told to run before every upgrade fails on the box where they run it.
+# Trixie's client is PG 17, which dumps from every server back to our declared
+# floor of 14 (pg_dump is forward-compatible with older servers).
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
 # The hub writes hub.db and hub_identity.json into the working directory.

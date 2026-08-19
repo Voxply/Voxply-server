@@ -8,7 +8,6 @@ mod events;
 mod federation;
 mod invites;
 mod messages;
-mod migrate;
 mod moderation;
 mod polls;
 mod recovery;

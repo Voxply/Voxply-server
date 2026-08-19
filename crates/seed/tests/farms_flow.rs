@@ -47,6 +47,9 @@ fn unix_now() -> i64 {
 }
 
 /// Insert a farm row directly into the DB, bypassing the HTTP callback.
+/// One argument per column of the row under test — a struct here would only
+/// move the same list somewhere else.
+#[allow(clippy::too_many_arguments)]
 async fn insert_farm(
     state: &SeedState,
     farm_url: &str,

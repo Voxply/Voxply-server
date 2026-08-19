@@ -9,6 +9,10 @@ pub(super) struct ConnState {
     pub public_key: String,
     /// Whether this connection belongs to a bot.
     pub is_bot: bool,
+    /// Whether this connection is a mini-app-scoped session (bot-mini-apps.md
+    /// "Scoped session token") — bound to one channel, no voice access
+    /// (voice-transport-v2.md: same block the deleted `/voice/ws` enforced).
+    pub is_mini_app: bool,
     /// Unique id for this WS session (UUID v4). Stored here so handler
     /// functions (e.g. screen share start) can tag resources they create
     /// without an extra parameter, enabling session-scoped cleanup on
@@ -40,6 +44,7 @@ impl ConnState {
     pub fn new(
         public_key: String,
         is_bot: bool,
+        is_mini_app: bool,
         session_id: String,
         subscribed: HashSet<String>,
         my_conversations: HashSet<String>,
@@ -47,6 +52,7 @@ impl ConnState {
         Self {
             public_key,
             is_bot,
+            is_mini_app,
             session_id,
             voice_channel: None,
             pending_chunk: None,

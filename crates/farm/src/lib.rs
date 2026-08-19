@@ -1,10 +1,12 @@
 pub mod db;
 pub mod hub_manager;
 pub mod monitor;
+pub mod placement;
 pub mod proxy;
 pub mod routes;
 pub mod server;
 pub mod settings;
+pub mod slug;
 pub mod state;
 pub mod token;
 

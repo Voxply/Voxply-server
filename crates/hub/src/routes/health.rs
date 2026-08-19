@@ -121,11 +121,26 @@ pub async fn info(State(state): State<Arc<AppState>>) -> Json<InfoResponse> {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok());
 
+    let timezone: Option<String> = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM hub_settings WHERE key = 'hub_timezone'",
+    )
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten()
+    .filter(|s| !s.is_empty());
+
+    let birthdays_enabled = crate::routes::hub::birthdays_enabled(&state.db).await;
+
     Json(InfoResponse {
         name: branding.name,
         description: branding.description,
         icon: branding.icon,
         version: env!("CARGO_PKG_VERSION").to_string(),
+        capabilities: crate::capabilities::CAPABILITIES
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         public_key: state.hub_identity.public_key_hex(),
         min_security_level,
         min_pow_level,
@@ -145,7 +160,11 @@ pub async fn info(State(state): State<Arc<AppState>>) -> Json<InfoResponse> {
         lan_fingerprint: state.lan_fingerprint.clone(),
         welcome_label,
         welcome_invite_url,
-        voice_udp_addr: state.voice_udp_addr.clone(),
+        voice_wt_url: state.voice_wt_url.clone(),
+        voice_cert_hash: state.voice_cert_hash.read().await.clone(),
+        timezone,
+        birthdays_enabled,
+        canonical_url: state.canonical_url.read().await.clone(),
     })
 }
 
@@ -162,6 +181,12 @@ pub struct InfoResponse {
     #[serde(default)]
     pub icon: Option<String>,
     pub version: String,
+    /// What this hub can do. Clients branch on membership in this list, never
+    /// on `version` — see `capabilities.rs` and decisions.md. Absent on hubs
+    /// older than 2026-08-09, which `#[serde(default)]` renders as "knows
+    /// nothing", the correct reading.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
     pub public_key: String,
     pub min_security_level: u32,
     /// Minimum PoW level required to authenticate via the structured
@@ -227,10 +252,42 @@ pub struct InfoResponse {
     /// Always `https://` or `wavvon://` when present. Absent when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub welcome_invite_url: Option<String>,
-    /// Publicly-reachable `host:port` for this hub's voice UDP relay.
-    /// Absent when the hub has no known public host (no `WAVVON_PUBLIC_URL`
-    /// and not in LAN mode). Clients dial UDP voice directly at this
-    /// address after fetching `/info` — see "UDP voice" in farm-impl.md.
+    /// Absolute `https://host:port/voice` URL for this hub's WebTransport
+    /// voice endpoint (voice-transport-v2.md). Absent when the hub has no
+    /// known public host (no `WAVVON_PUBLIC_URL` and not in LAN mode).
+    /// Clients dial voice directly at this URL — `voice_joined` carries the
+    /// same value so most clients never need this field, but a farm-routed
+    /// client (or any client) can fetch it here too.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub voice_udp_addr: Option<String>,
+    pub voice_wt_url: Option<String>,
+    /// Hex SHA-256 digest of the WT endpoint's current self-signed
+    /// certificate, for `WebTransportOptions.serverCertificateHashes`.
+    /// `None` when a CA-issued cert is in use.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice_cert_hash: Option<String>,
+    /// Operator-configured IANA timezone name (e.g. "Europe/Rome"). Absent
+    /// when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    /// Whether member birthdays are shown/settable on this hub. Defaults to
+    /// true when never configured.
+    #[serde(default = "default_true")]
+    pub birthdays_enabled: bool,
+    /// The address this hub says clients should use for it.
+    ///
+    /// Behind a farm this is the hub's canonical slug URL and it **changes**
+    /// when the owner renames the hub — clients re-read it on connect and on
+    /// `hub_updated` and update their stored address, so a rename reaches
+    /// everyone without breaking a single session. Absent when the hub has no
+    /// public address at all.
+    ///
+    /// This never replaces `public_key` as the hub's identity: a client keeps
+    /// indexing by key and follows this only for *where* to reach it. That is
+    /// what stops a changed address from silently becoming a different hub.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_url: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
 }

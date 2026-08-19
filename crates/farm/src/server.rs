@@ -25,6 +25,12 @@ pub fn create_router(state: Arc<FarmState>) -> Router {
             "/farm/hubs",
             get(routes::hubs::list_hubs).post(routes::hubs::create_hub),
         )
+        // Registered before /farm/hubs/{hub_id} for readability only — the
+        // two differ in segment count, so they cannot collide.
+        .route(
+            "/farm/hubs/by-pubkey/{pubkey}",
+            get(routes::slugs::hub_address_by_pubkey),
+        )
         .route("/farm/hubs/{hub_id}", get(routes::hubs::get_hub))
         .route(
             "/farm/hubs/{hub_id}/suspend",
@@ -35,12 +41,31 @@ pub fn create_router(state: Arc<FarmState>) -> Router {
             post(routes::hubs::force_restart_hub),
         )
         .route("/farm/hubs/{hub_id}", delete(routes::hubs::delete_hub))
+        // Hub addresses (slug.rs): owner-chosen aliases. Registered before
+        // the agent routes for no reason other than grouping with the hub
+        // routes they belong to.
+        .route(
+            "/farm/hubs/{hub_id}/slugs",
+            get(routes::slugs::list_slugs).post(routes::slugs::claim_slug),
+        )
+        .route(
+            "/farm/hubs/{hub_id}/slugs/{slug}",
+            delete(routes::slugs::release_slug),
+        )
+        .route(
+            "/farm/hubs/{hub_id}/slugs/{slug}/canonical",
+            axum::routing::put(routes::slugs::promote_slug),
+        )
         // Server agent management routes.
         .route(
             "/farm/admin/server-token",
             post(routes::servers::generate_server_token),
         )
         .route("/farm/admin/servers", get(routes::servers::list_servers))
+        .route(
+            "/farm/admin/servers/{server_id}",
+            patch(routes::servers::update_server),
+        )
         .route("/ws/agent", get(routes::servers::ws_agent_handler))
         // TOTP 2FA routes for admin account.
         .route(

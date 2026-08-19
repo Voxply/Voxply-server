@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use uuid::Uuid;
@@ -481,6 +481,7 @@ pub async fn list_dm_messages(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
     Path(conversation_id): Path<String>,
+    Query(params): Query<crate::routes::chat_models::PaginationParams>,
 ) -> Result<Json<Vec<DmMessageResponse>>, (StatusCode, String)> {
     let is_member: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM conversation_members WHERE conversation_id = $1 AND public_key = $2",
@@ -498,7 +499,16 @@ pub async fn list_dm_messages(
         ));
     }
 
-    let rows = sqlx::query_as::<_, DmMessageRow>(
+    // Same `before` + `limit` keyset the channel message list uses. Both
+    // clients have been sending these two params all along; until 2026-08-08
+    // this handler took no query params at all and returned the entire
+    // conversation history on every open.
+    let limit = params.limit.unwrap_or(50).clamp(1, 100);
+
+    // Newest `limit` rows (optionally older than the cursor), then flipped
+    // back to ascending — the clients render oldest-first and prepend when
+    // paging backwards.
+    let mut rows = sqlx::query_as::<_, DmMessageRow>(
         "SELECT m.id, m.conversation_id, m.sender, u.display_name as sender_name,
                 m.content, m.attachments, m.created_at,
                 COALESCE(m.is_encrypted, FALSE) AS is_encrypted,
@@ -511,12 +521,18 @@ pub async fn list_dm_messages(
          FROM dm_messages m
          LEFT JOIN users u ON u.public_key = m.sender
          WHERE m.conversation_id = $1
-         ORDER BY m.created_at ASC",
+           AND ($2::text IS NULL OR (m.created_at, m.id) <
+                ((SELECT created_at FROM dm_messages WHERE id = $2), $2))
+         ORDER BY m.created_at DESC, m.id DESC
+         LIMIT $3",
     )
     .bind(&conversation_id)
+    .bind(params.before.as_deref())
+    .bind(limit)
     .fetch_all(&state.db)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+    rows.reverse();
 
     let mut responses = Vec::with_capacity(rows.len());
     for r in rows {

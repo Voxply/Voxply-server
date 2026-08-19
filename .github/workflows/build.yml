@@ -12,11 +12,16 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-22.04]
+        # Both ends of the supported range. 14 is the declared minimum
+        # (hosting.md); testing only the newest would make "we support 14" a
+        # claim nobody checks — which is how the PG floor went undeclared and
+        # unenforced until 2026-08-08.
+        postgres: ["16-alpine", "14-alpine"]
     runs-on: ${{ matrix.os }}
 
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:${{ matrix.postgres }}
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -30,15 +35,15 @@ jobs:
           --health-retries 5
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
 
       - name: Fetch API spec (Wavvon docs repo)
         if: github.event_name == 'pull_request' && github.base_ref == 'main'
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Wavvon/Wavvon-docs
           sparse-checkout: |
@@ -51,6 +56,22 @@ jobs:
         if: github.event_name == 'pull_request' && github.base_ref == 'main'
         run: node _docs/scripts/check-openapi-coverage.mjs "$GITHUB_WORKSPACE"
 
+      # `wavvon-hub backup` shells out to pg_dump/pg_restore, and backup_flow
+      # skips itself when they are absent so a Windows dev box can still run
+      # the suite. Install them here and require them (below), or that skip
+      # quietly becomes permanent.
+      - name: Install PostgreSQL client tools matching the server
+        env:
+          PG_IMAGE_TAG: ${{ matrix.postgres }}
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc             | sudo tee /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc >/dev/null
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main"             | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y "postgresql-client-${PG_IMAGE_TAG%%-*}"
+          echo "/usr/lib/postgresql/${PG_IMAGE_TAG%%-*}/bin" >> "$GITHUB_PATH"
+          "/usr/lib/postgresql/${PG_IMAGE_TAG%%-*}/bin/pg_dump" --version
+
       - name: Cargo fmt check
         run: cargo fmt --all -- --check
 
@@ -60,7 +81,39 @@ jobs:
       - name: Cargo check
         run: cargo check --workspace
 
+      # farm_hub_e2e drives the farm against a real wavvon-hub process — the
+      # only test that covers the path where three silent bugs lived (the
+      # unclaimed serial, the underivable public URL, the shared database).
+      # It needs the binary built, and WAVVON_REQUIRE_E2E turns its
+      # not-built skip into a failure so it cannot quietly stop running.
+      - name: Build binaries (needed by the farm end-to-end test)
+        run: cargo build --workspace
+
       - name: Cargo test
         env:
           TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432
-        run: cargo test --workspace
+          WAVVON_REQUIRE_PG_TOOLS: "1"
+          WAVVON_REQUIRE_E2E: "1"
+        # `--nocapture` is load-bearing, not verbosity: cargo swallows the
+        # output of tests that pass, so a skip notice printed by a passing test
+        # never reaches this log and the guard below would grep a file that
+        # could not contain what it looks for. Found by testing the guard.
+        run: |
+          set -o pipefail
+          cargo test --workspace -- --nocapture 2>&1 | tee cargo-test.log
+
+      # A test that skips itself is a test that can stop running with nobody
+      # noticing, and it reports as green while it does. The per-test
+      # WAVVON_REQUIRE_* guards catch the ones we remembered to guard; this
+      # catches the ones we did not, and needs no discipline from whoever
+      # writes the next skippable test.
+      #
+      # Every skip prints `WAVVON-TEST-SKIPPED:` — one token, deliberately
+      # unlike anything else in the output, so this cannot false-positive on a
+      # log line that merely says "skip".
+      - name: No test may skip itself in CI
+        run: |
+          if grep -n "WAVVON-TEST-SKIPPED:" cargo-test.log; then
+            echo "::error::A test skipped itself. Either make its prerequisite available in CI, or delete the test — a green run that did not execute it is worse than no test."
+            exit 1
+          fi

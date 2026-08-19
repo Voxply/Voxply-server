@@ -42,21 +42,6 @@ pub struct KickRequest {
 }
 
 #[derive(Deserialize)]
-pub struct ChannelBanRequest {
-    pub target_public_key: String,
-    pub reason: Option<String>,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct ChannelBanResponse {
-    pub channel_id: String,
-    pub target_public_key: String,
-    pub banned_by: String,
-    pub reason: Option<String>,
-    pub created_at: i64,
-}
-
-#[derive(Deserialize)]
 pub struct VoiceMuteRequest {
     pub target_public_key: String,
     pub reason: Option<String>,
@@ -81,11 +66,18 @@ pub struct TalkPowerResponse {
     pub min_talk_power: i64,
 }
 
-// --- Channel-scoped ban (pubkey field, routes under /channels/:id/bans) ---
+// --- Channel-scoped ban (routes under /channels/:id/bans) ---
+//
+// The only channel-ban API. A second set of routes under
+// /moderation/channels/:id/bans used to write the same `channel_bans` table
+// with a different field name, a weaker permission gate (MUTE_MEMBERS) and no
+// `reason` on write — so whichever client banned last decided whether the
+// reason survived. Unified here (2026-08-08).
 
 #[derive(Deserialize)]
 pub struct ChannelBanByPubkeyRequest {
     pub pubkey: String,
+    pub reason: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -93,7 +85,8 @@ pub struct ChannelBanByPubkeyResponse {
     pub channel_id: String,
     pub pubkey: String,
     pub banned_by: String,
-    pub banned_at: String,
+    pub reason: Option<String>,
+    pub banned_at: i64,
 }
 
 // --- Per-channel voice mute ---

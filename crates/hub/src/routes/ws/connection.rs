@@ -164,6 +164,7 @@ pub(super) async fn handle_socket(
     let mut cs = ConnState::new(
         public_key.clone(),
         is_bot,
+        is_mini_app,
         session_id.clone(),
         subscribed,
         my_conversations,
@@ -222,6 +223,7 @@ pub(super) async fn handle_socket(
                         if matches!(
                             event,
                             crate::routes::chat_models::ChatEvent::ChannelsUpdated
+                                | crate::routes::chat_models::ChatEvent::HubUpdated
                                 | crate::routes::chat_models::ChatEvent::MemberOnline { .. }
                                 | crate::routes::chat_models::ChatEvent::MemberOffline { .. }
                                 | crate::routes::chat_models::ChatEvent::MemberUpdated { .. }
@@ -374,7 +376,20 @@ pub(super) async fn handle_socket(
 
             // ── Voice channel events ──────────────────────────────────────
             voice_result = voice_rx.recv() => {
-                if let Ok((channel_id, msg)) = voice_result {
+                match voice_result {
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // Dropped voice events are permanent UI damage (a
+                        // missed Joined leaves a participant invisible until
+                        // the next roster broadcast) — tell the client to
+                        // resync, same as the chat arm.
+                        tracing::warn!("WebSocket client lagged on voice events, missed {n}");
+                        let lag_msg = crate::routes::chat_models::WsServerMessage::Lagged { count: n };
+                        if let Ok(json) = serde_json::to_string(&lag_msg) {
+                            let _ = ws_tx.send(Message::Text(json.into())).await;
+                        }
+                    }
+                    Err(_) => break,
+                    Ok((channel_id, msg)) => {
                     let is_self = match &msg {
                         WsServerMessage::VoiceParticipantSpeaking {
                             public_key: pk, ..
@@ -408,16 +423,35 @@ pub(super) async fn handle_socket(
                             break;
                         }
                     }
+                    }
                 }
             }
 
             // ── DM events ────────────────────────────────────────────────
             dm_result = dm_rx.recv() => {
                 if let Ok(dm) = dm_result {
+                    // `my_conversations` is loaded once at connect, so keep it
+                    // live from membership events: without this, a conversation
+                    // created after this connection opened would be dead air
+                    // (every event for it dropped by the gate below) until the
+                    // client reconnects. Removal happens after delivery so the
+                    // removed member still receives their final MemberChanged.
+                    let mut removed_from = None;
+                    if let crate::state::DmEvent::MemberChanged { conversation_id, added, removed, .. } = &dm {
+                        if added.iter().any(|k| k == &cs.public_key) {
+                            cs.my_conversations.insert(conversation_id.clone());
+                        }
+                        if removed.iter().any(|k| k == &cs.public_key) {
+                            removed_from = Some(conversation_id.clone());
+                        }
+                    }
                     if (dm.suppress_echo() && dm.sender() == cs.public_key)
                         || !cs.my_conversations.contains(dm.conversation_id())
                     {
                         continue;
+                    }
+                    if let Some(conv_id) = removed_from {
+                        cs.my_conversations.remove(&conv_id);
                     }
                     let reply = match dm {
                         crate::state::DmEvent::Message {
@@ -713,6 +747,9 @@ async fn dispatch_client_msg(
             voice::handle_voice_whisper_start(cs, state, msg).await
         }
         WsClientMessage::VoiceWhisperStop => voice::handle_voice_whisper_stop(cs, state).await,
+        WsClientMessage::VoiceWhisperOptout { .. } => {
+            voice::handle_voice_whisper_optout(cs, state, msg).await
+        }
         WsClientMessage::VoiceMove { .. } => voice::handle_voice_move(cs, state, ws_tx, msg).await,
 
         // ── Proximity voice ────────────────────────────────────────────────
@@ -805,11 +842,13 @@ pub async fn leave_voice_for_test(state: &AppState, public_key: &str, channel_id
 }
 
 pub async fn leave_voice(state: &AppState, public_key: &str, channel_id: &str) {
-    let (removed_addr, became_empty) = {
+    state.voice_last_active.write().await.remove(public_key);
+    let (removed_session, became_empty) = {
         let mut channels = state.voice_channels.write().await;
-        let addr = channels
+        let session = channels
             .get_mut(channel_id)
-            .and_then(|participants| participants.remove(public_key));
+            .and_then(|participants| participants.remove(public_key))
+            .flatten();
         let mut became_empty = false;
         if let Some(participants) = channels.get(channel_id) {
             if participants.is_empty() {
@@ -817,7 +856,7 @@ pub async fn leave_voice(state: &AppState, public_key: &str, channel_id: &str) {
                 channels.remove(channel_id);
             }
         }
-        (addr, became_empty)
+        (session, became_empty)
     };
 
     if became_empty {
@@ -834,23 +873,17 @@ pub async fn leave_voice(state: &AppState, public_key: &str, channel_id: &str) {
         .execute(&state.db)
         .await;
     }
-    // Remove from voice_addr_map if this was a real bound address (not the sentinel 0.0.0.0:0).
-    if let Some(addr) = removed_addr {
-        let sentinel: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
-        if addr != sentinel {
-            state.voice_addr_map.write().await.remove(&addr);
-        }
+    // WS leave_voice is authoritative for roster (voice-transport-v2.md):
+    // proactively close any still-live WT session rather than leaving it to
+    // idle out on its own now that it has no roster entry.
+    if let Some(session) = removed_session {
+        session.close(wtransport::VarInt::from_u32(0), b"voice_leave");
     }
 
     // Remove any un-consumed pending bind for this pubkey.
     {
         let mut binds = state.voice_pending_binds.write().await;
         binds.retain(|_, v| v.pubkey != public_key);
-    }
-    // Remove any consumed-token record whose bound address maps to this pubkey.
-    {
-        let mut consumed = state.voice_consumed_tokens.write().await;
-        consumed.retain(|_, v| v.pubkey != public_key);
     }
 
     // An invisible participant was never announced as joined, so don't
@@ -927,23 +960,34 @@ pub async fn leave_voice(state: &AppState, public_key: &str, channel_id: &str) {
         }
     }
 
-    // Clean up the departing user's whisper session.
-    state.whisper_targets.write().await.remove(public_key);
+    // Clean up the departing user's whisper session (whisper.md: a session
+    // is torn down when the whisperer leaves voice). If they were an active
+    // whisperer, notify the previously-resolved recipients so their
+    // indicators clear -- the hub-routed audio is about to stop too since
+    // this pubkey no longer has a voice_channels entry.
     state.whisper_target_defs.write().await.remove(public_key);
-    state
+    let prev_whisper_pks = state
         .whisper_target_pubkeys
         .write()
         .await
         .remove(public_key);
+    if let Some(prev_whisper_pks) = prev_whisper_pks {
+        super::voice::send_whisper_notification(
+            state,
+            public_key,
+            channel_id,
+            false,
+            prev_whisper_pks.into_iter().collect(),
+        );
+    }
 
-    // Revoke the UDP relay slot.
+    // Revoke the voice relay slot.
     state.voice_relay_active.write().await.remove(public_key);
 
     // events.md §7.4: a voice-only presence grant for this exact
     // (pubkey, channel) pair evaporates on leave -- never persisted, never
-    // outlives the voice session. Both transports (main hub WS VoiceLeave
-    // and the /voice/ws relay's disconnect cleanup) funnel through this
-    // shared teardown.
+    // outlives the voice session. Both WS disconnect and explicit
+    // VoiceLeave funnel through this shared teardown.
     {
         let mut grants = state.staging_voice_grants.write().await;
         if let Some(set) = grants.get_mut(public_key) {
@@ -963,4 +1007,10 @@ pub async fn leave_voice(state: &AppState, public_key: &str, channel_id: &str) {
             participants: roster,
         },
     ));
+
+    // The departing user may be a RECIPIENT in other users' whisper
+    // sessions; re-resolve here (not just in the explicit voice-leave
+    // handler) so raw WS-disconnect teardown drops them from every
+    // resolved target set too.
+    super::voice::re_resolve_whisper_sessions(state).await;
 }

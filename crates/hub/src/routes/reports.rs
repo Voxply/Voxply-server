@@ -24,6 +24,11 @@ pub struct ReportAction {
 #[derive(Deserialize)]
 pub struct ReportsQuery {
     pub status: Option<String>,
+    /// Page size, clamped to `1..=200`.
+    pub limit: Option<i64>,
+    /// Keyset cursor: the `id` of the last row of the previous page. Rows come
+    /// back newest-first, so this resumes strictly older than that report.
+    pub cursor: Option<String>,
 }
 
 pub async fn report_message(
@@ -65,15 +70,21 @@ pub async fn list_reports(
     perms.require(ADMIN)?;
 
     let status = q.status.unwrap_or_else(|| "pending".into());
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
     let rows = sqlx::query(
         "SELECT r.id, r.message_id, m.content as message_content, m.channel_id,
                 r.reporter_pubkey, r.reason, r.reported_at, r.status
          FROM message_reports r
          JOIN messages m ON m.id = r.message_id
          WHERE r.status = $1
-         ORDER BY r.reported_at DESC LIMIT 50",
+           AND ($2::text IS NULL OR (r.reported_at, r.id) <
+                ((SELECT reported_at FROM message_reports WHERE id = $2), $2))
+         ORDER BY r.reported_at DESC, r.id DESC
+         LIMIT $3",
     )
     .bind(&status)
+    .bind(q.cursor.as_deref())
+    .bind(limit)
     .fetch_all(&state.db)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;

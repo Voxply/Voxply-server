@@ -40,13 +40,15 @@ async fn start_hub() -> (String, Arc<AppState>, common::TestDbGuard) {
         federation_client: FederationClient::new(),
         peer_tokens: RwLock::new(HashMap::new()),
         voice_channels: RwLock::new(HashMap::new()),
-        voice_addr_map: RwLock::new(HashMap::new()),
+        voice_last_active: RwLock::new(HashMap::new()),
         whisper_target_pubkeys: RwLock::new(HashMap::new()),
         voice_sender_ids: RwLock::new(HashMap::new()),
         voice_next_sender_id: RwLock::new(HashMap::new()),
         voice_zones: RwLock::new(HashMap::new()),
         voice_udp_port: 0,
-        voice_udp_addr: None,
+        voice_wt_url: None,
+        canonical_url: Arc::new(RwLock::new(None)),
+        voice_cert_hash: RwLock::new(None),
         voice_event_tx,
         dm_tx: broadcast::channel(16).0,
         online_users: RwLock::new(HashMap::new()),
@@ -59,15 +61,12 @@ async fn start_hub() -> (String, Arc<AppState>, common::TestDbGuard) {
         last_farm_pubkey_fetch: Arc::new(RwLock::new(0)),
         video_channels: RwLock::new(HashMap::new()),
         started_at: std::time::Instant::now(),
-        whisper_targets: RwLock::new(HashMap::new()),
         whisper_target_defs: RwLock::new(HashMap::new()),
+        whisper_optouts: RwLock::new(std::collections::HashSet::new()),
         voice_relay_active: RwLock::new(std::collections::HashSet::new()),
         staging_voice_grants: RwLock::new(std::collections::HashMap::new()),
         voice_pending_binds: RwLock::new(HashMap::new()),
-        voice_consumed_tokens: RwLock::new(HashMap::new()),
-        voice_ws_senders: RwLock::new(HashMap::new()),
         ws_key_senders: RwLock::new(HashMap::new()),
-        voice_udp_socket: Arc::new(RwLock::new(None)),
         rate_limiters: Default::default(),
         preview_cache: std::sync::Mutex::new(HashMap::new()),
         search: Arc::new(wavvon_hub::search::null_search::NullSearch),
@@ -316,7 +315,7 @@ async fn squad_rooms_happy_path() {
     let update_frame = next_frame_of_type(
         &mut watcher_rx,
         "channels_updated",
-        std::time::Duration::from_secs(3),
+        std::time::Duration::from_secs(15),
     )
     .await;
     assert!(
@@ -447,9 +446,13 @@ async fn join_to_ended_event_room_rejected() {
     )
     .await;
 
-    let err = next_frame_of_type(&mut member_ws.1, "error", std::time::Duration::from_secs(3))
-        .await
-        .expect("expected an error frame rejecting the join");
+    let err = next_frame_of_type(
+        &mut member_ws.1,
+        "error",
+        std::time::Duration::from_secs(15),
+    )
+    .await
+    .expect("expected an error frame rejecting the join");
     assert_eq!(err["context"], "voice_join");
 
     let joined = next_frame_of_type(

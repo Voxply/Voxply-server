@@ -707,13 +707,15 @@ async fn spawn_real_hub() -> (String, Arc<AppState>, common::TestDbGuard) {
         federation_client: FederationClient::new(),
         peer_tokens: RwLock::new(HashMap::new()),
         voice_channels: RwLock::new(HashMap::new()),
-        voice_addr_map: RwLock::new(HashMap::new()),
+        voice_last_active: RwLock::new(HashMap::new()),
         whisper_target_pubkeys: RwLock::new(HashMap::new()),
         voice_sender_ids: RwLock::new(HashMap::new()),
         voice_next_sender_id: RwLock::new(HashMap::new()),
         voice_zones: RwLock::new(HashMap::new()),
         voice_udp_port: 0,
-        voice_udp_addr: None,
+        voice_wt_url: None,
+        canonical_url: Arc::new(RwLock::new(None)),
+        voice_cert_hash: RwLock::new(None),
         voice_event_tx: broadcast::channel(16).0,
         dm_tx: broadcast::channel(16).0,
         online_users: RwLock::new(std::collections::HashMap::new()),
@@ -726,15 +728,12 @@ async fn spawn_real_hub() -> (String, Arc<AppState>, common::TestDbGuard) {
         last_farm_pubkey_fetch: std::sync::Arc::new(tokio::sync::RwLock::new(0)),
         video_channels: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         started_at: std::time::Instant::now(),
-        whisper_targets: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         whisper_target_defs: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+        whisper_optouts: tokio::sync::RwLock::new(std::collections::HashSet::new()),
         voice_relay_active: tokio::sync::RwLock::new(std::collections::HashSet::new()),
         staging_voice_grants: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         voice_pending_binds: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-        voice_consumed_tokens: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-        voice_ws_senders: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         ws_key_senders: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-        voice_udp_socket: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
         rate_limiters: Default::default(),
         preview_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         search: std::sync::Arc::new(wavvon_hub::search::null_search::NullSearch),
@@ -805,4 +804,120 @@ async fn http_authenticate(hub_url: &str, identity: &Identity) -> String {
         .await
         .unwrap();
     verify.token
+}
+
+// ---------------------------------------------------------------------------
+// soft-flag: admitted, but with a record a moderator can actually see
+// ---------------------------------------------------------------------------
+
+/// `soft-flag` has been selectable since federated ban lists shipped, and the
+/// admission check correctly ignores it — but nothing could answer "does this
+/// member have history?", and the entries list did not say which policy an
+/// entry came from. Choosing it was therefore indistinguishable from not
+/// subscribing to that source at all.
+#[tokio::test]
+async fn a_soft_flagged_member_is_admitted_and_their_history_is_readable() {
+    let (hub_url, state, _guard) = spawn_real_hub().await;
+
+    let owner = Identity::generate();
+    let owner_token = http_authenticate(&hub_url, &owner).await;
+
+    let flagged = Identity::generate();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    sqlx::query(
+        "INSERT INTO federated_ban_sources (url, policy, added_at, issuer_pubkey)
+         VALUES ('https://peer.example.com', 'soft-flag', $1, 'peer-hub-pk')",
+    )
+    .bind(now)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO federated_bans (source_hub_pubkey, target_master_pubkey, reason, added_at, synced_at)
+         VALUES ('peer-hub-pk', $1, 'raiding', $2, $2)",
+    )
+    .bind(flagged.public_key_hex())
+    .bind(now)
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    // Admitted: soft-flag records, it does not block.
+    let token = http_authenticate(&hub_url, &flagged).await;
+    assert!(
+        !token.is_empty(),
+        "a soft-flag entry must not deny admission"
+    );
+
+    let history: serde_json::Value = reqwest::Client::new()
+        .get(format!(
+            "{hub_url}/moderation/history/{}",
+            flagged.public_key_hex()
+        ))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let entries = history["entries"].as_array().expect("entries array");
+    assert_eq!(entries.len(), 1, "the moderator must be able to see it");
+    assert_eq!(entries[0]["policy"], "soft-flag");
+    assert_eq!(entries[0]["source_hub_pubkey"], "peer-hub-pk");
+    assert_eq!(
+        entries[0]["reason"], "raiding",
+        "the reason is the whole point — a bare flag tells a moderator nothing"
+    );
+}
+
+/// A member nobody has said anything about reads as a clean record, not an
+/// error — the endpoint is asked about ordinary people constantly.
+#[tokio::test]
+async fn a_member_with_no_history_returns_an_empty_list() {
+    let (hub_url, _state, _guard) = spawn_real_hub().await;
+    let owner = Identity::generate();
+    let owner_token = http_authenticate(&hub_url, &owner).await;
+
+    let stranger = Identity::generate();
+    let res = reqwest::Client::new()
+        .get(format!(
+            "{hub_url}/moderation/history/{}",
+            stranger.public_key_hex()
+        ))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["entries"].as_array().unwrap().len(), 0);
+}
+
+/// Another hub's ban is another hub's decision; who may read it is this hub's.
+#[tokio::test]
+async fn reading_a_members_history_needs_ban_permission() {
+    let (hub_url, _state, _guard) = spawn_real_hub().await;
+    let _owner = http_authenticate(&hub_url, &Identity::generate()).await;
+
+    let plain = Identity::generate();
+    let plain_token = http_authenticate(&hub_url, &plain).await;
+
+    let res = reqwest::Client::new()
+        .get(format!(
+            "{hub_url}/moderation/history/{}",
+            plain.public_key_hex()
+        ))
+        .bearer_auth(&plain_token)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 403);
 }

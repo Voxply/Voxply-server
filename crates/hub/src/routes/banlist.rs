@@ -205,6 +205,15 @@ pub struct EntryFilter {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FederatedBanEntryResponse {
     pub source_hub_pubkey: String,
+    /// Which policy this entry came from. Without it a moderator cannot tell
+    /// an entry that blocks admission from one that only records history —
+    /// the two look identical in this list and mean opposite things.
+    ///
+    /// `"unknown"` when the source that produced it is no longer subscribed.
+    /// Such an entry is inert — admission only counts `hard-reject` sources —
+    /// and it is listed rather than hidden: dropping rows would make this list
+    /// quietly disagree with the table it claims to show.
+    pub policy: String,
     pub target_master_pubkey: String,
     pub reason: Option<String>,
     pub added_at: i64,
@@ -214,6 +223,7 @@ pub struct FederatedBanEntryResponse {
 #[derive(sqlx::FromRow)]
 struct FederatedBanRow {
     source_hub_pubkey: String,
+    policy: String,
     target_master_pubkey: String,
     reason: Option<String>,
     added_at: i64,
@@ -231,18 +241,23 @@ pub async fn list_entries(
 
     let rows = if let Some(src) = filter.source.as_deref() {
         sqlx::query_as::<_, FederatedBanRow>(
-            "SELECT source_hub_pubkey, target_master_pubkey, reason, added_at, synced_at
-             FROM federated_bans WHERE source_hub_pubkey = $1
-             ORDER BY synced_at DESC LIMIT 1000",
+            "SELECT fb.source_hub_pubkey, COALESCE(fbs.policy, 'unknown') AS policy, fb.target_master_pubkey, fb.reason,
+                    fb.added_at, fb.synced_at
+             FROM federated_bans fb
+             LEFT JOIN federated_ban_sources fbs ON fbs.issuer_pubkey = fb.source_hub_pubkey
+             WHERE fb.source_hub_pubkey = $1
+             ORDER BY fb.synced_at DESC LIMIT 1000",
         )
         .bind(src)
         .fetch_all(&state.db)
         .await
     } else {
         sqlx::query_as::<_, FederatedBanRow>(
-            "SELECT source_hub_pubkey, target_master_pubkey, reason, added_at, synced_at
-             FROM federated_bans
-             ORDER BY synced_at DESC LIMIT 1000",
+            "SELECT fb.source_hub_pubkey, COALESCE(fbs.policy, 'unknown') AS policy, fb.target_master_pubkey, fb.reason,
+                    fb.added_at, fb.synced_at
+             FROM federated_bans fb
+             LEFT JOIN federated_ban_sources fbs ON fbs.issuer_pubkey = fb.source_hub_pubkey
+             ORDER BY fb.synced_at DESC LIMIT 1000",
         )
         .fetch_all(&state.db)
         .await
@@ -253,6 +268,7 @@ pub async fn list_entries(
         rows.into_iter()
             .map(|r| FederatedBanEntryResponse {
                 source_hub_pubkey: r.source_hub_pubkey,
+                policy: r.policy,
                 target_master_pubkey: r.target_master_pubkey,
                 reason: r.reason,
                 added_at: r.added_at,
@@ -469,4 +485,87 @@ fn validate_policy(policy: &str) -> Result<(), (StatusCode, String)> {
             "policy must be 'hard-reject' or 'soft-flag'".to_string(),
         ))
     }
+}
+
+// ---------------------------------------------------------------------------
+// GET /moderation/history/{pubkey}
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct HistoryEntry {
+    pub source_hub_pubkey: String,
+    /// `hard-reject` (this entry would refuse admission) or `soft-flag` (it
+    /// would not — it is here to be read).
+    pub policy: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub added_at: i64,
+}
+
+#[derive(Serialize)]
+pub struct HistoryResponse {
+    pub entries: Vec<HistoryEntry>,
+}
+
+/// What other hubs have said about this member.
+///
+/// `soft-flag` is the policy that lets someone in and records that a hub we
+/// subscribe to had banned them. It has been selectable in the admin UI since
+/// federated ban lists shipped, and the admission check correctly ignores it —
+/// but there was no way to ask "does this person have history?", and the raw
+/// entries list did not say which policy an entry came from, so a moderator
+/// could not tell an advisory entry from a blocking one. Choosing `soft-flag`
+/// was therefore indistinguishable from not subscribing at all.
+///
+/// Deliberately not a judgement. Another hub's ban is another hub's decision,
+/// made for reasons this one cannot see; the moderator gets the source, the
+/// reason and the date, and makes their own.
+///
+/// Resolved against the member's master pubkey where they have one, matching
+/// admission — otherwise a paired device would show a clean record.
+pub async fn user_history(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(pubkey): Path<String>,
+) -> Result<Json<HistoryResponse>, (StatusCode, String)> {
+    let perms = permissions::user_permissions(&state.db, &user.public_key).await?;
+    perms.require(permissions::BAN_MEMBERS)?;
+
+    let master: Option<String> =
+        sqlx::query_scalar("SELECT master_pubkey FROM users WHERE public_key = $1")
+            .bind(&pubkey)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?
+            .flatten();
+    let target = master.unwrap_or_else(|| pubkey.clone());
+
+    let rows: Vec<(String, String, Option<String>, i64)> = sqlx::query_as(
+        // Joined on issuer_pubkey, matching `is_denied_by_federated_policy` —
+        // a source is identified by the hub that signed it, not by the URL it
+        // was fetched from, which can change.
+        "SELECT fb.source_hub_pubkey, fbs.policy, fb.reason, fb.added_at
+         FROM federated_bans fb
+         JOIN federated_ban_sources fbs ON fbs.issuer_pubkey = fb.source_hub_pubkey
+         WHERE fb.target_master_pubkey = $1
+         ORDER BY fb.added_at DESC",
+    )
+    .bind(&target)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+
+    Ok(Json(HistoryResponse {
+        entries: rows
+            .into_iter()
+            .map(
+                |(source_hub_pubkey, policy, reason, added_at)| HistoryEntry {
+                    source_hub_pubkey,
+                    policy,
+                    reason,
+                    added_at,
+                },
+            )
+            .collect(),
+    }))
 }

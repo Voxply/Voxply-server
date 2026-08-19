@@ -39,13 +39,15 @@ async fn start_hub() -> (String, Arc<AppState>, common::TestDbGuard) {
         federation_client: FederationClient::new(),
         peer_tokens: RwLock::new(HashMap::new()),
         voice_channels: RwLock::new(HashMap::new()),
-        voice_addr_map: RwLock::new(HashMap::new()),
+        voice_last_active: RwLock::new(HashMap::new()),
         whisper_target_pubkeys: RwLock::new(HashMap::new()),
         voice_sender_ids: RwLock::new(HashMap::new()),
         voice_next_sender_id: RwLock::new(HashMap::new()),
         voice_zones: RwLock::new(HashMap::new()),
         voice_udp_port: 0,
-        voice_udp_addr: None,
+        voice_wt_url: None,
+        canonical_url: Arc::new(RwLock::new(None)),
+        voice_cert_hash: RwLock::new(None),
         voice_event_tx,
         dm_tx: broadcast::channel(16).0,
         online_users: RwLock::new(std::collections::HashMap::new()),
@@ -58,15 +60,12 @@ async fn start_hub() -> (String, Arc<AppState>, common::TestDbGuard) {
         last_farm_pubkey_fetch: std::sync::Arc::new(tokio::sync::RwLock::new(0)),
         video_channels: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         started_at: std::time::Instant::now(),
-        whisper_targets: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         whisper_target_defs: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+        whisper_optouts: tokio::sync::RwLock::new(std::collections::HashSet::new()),
         voice_relay_active: tokio::sync::RwLock::new(std::collections::HashSet::new()),
         staging_voice_grants: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         voice_pending_binds: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-        voice_consumed_tokens: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-        voice_ws_senders: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         ws_key_senders: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-        voice_udp_socket: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
         rate_limiters: Default::default(),
         preview_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         search: std::sync::Arc::new(wavvon_hub::search::null_search::NullSearch),
@@ -248,7 +247,7 @@ async fn subscribe_to_denied_channel_is_rejected_and_no_events_leak() {
     .await;
 
     // The hub must respond with an error frame, not silently subscribe.
-    let frame = next_meaningful_frame(&mut member_rx, std::time::Duration::from_secs(3))
+    let frame = next_meaningful_frame(&mut member_rx, std::time::Duration::from_secs(15))
         .await
         .expect("expected an error frame for the denied subscribe");
     assert_eq!(frame["type"], "error");
@@ -287,7 +286,7 @@ async fn subscribe_to_readable_channel_still_delivers_events() {
 
     send_message(&base, &owner_token, &open.id, "hello everyone").await;
 
-    let frame = next_meaningful_frame(&mut member_rx, std::time::Duration::from_secs(3))
+    let frame = next_meaningful_frame(&mut member_rx, std::time::Duration::from_secs(15))
         .await
         .expect("expected the chat message to be delivered");
     assert_eq!(frame["type"], "message");

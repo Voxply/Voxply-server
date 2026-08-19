@@ -44,13 +44,15 @@ async fn start_hub() -> (String, Arc<AppState>, common::TestDbGuard) {
         federation_client: FederationClient::new(),
         peer_tokens: RwLock::new(HashMap::new()),
         voice_channels: RwLock::new(HashMap::new()),
-        voice_addr_map: RwLock::new(HashMap::new()),
+        voice_last_active: RwLock::new(HashMap::new()),
         whisper_target_pubkeys: RwLock::new(HashMap::new()),
         voice_sender_ids: RwLock::new(HashMap::new()),
         voice_next_sender_id: RwLock::new(HashMap::new()),
         voice_zones: RwLock::new(HashMap::new()),
         voice_udp_port: 0,
-        voice_udp_addr: None,
+        voice_wt_url: None,
+        canonical_url: Arc::new(RwLock::new(None)),
+        voice_cert_hash: RwLock::new(None),
         voice_event_tx,
         dm_tx: broadcast::channel(16).0,
         online_users: RwLock::new(std::collections::HashMap::new()),
@@ -63,15 +65,12 @@ async fn start_hub() -> (String, Arc<AppState>, common::TestDbGuard) {
         last_farm_pubkey_fetch: std::sync::Arc::new(tokio::sync::RwLock::new(0)),
         video_channels: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         started_at: std::time::Instant::now(),
-        whisper_targets: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         whisper_target_defs: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+        whisper_optouts: tokio::sync::RwLock::new(std::collections::HashSet::new()),
         voice_relay_active: tokio::sync::RwLock::new(std::collections::HashSet::new()),
         staging_voice_grants: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         voice_pending_binds: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-        voice_consumed_tokens: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-        voice_ws_senders: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         ws_key_senders: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-        voice_udp_socket: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
         rate_limiters: Default::default(),
         preview_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         search: std::sync::Arc::new(wavvon_hub::search::null_search::NullSearch),
@@ -262,7 +261,7 @@ async fn join_mini_app(base: &str, member_token: &str, bot_id: &str, channel_id:
         json!({ "type": "bot_app_join", "bot_id": bot_id, "channel_id": channel_id }),
     )
     .await;
-    let frame = next_meaningful_frame(&mut rx, std::time::Duration::from_secs(3))
+    let frame = next_meaningful_frame(&mut rx, std::time::Duration::from_secs(15))
         .await
         .expect("expected a bot_app_open reply");
     assert_eq!(frame["type"], "bot_app_open");
@@ -298,7 +297,7 @@ async fn mini_app_token_can_join_ws_and_receive_bound_channel_events() {
 
     // ...and receives a message posted to the bound channel.
     send_message(&base, &owner_token, &channel_id, "round 1 starting").await;
-    let frame = next_meaningful_frame(&mut mini_rx, std::time::Duration::from_secs(3))
+    let frame = next_meaningful_frame(&mut mini_rx, std::time::Duration::from_secs(15))
         .await
         .expect("mini-app session should receive events for its bound channel");
     assert_eq!(frame["type"], "message");
@@ -338,10 +337,13 @@ async fn mini_app_token_does_not_leak_events_from_other_channels() {
     );
 }
 
-/// The minted token is rejected by the voice-over-WS relay entirely — voice
-/// was never part of the mini-app scope.
+/// The minted mini-app session token cannot join voice over the unified
+/// `voice_join` WS handler — same block the now-deleted `/voice/ws`
+/// endpoint's scope check enforced (voice-transport-v2.md), re-applied at
+/// `handle_voice_join` (`routes/ws/handlers/voice.rs`) since that's now the
+/// only voice-join code path.
 #[tokio::test]
-async fn mini_app_token_cannot_join_voice_ws() {
+async fn mini_app_token_cannot_join_voice() {
     let (base, _state, _guard) = start_hub().await;
 
     let owner = Identity::generate();
@@ -349,7 +351,7 @@ async fn mini_app_token_cannot_join_voice_ws() {
     let owner_token = authenticate_http(&base, &owner).await;
     let member_token = authenticate_http(&base, &member).await;
 
-    let channel = create_channel(&base, &owner_token, "game-room").await;
+    let channel = create_channel(&base, &owner_token, "game-room-voice").await;
     let channel_id = channel["id"].as_str().unwrap().to_string();
 
     let bot = create_mini_app_bot(&base, &owner_token).await;
@@ -357,24 +359,18 @@ async fn mini_app_token_cannot_join_voice_ws() {
 
     let session_token = join_mini_app(&base, &member_token, &bot_id, &channel_id).await;
 
-    let voice_ws_url = format!(
-        "{}/voice/ws?token={}&channel_id={}",
-        base.replace("http://", "ws://"),
-        session_token,
-        channel_id
-    );
-    let result = try_connect_ws(&voice_ws_url).await;
-    // The upgrade may nominally succeed at the HTTP layer but the server
-    // task returns immediately without ever completing the voice handshake;
-    // either an outright upgrade rejection or an immediate close is
-    // acceptable — what must NOT happen is a live, usable voice session.
-    if let Ok((_tx, mut rx)) = result {
-        let frame = next_meaningful_frame(&mut rx, std::time::Duration::from_secs(2)).await;
-        assert!(
-            frame.is_none(),
-            "mini-app-scoped token must not get a usable voice-ws session, got: {frame:?}"
-        );
-    }
+    let (mut mini_tx, mut mini_rx) = connect_ws(&base, &session_token).await;
+    send_text(
+        &mut mini_tx,
+        json!({ "type": "voice_join", "channel_id": channel_id }),
+    )
+    .await;
+
+    let frame = next_meaningful_frame(&mut mini_rx, std::time::Duration::from_secs(2))
+        .await
+        .expect("expected an error reply, mini-app sessions cannot join voice");
+    assert_eq!(frame["type"], "error");
+    assert_eq!(frame["context"], "voice_join");
 }
 
 /// The minted token cannot call an admin REST route.

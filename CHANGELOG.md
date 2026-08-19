@@ -82,7 +82,7 @@ The x86_64-musl and Docker builds are unchanged.
 
 ### Refactoring
 - Move all Rust crates under crates/
-- Rename crates/server to crates/agent, package voxply-agent
+- Rename crates/server to crates/agent, package wavvon-agent
 - Flatten crates/tools/ — move demo-seed directly under crates/
 - Remove game state, migrations, row types, and test file (S5)
 - Remove games routes, WS types, farm routes, and GameStore trait (S1-S4)
@@ -115,7 +115,7 @@ The x86_64-musl and Docker builds are unchanged.
 ### Features
 - Allow multiple concurrent screen sharers per channel
 - Cross-channel stream subscription (decouple streaming from voice)
-- Voxply-hub update subcommand
+- Wavvon-hub update subcommand
 - Rate-limit GET /preview per user (10 req/60 s)
 - POST /admin/search/reindex — operator-driven index rebuild
 - Networked voice Phase 1 — token-gated UDP source-address learning

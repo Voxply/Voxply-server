@@ -1,4 +1,5 @@
-/target
+﻿/target
+/target-test
 .claude/
 .obsidian/
 # demo-seed credentials output (contains session tokens / recovery phrases)
@@ -9,6 +10,7 @@ demo-credentials.json
 hub_identity.json
 *.pem
 *.key
+voice_wt_cert*
 .env
 # Tantivy search index (runtime artifact)
 **/*.search/
@@ -16,3 +18,4 @@ hub_identity.json
 # `cargo test`'s default cwd writes files for tests that hit upload routes
 # without overriding the env var.
 crates/hub/uploads/
+/uploads/

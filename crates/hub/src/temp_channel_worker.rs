@@ -12,8 +12,8 @@
 //!    right after boot, so the very first tick stamps every surviving temp
 //!    channel and it ages out through the same path below. One code path,
 //!    no separate boot-time sweep.
-//! 2. Deletes temp channels whose `empty_since` is older than the 60s grace
-//!    period, using the same manual multi-table delete `delete_channel`
+//! 2. Deletes temp channels whose `empty_since` is older than the
+//!    `GRACE_SECS` grace period, using the same manual multi-table delete `delete_channel`
 //!    uses (there's no DB-level `ON DELETE CASCADE` on `messages.channel_id`
 //!    -- only `channel_permission_overwrites`, `channel_pins`, and
 //!    `upload_files` cascade automatically).
@@ -30,10 +30,12 @@ use crate::routes::chat_models::{ChatEvent, WsServerMessage};
 use crate::state::AppState;
 
 /// How often the worker wakes to sweep temp channels.
-const POLL_INTERVAL: Duration = Duration::from_secs(30);
+const POLL_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Grace period, in seconds, a temp channel may sit empty before deletion.
-pub const GRACE_SECS: i64 = 60;
+/// Long enough to absorb voice reconnects and "oops, wrong room" rejoins,
+/// short enough that dead rooms don't linger (was 60s; felt too slow).
+pub const GRACE_SECS: i64 = 30;
 
 pub fn spawn(state: Arc<AppState>) {
     tokio::spawn(async move {

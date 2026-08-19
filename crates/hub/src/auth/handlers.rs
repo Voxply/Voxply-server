@@ -792,9 +792,10 @@ pub struct WsAuth {
 /// mini-app webview's whole purpose is to talk over `/ws` — but callers
 /// must consult `WsAuth::mini_app_channel_id` to confine what it can see.
 pub async fn validate_ws_token(
-    db: &PgPool,
+    state: &crate::state::AppState,
     token: &str,
 ) -> Result<WsAuth, (axum::http::StatusCode, String)> {
+    let db = &state.db;
     use axum::http::StatusCode;
 
     // (public_key, approval_status, expires_at, scope, mini_app_channel_id)
@@ -841,6 +842,29 @@ pub async fn validate_ws_token(
 
             match bot_key {
                 Some(k) => (k, "approved".to_string(), "member".to_string(), None),
+                // Farm-issued token, verified against the farm pubkey exactly
+                // as the HTTP path does — one function, so the two cannot
+                // drift. This branch was missing entirely: on a farm-managed
+                // hub the client authenticates at the farm, so *every* socket
+                // it opened was refused while its HTTP calls worked. No
+                // messages, no presence, no voice signalling, and no error
+                // anywhere except a socket that never connected.
+                None if token.contains('.') => {
+                    let pk = crate::auth::middleware::resolve_farm_token(state, token).await?;
+                    let status: Option<String> = sqlx::query_scalar(
+                        "SELECT approval_status FROM users WHERE public_key = $1",
+                    )
+                    .bind(&pk)
+                    .fetch_optional(db)
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+                    (
+                        pk,
+                        status.unwrap_or_else(|| "approved".to_string()),
+                        "member".to_string(),
+                        None,
+                    )
+                }
                 None => {
                     return Err((
                         StatusCode::UNAUTHORIZED,

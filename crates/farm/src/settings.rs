@@ -15,16 +15,39 @@ pub struct Settings {
     /// Base port for hub child processes. Hub i gets base_port + i.
     /// Env: WAVVON_HUB_BASE_PORT
     pub hub_base_port: u16,
+    /// Base port for hub child processes' voice (WebTransport/QUIC over UDP)
+    /// port. Defaults to `hub_base_port + 1000` when unset — see `load()`.
+    /// Env: WAVVON_VOICE_BASE_PORT
+    pub voice_base_port: Option<u16>,
     /// Directory where hub data directories are stored.
     /// Env: WAVVON_HUBS_DIR
     pub hubs_dir: String,
-    /// PostgreSQL connection URL. Env: DATABASE_URL
+    /// PostgreSQL connection URL. Env: WAVVON_DATABASE_URL
+    ///
+    /// Note the `WAVVON_` prefix — `load()` reads every field through
+    /// `config::Environment::with_prefix("WAVVON")`. This was documented as
+    /// plain `DATABASE_URL` while `main.rs` separately read that unprefixed
+    /// name, so the farm needed *both* names set to start and neither the
+    /// Dockerfile nor docker-compose.farm.yml set either.
     pub database_url: String,
+    /// PostgreSQL connection-pool size. Caps concurrent database work, not
+    /// concurrent users — a connection is borrowed per query and returned.
+    /// Env: WAVVON_DB_MAX_CONNECTIONS
+    pub db_max_connections: u32,
     /// Logging format: "text" (default) or "json". Env: WAVVON_LOG_FORMAT
     pub log_format: String,
     /// OpenTelemetry OTLP collector endpoint. Leave empty to disable.
     /// Env: WAVVON_OTLP_ENDPOINT
     pub otlp_endpoint: Option<String>,
+}
+
+impl Settings {
+    /// Resolved voice base port: `voice_base_port` if explicitly configured,
+    /// else `hub_base_port + 1000`.
+    pub fn resolved_voice_base_port(&self) -> u16 {
+        self.voice_base_port
+            .unwrap_or_else(|| self.hub_base_port.saturating_add(1000))
+    }
 }
 
 /// Load farm settings from (in priority order, highest last):
@@ -37,6 +60,7 @@ pub fn load() -> Result<Settings> {
         .set_default("hub_base_port", 9100)?
         .set_default("hubs_dir", "hubs")?
         .set_default("log_format", "text")?
+        .set_default("db_max_connections", 5u32)?
         .add_source(config::File::with_name("farm").required(false))
         .add_source(config::Environment::with_prefix("WAVVON"))
         .build()?

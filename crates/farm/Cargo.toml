@@ -28,10 +28,12 @@ totp-rs = { version = "5", features = ["qr"] }
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
 wavvon-identity = { path = "../identity" }
+wavvon-hub-env = { path = "../hub-env" }
 uuid = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 futures-util = "0.3"
 hyper = "1"
+url = "2"
 hyper-util = { version = "0.1", features = ["tokio"] }
 opentelemetry        = { workspace = true }
 opentelemetry_sdk    = { workspace = true }

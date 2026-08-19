@@ -1,4 +1,3 @@
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::extract::ws::Message;
@@ -11,7 +10,7 @@ use crate::state::{AppState, PendingVoiceBind};
 use crate::routes::ws::conn_state::{ConnState, DispatchResult};
 use crate::routes::ws::voice::{
     apply_pending_voice_move_assignment, get_voice_participants, get_voice_roster,
-    re_resolve_whisper_sessions, resolve_role_addrs, resolve_whisper_targets,
+    re_resolve_whisper_sessions, resolve_whisper_target_pubkeys, send_whisper_notification,
 };
 
 type WsTx = futures_util::stream::SplitSink<axum::extract::ws::WebSocket, Message>;
@@ -22,16 +21,42 @@ pub(in crate::routes::ws) async fn handle_voice_join(
     ws_tx: &mut WsTx,
     msg: WsClientMessage,
 ) -> DispatchResult {
-    // udp_port is kept for wire-format compatibility but is no longer used
-    // to fabricate a loopback address.  The real source address is learned
-    // via the VXRG UDP register packet after voice_join completes.
-    let (mut channel_id, _udp_port) = match msg {
-        WsClientMessage::VoiceJoin {
-            channel_id,
-            udp_port,
-        } => (channel_id, udp_port),
+    let mut channel_id = match msg {
+        WsClientMessage::VoiceJoin { channel_id } => channel_id,
         _ => return DispatchResult::Continue,
     };
+
+    // Mini-app-scoped sessions (bot-mini-apps.md "Scoped session token")
+    // never had voice in scope — same block the now-deleted `/voice/ws`
+    // endpoint enforced (voice-transport-v2.md), re-applied here since the
+    // unified `voice_join` handler is now the only voice-join code path.
+    if cs.is_mini_app {
+        let err = WsServerMessage::Error {
+            context: "voice_join".to_string(),
+            message: "Mini-app sessions cannot join voice.".to_string(),
+        };
+        let _ = ws_tx
+            .send(Message::Text(serde_json::to_string(&err).unwrap().into()))
+            .await;
+        return DispatchResult::Continue;
+    }
+
+    // Bot audio injection (soundboard.md §2) requires the effective
+    // `can_speak_voice` capability grant — same gate the now-deleted
+    // `/voice/ws` endpoint enforced for bot joins (voice-transport-v2.md).
+    if cs.is_bot
+        && !crate::bots::capabilities::has_capability(&state.db, &cs.public_key, "can_speak_voice")
+            .await
+    {
+        let err = WsServerMessage::Error {
+            context: "voice_join".to_string(),
+            message: "This bot does not have voice permission.".to_string(),
+        };
+        let _ = ws_tx
+            .send(Message::Text(serde_json::to_string(&err).unwrap().into()))
+            .await;
+        return DispatchResult::Continue;
+    }
 
     // Hub-wide voice mute check.
     let is_hub_muted = crate::routes::moderation::is_voice_muted(&state.db, &cs.public_key)
@@ -264,17 +289,16 @@ pub(in crate::routes::ws) async fn handle_voice_join(
         }
     }
 
-    // --- Token-gated source-address learning (Phase 1) ---
+    // --- Token-gated WebTransport session bind (voice-transport-v2.md) ---
     //
-    // We no longer fabricate a 127.0.0.1 address.  Instead:
-    // 1. Mint a 32-byte random single-use register token.
+    // 1. Mint a 32-byte random single-use token.
     // 2. Store it in voice_pending_binds with a 30-second TTL.
-    // 3. Return it in the voice_joined reply; the client will send a VXRG
-    //    UDP packet carrying the token, at which point the relay loop
-    //    binds the real source address into voice_addr_map.
+    // 3. Return it (plus the WT URL/cert hash) in the voice_joined reply;
+    //    the client opens a WT session against `voice_wt_url?token=<hex>`,
+    //    which consumes the token and binds the session (`voice_wt.rs`).
     //
     // Purge stale pending binds opportunistically (on each new mint).
-    let udp_register_token: String = {
+    let voice_token: String = {
         let mut bytes = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut bytes);
         hex::encode(bytes)
@@ -290,7 +314,7 @@ pub(in crate::routes::ws) async fn handle_voice_join(
         // Remove any prior pending bind for this pubkey (re-join race).
         binds.retain(|_, v| v.pubkey != cs.public_key);
         binds.insert(
-            udp_register_token.clone(),
+            voice_token.clone(),
             PendingVoiceBind {
                 channel_id: channel_id.clone(),
                 pubkey: cs.public_key.clone(),
@@ -299,19 +323,23 @@ pub(in crate::routes::ws) async fn handle_voice_join(
         );
     }
 
-    // Register the pubkey in voice_channels (membership) using a sentinel
-    // address.  The real SocketAddr is filled in by the VXRG handler; until
-    // then the sentinel is never present in voice_addr_map, so no audio is
-    // ever relayed to it (the fan-out filters by voice_addr_map membership).
-    let sentinel: SocketAddr = "0.0.0.0:0".parse().unwrap();
+    // Register the pubkey in voice_channels (roster membership) with no WT
+    // session bound yet — `voice_wt.rs` fills it in once the client opens
+    // its session with the token above; until then no audio is relayed to
+    // it (the fan-out only ever sends to a `Some(connection)` slot).
     state
         .voice_channels
         .write()
         .await
         .entry(channel_id.clone())
         .or_default()
-        .insert(cs.public_key.clone(), sentinel);
-    // voice_addr_map is NOT updated here; it is updated by the VXRG handler.
+        .insert(cs.public_key.clone(), None);
+    // Joining counts as activity for the AFK sweep — a joiner who never
+    // speaks still gets the full timeout before being moved.
+    state.voice_last_active.write().await.insert(
+        cs.public_key.clone(),
+        crate::auth::handlers::unix_timestamp(),
+    );
     state
         .voice_relay_active
         .write()
@@ -337,11 +365,19 @@ pub(in crate::routes::ws) async fn handle_voice_join(
 
     let participants = get_voice_participants(state, &channel_id, Some(&cs.public_key)).await;
 
+    let voice_wt_url = state
+        .voice_wt_url
+        .clone()
+        .unwrap_or_else(|| format!("https://localhost:{}/voice", state.voice_udp_port));
+    let voice_cert_hash = state.voice_cert_hash.read().await.clone();
+
     let reply = WsServerMessage::VoiceJoined {
         channel_id: channel_id.clone(),
-        hub_udp_port: state.voice_udp_port,
+        sender_id,
         participants,
-        udp_register_token,
+        voice_token,
+        voice_wt_url,
+        voice_cert_hash,
     };
     let json = serde_json::to_string(&reply).unwrap();
     let _ = ws_tx.send(Message::Text(json.into())).await;
@@ -372,6 +408,7 @@ pub(in crate::routes::ws) async fn handle_voice_join(
                     public_key: cs.public_key.clone(),
                     display_name: display_name.clone(),
                     is_bot,
+                    sender_id: Some(sender_id),
                 },
             },
         ));
@@ -504,7 +541,6 @@ pub(in crate::routes::ws) async fn handle_voice_leave(
 
     crate::routes::ws::connection::leave_voice(state, &cs.public_key, &channel_id).await;
     cs.voice_channel = None;
-    re_resolve_whisper_sessions(state).await;
 
     {
         let state_c = state.clone();
@@ -541,6 +577,13 @@ pub(in crate::routes::ws) async fn handle_voice_speaking(
         } => (channel_id, speaking),
         _ => return DispatchResult::Continue,
     };
+    // Any speaking transition (start or stop) is activity for the AFK
+    // sweep. Stamped before the invisibility gate below — invisible
+    // participants talk too.
+    state.voice_last_active.write().await.insert(
+        cs.public_key.clone(),
+        crate::auth::handlers::unix_timestamp(),
+    );
     // A speaking indicator for a hidden participant would out them — same
     // gate as the join/leave broadcasts. Their audio still relays.
     if crate::routes::users::is_invisible(&state.db, &cs.public_key).await {
@@ -567,62 +610,29 @@ pub(in crate::routes::ws) async fn handle_voice_whisper_start(
         _ => return DispatchResult::Continue,
     };
 
-    let my_addr = {
+    let in_voice = {
         let vc = state.voice_channels.read().await;
-        if let Some(ch) = &cs.voice_channel {
-            vc.get(ch).and_then(|p| p.get(&cs.public_key)).copied()
-        } else {
-            None
-        }
+        cs.voice_channel
+            .as_ref()
+            .and_then(|ch| vc.get(ch))
+            .map(|participants| participants.contains_key(&cs.public_key))
+            .unwrap_or(false)
     };
-    let my_addr = match my_addr {
-        Some(a) => a,
-        None => return DispatchResult::Continue,
-    };
-
-    let mut addrs = resolve_whisper_targets(state, &targets, my_addr).await;
-    for def in &targets {
-        if def.target_type == "role" {
-            addrs.extend(resolve_role_addrs(state, &def.id, my_addr).await);
-        }
+    if !in_voice {
+        return DispatchResult::Continue;
     }
 
-    state
-        .whisper_targets
-        .write()
-        .await
-        .insert(cs.public_key.clone(), addrs.clone());
     state
         .whisper_target_defs
         .write()
         .await
         .insert(cs.public_key.clone(), targets.clone());
 
-    // Resolve targets to pubkeys directly (works for web clients, which have
-    // no stable UDP addr). "user" → the pubkey; "channel" → everyone in that
-    // voice channel. This set drives both the notification delivery and the
-    // WS voice relay's whisper routing (`voice_ws.rs`).
-    let target_pks: std::collections::HashSet<String> = {
-        let mut set = std::collections::HashSet::new();
-        let vc = state.voice_channels.read().await;
-        for def in &targets {
-            match def.target_type.as_str() {
-                "user" => {
-                    set.insert(def.id.clone());
-                }
-                "channel" => {
-                    if let Some(p) = vc.get(&def.id) {
-                        for pk in p.keys() {
-                            set.insert(pk.clone());
-                        }
-                    }
-                }
-                _ => {} // "role" targets still route via the UDP addr set above.
-            }
-        }
-        set.remove(&cs.public_key); // never whisper to self
-        set
-    };
+    // Resolve targets to pubkeys. "user" → the pubkey; "channel" → everyone
+    // in that voice channel; "role" → every role member currently in voice.
+    // This pubkey set drives both the notification delivery and the WT
+    // relay's whisper routing (`voice_wt.rs`).
+    let target_pks = resolve_whisper_target_pubkeys(state, &targets, &cs.public_key).await;
     state
         .whisper_target_pubkeys
         .write()
@@ -630,16 +640,13 @@ pub(in crate::routes::ws) async fn handle_voice_whisper_start(
         .insert(cs.public_key.clone(), target_pks.clone());
 
     let target_pubkeys: Vec<String> = target_pks.into_iter().collect();
-    let reply = WsServerMessage::VoiceWhisperStarted {
-        sender_pubkey: cs.public_key.clone(),
-    };
-    let ev = crate::routes::chat_models::ChatEvent::WhisperSignal {
-        channel_id: cs.voice_channel.clone().unwrap_or_default(),
-        to_pubkeys: target_pubkeys,
-    };
-    let json: std::sync::Arc<str> =
-        std::sync::Arc::from(serde_json::to_string(&reply).unwrap().as_str());
-    let _ = state.chat_tx.send((ev, json));
+    send_whisper_notification(
+        state,
+        &cs.public_key,
+        &cs.voice_channel.clone().unwrap_or_default(),
+        true,
+        target_pubkeys,
+    );
     DispatchResult::Continue
 }
 
@@ -647,7 +654,6 @@ pub(in crate::routes::ws) async fn handle_voice_whisper_stop(
     cs: &ConnState,
     state: &Arc<AppState>,
 ) -> DispatchResult {
-    let prev_addrs = state.whisper_targets.write().await.remove(&cs.public_key);
     state
         .whisper_target_defs
         .write()
@@ -659,20 +665,49 @@ pub(in crate::routes::ws) async fn handle_voice_whisper_stop(
         .await
         .remove(&cs.public_key);
 
-    if prev_addrs.is_some() || prev_pks.is_some() {
-        // Notify the pubkey-based target set (covers web + UDP targets).
-        let target_pubkeys: Vec<String> = prev_pks.unwrap_or_default().into_iter().collect();
-        let reply = WsServerMessage::VoiceWhisperStopped {
-            sender_pubkey: cs.public_key.clone(),
-        };
-        let ev = crate::routes::chat_models::ChatEvent::WhisperSignal {
-            channel_id: cs.voice_channel.clone().unwrap_or_default(),
-            to_pubkeys: target_pubkeys,
-        };
-        let json: std::sync::Arc<str> =
-            std::sync::Arc::from(serde_json::to_string(&reply).unwrap().as_str());
-        let _ = state.chat_tx.send((ev, json));
+    if let Some(prev_pks) = prev_pks {
+        let target_pubkeys: Vec<String> = prev_pks.into_iter().collect();
+        send_whisper_notification(
+            state,
+            &cs.public_key,
+            &cs.voice_channel.clone().unwrap_or_default(),
+            false,
+            target_pubkeys,
+        );
     }
+    DispatchResult::Continue
+}
+
+/// Sender opts in or out of RECEIVING whispers (whisper.md). Only affects
+/// resolution of the sender as a whisper *target* -- they can still start
+/// whispers of their own while opted out. Re-resolves every active whisper
+/// session afterward (same call used on voice join/leave) so an opt-out
+/// immediately drops the sender from any live target set and an opt-back-in
+/// immediately adds them back, without waiting for the whisperer to send a
+/// fresh `voice_whisper_start`. `re_resolve_whisper_sessions` diffs the
+/// resolved pubkey set against its previous value and pushes
+/// `voice_whisper_stopped` to the opted-out pubkey (or `voice_whisper_started`
+/// on opt-back-in) for every session it was a target of.
+pub(in crate::routes::ws) async fn handle_voice_whisper_optout(
+    cs: &ConnState,
+    state: &Arc<AppState>,
+    msg: WsClientMessage,
+) -> DispatchResult {
+    let enabled = match msg {
+        WsClientMessage::VoiceWhisperOptout { enabled } => enabled,
+        _ => return DispatchResult::Continue,
+    };
+
+    {
+        let mut optouts = state.whisper_optouts.write().await;
+        if enabled {
+            optouts.insert(cs.public_key.clone());
+        } else {
+            optouts.remove(&cs.public_key);
+        }
+    }
+
+    re_resolve_whisper_sessions(state).await;
     DispatchResult::Continue
 }
 

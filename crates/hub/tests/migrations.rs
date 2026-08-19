@@ -103,3 +103,53 @@ async fn migrations_create_all_core_tables() {
         assert_eq!(count, 1, "Table '{table}' should exist after migrations");
     }
 }
+
+/// The real server the suite runs against must satisfy the declared floor —
+/// otherwise the floor is a claim nobody checks. Pairs with the unit tests in
+/// `db::version`, which cover the comparison and the message.
+#[tokio::test]
+async fn test_database_meets_the_declared_minimum_version() {
+    let (db, _guard) = common::create_test_db().await;
+    wavvon_hub::db::version::ensure_supported(&db)
+        .await
+        .expect("CI/dev PostgreSQL is below the declared minimum");
+}
+
+/// Every `ADD COLUMN ... NOT NULL` must carry a `DEFAULT`.
+///
+/// This is what makes downgrading a hub survivable at the schema level. An
+/// older binary does not know the columns a newer one added, so its INSERTs
+/// omit them; a `NOT NULL` column with no default rejects every one of those
+/// inserts and the old binary cannot write at all. With a default, the column
+/// fills itself and the old binary keeps working against the newer schema.
+///
+/// Source-level on purpose: `information_schema` cannot tell a column added by
+/// `ALTER TABLE` from one that was in the original `CREATE TABLE`, and the
+/// latter are legitimately `NOT NULL` without a default (primary keys, and
+/// every column a binary of that vintage already supplies).
+///
+/// It holds today by luck, not by rule. This is the rule.
+#[test]
+fn added_columns_never_require_a_value_an_older_binary_cannot_supply() {
+    const SRC: &str = include_str!("../src/db/migrations.rs");
+
+    let mut offenders = Vec::new();
+    for (i, chunk) in SRC.split("ADD COLUMN").enumerate().skip(1) {
+        // The column definition runs to the end of the statement or the next
+        // column in the list — whichever comes first.
+        let end = chunk
+            .find([',', ';', '"'])
+            .unwrap_or_else(|| chunk.len().min(200));
+        let def = chunk[..end].to_uppercase();
+        if def.contains("NOT NULL") && !def.contains("DEFAULT") {
+            offenders.push(format!("#{i}: ADD COLUMN{}", &chunk[..end]));
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "these added columns are NOT NULL with no DEFAULT, which stops an older \
+         binary inserting at all after an upgrade:\n{}",
+        offenders.join("\n")
+    );
+}

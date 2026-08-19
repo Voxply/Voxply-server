@@ -206,6 +206,92 @@ fn try_verify_farm_token(
     Ok(payload.sub)
 }
 
+/// Resolve a farm-issued token to the pubkey it speaks for.
+///
+/// Shared by the HTTP middleware and the WebSocket handshake. It was inline in
+/// the middleware only, and the WebSocket path did not have it at all: on a
+/// farm-managed hub a client authenticates at the farm, so every socket it
+/// opened was refused while its HTTP calls worked. Half a working hub, and
+/// silent — the socket just never connected.
+///
+/// Verification is local against the farm pubkey cached at startup; a failure
+/// re-fetches it at most once a minute, so a farm key rotation heals without
+/// a per-request round trip.
+pub(crate) async fn resolve_farm_token(
+    state: &AppState,
+    token: &str,
+) -> Result<String, (StatusCode, String)> {
+    Ok({
+        // --- Farm token path ---
+        let cached_pubkey = state.cached_farm_pubkey.read().await.clone();
+
+        match &cached_pubkey {
+            None => return Err((StatusCode::UNAUTHORIZED, "no_farm_configured".to_string())),
+            Some(farm_pubkey) => {
+                match try_verify_farm_token(farm_pubkey, token) {
+                    Ok(sub) => sub,
+                    Err(first_err) => {
+                        // Rate-limited re-fetch: try once per 60s to pick up key rotation.
+                        let should_refetch = {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs() as i64;
+                            let last = *state.last_farm_pubkey_fetch.read().await;
+                            now - last > FARM_REFETCH_COOLDOWN
+                        };
+
+                        if should_refetch {
+                            if let Some(ref farm_url) = state.farm_url {
+                                let refetch_result = state
+                                    .http_client
+                                    .get(format!("{farm_url}/farm/info"))
+                                    .send()
+                                    .await;
+
+                                // Update fetch timestamp regardless of outcome.
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs() as i64;
+                                *state.last_farm_pubkey_fetch.write().await = now;
+
+                                if let Ok(resp) = refetch_result {
+                                    if let Ok(body) = resp.json::<serde_json::Value>().await {
+                                        if let Some(pk) =
+                                            body.get("public_key").and_then(|v| v.as_str())
+                                        {
+                                            let new_pk = pk.to_string();
+                                            *state.cached_farm_pubkey.write().await =
+                                                Some(new_pk.clone());
+
+                                            // Retry with new pubkey.
+                                            match try_verify_farm_token(&new_pk, token) {
+                                                Ok(sub) => sub,
+                                                Err(_) => return Err(first_err),
+                                            }
+                                        } else {
+                                            return Err(first_err);
+                                        }
+                                    } else {
+                                        return Err(first_err);
+                                    }
+                                } else {
+                                    return Err(first_err);
+                                }
+                            } else {
+                                return Err(first_err);
+                            }
+                        } else {
+                            return Err(first_err);
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
 impl FromRequestParts<Arc<AppState>> for AuthUser {
     type Rejection = (StatusCode, String);
 
@@ -238,74 +324,8 @@ impl FromRequestParts<Arc<AppState>> for AuthUser {
         // Dispatch: farm token (contains '.') vs legacy opaque hub token.
         // -----------------------------------------------------------------
         let public_key = if token.contains('.') {
-            // --- Farm token path ---
-            let cached_pubkey = state.cached_farm_pubkey.read().await.clone();
-
-            match &cached_pubkey {
-                None => return Err((StatusCode::UNAUTHORIZED, "no_farm_configured".to_string())),
-                Some(farm_pubkey) => {
-                    match try_verify_farm_token(farm_pubkey, token) {
-                        Ok(sub) => sub,
-                        Err(first_err) => {
-                            // Rate-limited re-fetch: try once per 60s to pick up key rotation.
-                            let should_refetch = {
-                                let now = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs() as i64;
-                                let last = *state.last_farm_pubkey_fetch.read().await;
-                                now - last > FARM_REFETCH_COOLDOWN
-                            };
-
-                            if should_refetch {
-                                if let Some(ref farm_url) = state.farm_url {
-                                    let refetch_result = state
-                                        .http_client
-                                        .get(format!("{farm_url}/farm/info"))
-                                        .send()
-                                        .await;
-
-                                    // Update fetch timestamp regardless of outcome.
-                                    let now = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs()
-                                        as i64;
-                                    *state.last_farm_pubkey_fetch.write().await = now;
-
-                                    if let Ok(resp) = refetch_result {
-                                        if let Ok(body) = resp.json::<serde_json::Value>().await {
-                                            if let Some(pk) =
-                                                body.get("public_key").and_then(|v| v.as_str())
-                                            {
-                                                let new_pk = pk.to_string();
-                                                *state.cached_farm_pubkey.write().await =
-                                                    Some(new_pk.clone());
-
-                                                // Retry with new pubkey.
-                                                match try_verify_farm_token(&new_pk, token) {
-                                                    Ok(sub) => sub,
-                                                    Err(_) => return Err(first_err),
-                                                }
-                                            } else {
-                                                return Err(first_err);
-                                            }
-                                        } else {
-                                            return Err(first_err);
-                                        }
-                                    } else {
-                                        return Err(first_err);
-                                    }
-                                } else {
-                                    return Err(first_err);
-                                }
-                            } else {
-                                return Err(first_err);
-                            }
-                        }
-                    }
-                }
-            }
+            // --- Farm token path (shared with the WebSocket handshake) ---
+            resolve_farm_token(state, token).await?
         } else {
             // --- Legacy opaque hub-token path (unchanged) ---
             // Try sessions first.

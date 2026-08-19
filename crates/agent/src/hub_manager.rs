@@ -27,20 +27,44 @@ impl HubManager {
     pub async fn spawn_hub(
         &self,
         hub_id: &str,
-        db_path: &str,
+        db_url: &str,
         port: u16,
+        voice_port: u16,
         owner_pubkey: Option<&str>,
         farm_url: Option<&str>,
     ) -> Result<()> {
-        let bin = std::env::var("WAVVON_HUB_BIN").unwrap_or_else(|_| self.hub_bin.clone());
+        // See the same block in farm/src/hub_manager.rs: these names used to
+        // be literals, and WAVVON_HUB_HTTP_PORT was one the hub never reads,
+        // so the assigned port was silently ignored. `db_url` is likewise
+        // still a SQLite-era file path with no PostgreSQL provisioning behind
+        // it, so no database var is passed and the hub uses its own default.
+        let bin = std::env::var(wavvon_hub_env::HUB_BIN).unwrap_or_else(|_| self.hub_bin.clone());
         let mut cmd = tokio::process::Command::new(&bin);
-        cmd.env("WAVVON_HUB_DB", db_path)
-            .env("WAVVON_HUB_HTTP_PORT", port.to_string());
+        // Tokio does NOT kill a child when its `Child` is dropped — it detaches
+        // it. Without this, any path that drops the manager without calling
+        // `stop_hub` (a panic, a test ending, the agent exiting) leaves a hub
+        // running forever with nothing supervising it, still holding its port
+        // and still writing to the shared default database. That is exactly
+        // what it did: an orphaned `wavvon-hub` whose parent was gone wedged
+        // `cargo test --workspace` for the better part of an hour.
+        cmd.kill_on_drop(true)
+            .env(wavvon_hub_env::HTTP_PORT, port.to_string())
+            .env(wavvon_hub_env::VOICE_UDP_PORT, voice_port.to_string())
+            // The farm's row id for this hub, forwarded from the spawn command.
+            // The hub reports it back on its heartbeat so the farm can bind the
+            // row to the hub's pubkey and route to it.
+            .env(wavvon_hub_env::FARM_HUB_ID, hub_id);
+        tracing::warn!(
+            hub_id,
+            db_url,
+            "no per-hub database provisioning: this hub will use the default \
+             WAVVON_DATABASE_URL and share it with every other spawned hub"
+        );
         if let Some(pk) = owner_pubkey {
-            cmd.env("WAVVON_OWNER_PUBKEY", pk);
+            cmd.env(wavvon_hub_env::OWNER_PUBKEY, pk);
         }
         if let Some(url) = farm_url {
-            cmd.env("WAVVON_FARM_URL", url);
+            cmd.env(wavvon_hub_env::FARM_URL, url);
         }
         let child = cmd.spawn().with_context(|| format!("spawn hub {hub_id}"))?;
         self.hubs.write().await.insert(
@@ -50,7 +74,7 @@ impl HubManager {
                 _child: child,
             },
         );
-        tracing::info!(hub_id, port, "Hub spawned");
+        tracing::info!(hub_id, port, voice_port, "Hub spawned");
         Ok(())
     }
 
@@ -67,13 +91,14 @@ impl HubManager {
     pub async fn restart_hub(
         &self,
         hub_id: &str,
-        db_path: &str,
+        db_url: &str,
         port: u16,
+        voice_port: u16,
         owner_pubkey: Option<&str>,
         farm_url: Option<&str>,
     ) -> Result<()> {
         self.stop_hub(hub_id).await?;
-        self.spawn_hub(hub_id, db_path, port, owner_pubkey, farm_url)
+        self.spawn_hub(hub_id, db_url, port, voice_port, owner_pubkey, farm_url)
             .await
     }
 

@@ -8,6 +8,7 @@ name = "wavvon-agent"
 path = "src/main.rs"
 
 [dependencies]
+wavvon-hub-env = { path = "../hub-env" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

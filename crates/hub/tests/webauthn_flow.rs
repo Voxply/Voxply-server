@@ -70,13 +70,15 @@ async fn make_state() -> (Arc<AppState>, common::TestDbGuard) {
         peer_tokens: RwLock::new(HashMap::new()),
         http_client: reqwest::Client::new(),
         voice_channels: RwLock::new(HashMap::new()),
-        voice_addr_map: RwLock::new(HashMap::new()),
+        voice_last_active: RwLock::new(HashMap::new()),
         whisper_target_pubkeys: RwLock::new(HashMap::new()),
         voice_sender_ids: RwLock::new(HashMap::new()),
         voice_next_sender_id: RwLock::new(HashMap::new()),
         voice_zones: RwLock::new(HashMap::new()),
         voice_udp_port: 0,
-        voice_udp_addr: None,
+        voice_wt_url: None,
+        canonical_url: Arc::new(RwLock::new(None)),
+        voice_cert_hash: RwLock::new(None),
         voice_event_tx: broadcast::channel(16).0,
         dm_tx: broadcast::channel(16).0,
         online_users: RwLock::new(HashMap::new()),
@@ -88,15 +90,12 @@ async fn make_state() -> (Arc<AppState>, common::TestDbGuard) {
         last_farm_pubkey_fetch: Arc::new(RwLock::new(0)),
         video_channels: RwLock::new(HashMap::new()),
         started_at: std::time::Instant::now(),
-        whisper_targets: RwLock::new(HashMap::new()),
         whisper_target_defs: RwLock::new(HashMap::new()),
+        whisper_optouts: RwLock::new(std::collections::HashSet::new()),
         voice_relay_active: RwLock::new(std::collections::HashSet::new()),
         staging_voice_grants: RwLock::new(std::collections::HashMap::new()),
         voice_pending_binds: RwLock::new(HashMap::new()),
-        voice_consumed_tokens: RwLock::new(HashMap::new()),
-        voice_ws_senders: RwLock::new(HashMap::new()),
         ws_key_senders: RwLock::new(HashMap::new()),
-        voice_udp_socket: Arc::new(RwLock::new(None)),
         rate_limiters: Default::default(),
         preview_cache: std::sync::Mutex::new(HashMap::new()),
         search: Arc::new(wavvon_hub::search::null_search::NullSearch),
@@ -122,35 +121,6 @@ async fn make_state() -> (Arc<AppState>, common::TestDbGuard) {
 async fn setup_server() -> common::TestHarness {
     let (state, guard) = make_state().await;
     common::TestHarness::new(TestServer::new(server::create_router(state)), guard)
-}
-
-/// Insert a user + session row so subsequent authenticated requests succeed.
-async fn seed_user_and_session(server: &TestServer, _pubkey: &str) -> String {
-    // We go through the real /auth/challenge + /auth/verify flow so
-    // the sessions FK constraint is satisfied.
-    let identity = Identity::generate();
-    let pk = identity.public_key_hex();
-
-    let ch = server
-        .post("/auth/challenge")
-        .json(&json!({ "public_key": pk }))
-        .await;
-    ch.assert_status_ok();
-    let challenge: serde_json::Value = ch.json();
-    let challenge_hex = challenge["challenge"].as_str().unwrap();
-    let sig = identity.sign(&hex::decode(challenge_hex).unwrap());
-
-    let v = server
-        .post("/auth/verify")
-        .json(&json!({
-            "public_key": pk,
-            "challenge": challenge_hex,
-            "signature": hex::encode(sig.to_bytes()),
-        }))
-        .await;
-    v.assert_status_ok();
-    let verify: serde_json::Value = v.json();
-    verify["token"].as_str().unwrap().to_string()
 }
 
 // ---------------------------------------------------------------------------

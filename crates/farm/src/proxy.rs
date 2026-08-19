@@ -29,25 +29,66 @@ use tokio::net::TcpStream;
 
 use crate::state::FarmState;
 
+/// Resolve an address segment to `(suspended_at, process_port)`.
+///
+/// A released slug does not resolve: that is the point of releasing it. The
+/// pubkey always does, which is what makes it the address of last resort — a
+/// client that has lost track of a hub's current name still has its key.
+async fn resolve_hub(state: &FarmState, segment: &str) -> Option<(Option<i64>, Option<i32>)> {
+    if crate::slug::looks_like_pubkey(segment) {
+        return sqlx::query_as(
+            "SELECT suspended_at, process_port FROM hubs
+             WHERE hub_pubkey = $1 AND deleted_at IS NULL",
+        )
+        .bind(segment)
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or(None);
+    }
+
+    // Slugs are stored lowercase, so an address typed with different capitals
+    // reaches the same hub instead of a stranger's.
+    let lowered = segment.to_ascii_lowercase();
+    let row: Option<(Option<i64>, Option<i32>)> = sqlx::query_as(
+        "SELECT h.suspended_at, h.process_port
+         FROM hub_slugs s JOIN hubs h ON h.id = s.hub_id
+         WHERE s.slug = $1 AND s.released_at IS NULL AND h.deleted_at IS NULL",
+    )
+    .bind(&lowered)
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
+
+    if row.is_some() {
+        // Best-effort usage stamp. This is the data that would let a future
+        // "prune slugs nobody follows any more" have a real criterion instead
+        // of a guess; nothing depends on it today, and a failed write must
+        // never cost a request.
+        let _ = sqlx::query("UPDATE hub_slugs SET last_resolved_at = $1 WHERE slug = $2")
+            .bind(crate::unix_now())
+            .bind(&lowered)
+            .execute(&state.db)
+            .await;
+    }
+    row
+}
+
 pub async fn proxy_handler(
     Path((serial, path)): Path<(String, String)>,
     State(state): State<Arc<FarmState>>,
     req: Request<Body>,
 ) -> Response<Body> {
-    // Look up the hub row by serial (hub_pubkey), not by the opaque `id` PK.
+    // The address segment is either the hub's pubkey or one of its slugs; the
+    // two key spaces cannot overlap (`slug::normalize` refuses anything
+    // shaped like a key), so one lookup function serves both. Deliberately
+    // not two route families — that mistake has already cost this repo a
+    // pair of ban endpoints that silently disagreed.
+    //
     // `suspended_at` is BIGINT, `process_port` is INTEGER — decoding both as
     // i64 (as a prior version of this query did) makes sqlx's runtime type
     // check reject every row with a non-null process_port, silently
     // degrading to a false "not found" via `unwrap_or(None)` below.
-    let row: Option<(Option<i64>, Option<i32>)> = sqlx::query_as(
-        "SELECT suspended_at, process_port FROM hubs WHERE hub_pubkey = $1 AND deleted_at IS NULL",
-    )
-    .bind(&serial)
-    .fetch_optional(&state.db)
-    .await
-    .unwrap_or(None);
-
-    let (suspended_at, process_port) = match row {
+    let (suspended_at, process_port) = match resolve_hub(&state, &serial).await {
         None => {
             return json_error(StatusCode::NOT_FOUND, "hub_not_found");
         }

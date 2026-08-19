@@ -36,13 +36,15 @@ async fn setup_with_search() -> (common::TestHarness, tempfile::TempDir) {
         federation_client: FederationClient::new(),
         peer_tokens: RwLock::new(HashMap::new()),
         voice_channels: RwLock::new(HashMap::new()),
-        voice_addr_map: RwLock::new(HashMap::new()),
+        voice_last_active: RwLock::new(HashMap::new()),
         whisper_target_pubkeys: RwLock::new(HashMap::new()),
         voice_sender_ids: RwLock::new(HashMap::new()),
         voice_next_sender_id: RwLock::new(HashMap::new()),
         voice_zones: RwLock::new(HashMap::new()),
         voice_udp_port: 0,
-        voice_udp_addr: None,
+        voice_wt_url: None,
+        canonical_url: Arc::new(RwLock::new(None)),
+        voice_cert_hash: RwLock::new(None),
         voice_event_tx,
         dm_tx: broadcast::channel(16).0,
         online_users: RwLock::new(std::collections::HashMap::new()),
@@ -55,15 +57,12 @@ async fn setup_with_search() -> (common::TestHarness, tempfile::TempDir) {
         last_farm_pubkey_fetch: Arc::new(tokio::sync::RwLock::new(0)),
         video_channels: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         started_at: std::time::Instant::now(),
-        whisper_targets: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         whisper_target_defs: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+        whisper_optouts: tokio::sync::RwLock::new(std::collections::HashSet::new()),
         voice_relay_active: tokio::sync::RwLock::new(std::collections::HashSet::new()),
         staging_voice_grants: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         voice_pending_binds: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-        voice_consumed_tokens: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-        voice_ws_senders: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         ws_key_senders: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-        voice_udp_socket: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
         rate_limiters: Default::default(),
         preview_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         search,
@@ -270,9 +269,9 @@ async fn search_respects_channel_ban() {
     // poster's token to insert as a shortcut — the ban row only needs to
     // exist for the search filter to take effect.
     server
-        .post(format!("/moderation/channels/{}/bans", channel.id).as_str())
+        .post(format!("/channels/{}/bans", channel.id).as_str())
         .authorization_bearer(&poster_token)
-        .json(&json!({ "target_public_key": watcher.public_key_hex(), "reason": "test" }))
+        .json(&json!({ "pubkey": watcher.public_key_hex(), "reason": "test" }))
         .await;
 
     // After the moderation call, confirm search still works for the poster.

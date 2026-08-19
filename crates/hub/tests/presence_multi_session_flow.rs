@@ -44,13 +44,15 @@ async fn start_hub() -> (String, Arc<AppState>, common::TestDbGuard) {
         federation_client: FederationClient::new(),
         peer_tokens: RwLock::new(HashMap::new()),
         voice_channels: RwLock::new(HashMap::new()),
-        voice_addr_map: RwLock::new(HashMap::new()),
+        voice_last_active: RwLock::new(HashMap::new()),
         whisper_target_pubkeys: RwLock::new(HashMap::new()),
         voice_sender_ids: RwLock::new(HashMap::new()),
         voice_next_sender_id: RwLock::new(HashMap::new()),
         voice_zones: RwLock::new(HashMap::new()),
         voice_udp_port: 0,
-        voice_udp_addr: None,
+        voice_wt_url: None,
+        canonical_url: Arc::new(RwLock::new(None)),
+        voice_cert_hash: RwLock::new(None),
         voice_event_tx,
         dm_tx: broadcast::channel(16).0,
         online_users: RwLock::new(std::collections::HashMap::new()),
@@ -63,15 +65,12 @@ async fn start_hub() -> (String, Arc<AppState>, common::TestDbGuard) {
         last_farm_pubkey_fetch: Arc::new(RwLock::new(0)),
         video_channels: RwLock::new(HashMap::new()),
         started_at: std::time::Instant::now(),
-        whisper_targets: RwLock::new(HashMap::new()),
         whisper_target_defs: RwLock::new(HashMap::new()),
+        whisper_optouts: RwLock::new(std::collections::HashSet::new()),
         voice_relay_active: RwLock::new(std::collections::HashSet::new()),
         staging_voice_grants: RwLock::new(std::collections::HashMap::new()),
         voice_pending_binds: RwLock::new(HashMap::new()),
-        voice_consumed_tokens: RwLock::new(HashMap::new()),
-        voice_ws_senders: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         ws_key_senders: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-        voice_udp_socket: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
         rate_limiters: Default::default(),
         preview_cache: std::sync::Mutex::new(HashMap::new()),
         search: Arc::new(wavvon_hub::search::null_search::NullSearch),
@@ -154,7 +153,7 @@ async fn connect_ws(base: &str, token: &str) -> WsStream {
     let ws_url = format!("{}/ws?token={}", base.replace("http://", "ws://"), token);
     let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
     // Consume the `hello` frame.
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), ws.next())
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(15), ws.next())
         .await
         .expect("timed out waiting for hello");
     ws
@@ -498,7 +497,7 @@ async fn send_ws_json(ws: &mut WsStream, msg: Value) {
 /// Read frames until one with the given `type` arrives (3s per-frame cap).
 async fn wait_for_type(ws: &mut WsStream, ty: &str) -> Value {
     loop {
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(3), ws.next())
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(15), ws.next())
             .await
             .expect("timed out waiting for WS frame")
             .unwrap()

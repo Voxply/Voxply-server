@@ -65,8 +65,9 @@ impl FarmState {
         &self,
         server_id: &str,
         hub_id: &str,
-        db_path: &str,
+        db_url: &str,
         port: u16,
+        voice_port: u16,
         owner_pubkey: Option<&str>,
     ) -> Result<(), ()> {
         let sender = {
@@ -77,11 +78,28 @@ impl FarmState {
         let cmd = serde_json::json!({
             "type": "restart_hub",
             "hub_id": hub_id,
-            "db_path": db_path,
+            "db_url": db_url,
             "port": port,
+            "voice_port": voice_port,
             "owner_pubkey": owner_pubkey,
             "farm_url": self.farm_url,
         });
         sender.try_send(cmd.to_string()).map_err(|_| ())
+    }
+
+    /// Return `existing` if set, else allocate a fresh voice port and persist
+    /// it. Backfills hubs created before `voice_port` existed (or agent-hosted
+    /// hubs whose `hub_spawned` confirmation predates this field).
+    pub async fn resolve_voice_port(&self, hub_id: &str, existing: Option<i32>) -> u16 {
+        if let Some(vp) = existing {
+            return vp as u16;
+        }
+        let vp = self.hub_manager.allocate_voice_port(&self.db).await;
+        let _ = sqlx::query("UPDATE hubs SET voice_port = $1 WHERE id = $2")
+            .bind(vp as i32)
+            .bind(hub_id)
+            .execute(&self.db)
+            .await;
+        vp
     }
 }

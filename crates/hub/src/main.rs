@@ -1,12 +1,10 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use sqlx::postgres::PgPoolOptions;
 use store::PostgresStore;
-use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, RwLock};
 use url::Url;
 use wavvon_hub::bots::token_expiry;
@@ -15,7 +13,7 @@ use wavvon_hub::db;
 use wavvon_hub::dm_worker;
 use wavvon_hub::federation::client::FederationClient;
 use wavvon_hub::server;
-use wavvon_hub::state::{AppState, ConsumedVoiceToken};
+use wavvon_hub::state::AppState;
 use wavvon_identity::Identity;
 use webauthn_rs::WebauthnBuilder;
 
@@ -27,8 +25,13 @@ fn print_help() {
     println!("SUBCOMMANDS:");
     println!("  setup            Interactive install wizard: generates docker-compose.yml + .env");
     println!("  migrate          Apply DB migrations and exit");
-    println!("  backup [FILE]    Write a backup archive (default: hub-backup-<ts>.tar.gz)");
-    println!("  restore FILE     Restore from a backup archive");
+    println!(
+        "  backup [FILE]    Back up database + identity + uploads \
+         (default: hub-backup-<ts>.tar.gz)"
+    );
+    println!("  restore FILE [--force]");
+    println!("                   Restore a backup archive. Refuses a non-empty");
+    println!("                   destination unless --force.");
     println!("  rotate-key       Generate a new hub keypair and sign a rotation payload");
     println!("  update [--check] Self-update binary from GitHub releases (Linux x86_64 only)");
     println!("  admin <cmd>      Admin CLI (stats|users|channels|tokens|backup|restore)\n");
@@ -256,7 +259,7 @@ async fn run_doctor() -> bool {
     let db_url = settings
         .database_url
         .clone()
-        .unwrap_or_else(|| "postgres://postgres:postgres@localhost:5432/wavvon".to_string());
+        .unwrap_or_else(|| wavvon_hub::settings::DEFAULT_DATABASE_URL.to_string());
     match PgPoolOptions::new()
         .max_connections(1)
         .connect(&db_url)
@@ -265,27 +268,33 @@ async fn run_doctor() -> bool {
         Ok(pool) => {
             match wavvon_hub::routes::invites::maybe_mint_first_boot_owner_invite(&pool).await {
                 Ok(Some(code)) => {
-                    let raw_host = settings
-                        .public_url
-                        .clone()
-                        .unwrap_or_else(|| format!("localhost:{}", settings.http_port));
+                    // Read the identity rather than create one: on a
+                    // farm-hosted hub the public URL contains its pubkey, and
+                    // doctor printing a localhost link for a hub that is
+                    // actually reachable at https://farm/hub/<key> would be
+                    // worse than useless. Absent (hub never started) → falls
+                    // back to whatever is configured.
+                    let pubkey = Identity::load(Path::new("hub_identity.json"))
+                        .ok()
+                        .map(|i| i.public_key_hex());
+                    let raw_host = wavvon_hub::settings::effective_public_url(
+                        settings.public_url.as_deref(),
+                        settings.farm_url.as_deref(),
+                        pubkey.as_deref(),
+                    )
+                    .unwrap_or_else(|| format!("localhost:{}", settings.http_port));
                     let host = raw_host
                         .trim_start_matches("https://")
                         .trim_start_matches("http://")
                         .trim_end_matches('/');
-                    match Identity::load(Path::new("hub_identity.json")) {
-                        Ok(identity) => {
-                            println!(
-                            "INFO  hub owner: none yet — first-boot invite wavvon://{host}/i/{}/{code}",
-                            identity.public_key_hex()
-                        );
-                        }
-                        Err(_) => {
-                            println!(
-                            "INFO  hub owner: none yet — first-boot invite https://{host}/join/{code}"
-                        );
-                        }
-                    }
+                    let scheme = if host.starts_with("localhost") || host.starts_with("127.") {
+                        "http"
+                    } else {
+                        "https"
+                    };
+                    println!(
+                        "INFO  hub owner: none yet — first-boot invite {scheme}://{host}/join/{code}"
+                    );
                 }
                 Ok(None) => {
                     println!("PASS  hub owner: already assigned");
@@ -385,15 +394,26 @@ async fn main() -> Result<()> {
         tracing_opentelemetry::layer().with_tracer(provider.tracer(env!("CARGO_PKG_NAME")))
     });
 
+    // Respect RUST_LOG; default to info. Without a filter the subscriber
+    // logs TRACE from every dependency (tokio_tungstenite polls, sqlx
+    // statements), which floods files/journald on any real deployment.
+    let env_filter = || {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+    };
     if json_logs {
         tracing_subscriber::registry()
             .with(otel_layer)
-            .with(tracing_subscriber::fmt::layer().json())
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_filter(env_filter()),
+            )
             .init();
     } else {
         tracing_subscriber::registry()
             .with(otel_layer)
-            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::fmt::layer().with_filter(env_filter()))
             .init();
     }
 
@@ -408,12 +428,14 @@ async fn main() -> Result<()> {
     // are handled above before settings are loaded.
     let subcommand = std::env::args().nth(1);
     if subcommand.as_deref() == Some("migrate") {
-        let db_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/wavvon".to_string());
+        let db_url = cli_database_url();
         let db = PgPoolOptions::new()
             .max_connections(1)
             .connect(&db_url)
             .await?;
+        db::version::ensure_supported(&db)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         db::migrations::run(&db).await?;
         println!("Migrations applied");
         return Ok(());
@@ -427,7 +449,7 @@ async fn main() -> Result<()> {
                 .as_secs();
             format!("hub-backup-{ts}.tar.gz")
         });
-        backup(&out_path)?;
+        backup(&out_path, &cli_database_url()).await?;
         println!("Backup written to {out_path}");
         return Ok(());
     }
@@ -435,8 +457,12 @@ async fn main() -> Result<()> {
     if subcommand.as_deref() == Some("restore") {
         let src = std::env::args()
             .nth(2)
-            .ok_or_else(|| anyhow::anyhow!("Usage: wavvon-hub restore <backup.tar.gz>"))?;
-        restore(&src)?;
+            .filter(|a| !a.starts_with("--"))
+            .ok_or_else(|| {
+                anyhow::anyhow!("Usage: wavvon-hub restore <backup.tar.gz> [--force]")
+            })?;
+        let force = std::env::args().any(|a| a == "--force");
+        restore(&src, &cli_database_url(), force).await?;
         println!("Restore complete. Restart the hub to apply.");
         return Ok(());
     }
@@ -460,8 +486,7 @@ async fn main() -> Result<()> {
 
     if subcommand.as_deref() == Some("admin") {
         let admin_cmd = std::env::args().nth(2).unwrap_or_default();
-        let db_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/wavvon".to_string());
+        let db_url = cli_database_url();
         let db = PgPoolOptions::new()
             .max_connections(1)
             .connect(&db_url)
@@ -648,14 +673,16 @@ async fn main() -> Result<()> {
                             .as_secs()
                     )
                 });
-                backup(&out)?;
+                backup(&out, &db_url).await?;
                 println!("Backup written to {out}");
             }
             "restore" => {
                 let src = std::env::args()
                     .nth(3)
-                    .context("Usage: admin restore <backup.tar.gz>")?;
-                restore(&src)?;
+                    .filter(|a| !a.starts_with("--"))
+                    .context("Usage: admin restore <backup.tar.gz> [--force]")?;
+                let force = std::env::args().any(|a| a == "--force");
+                restore(&src, &db_url, force).await?;
                 println!("Restore complete. Restart the hub.");
             }
             _ => {
@@ -669,6 +696,24 @@ async fn main() -> Result<()> {
     let voice_udp_port = settings.voice_udp_port;
 
     let (hub_identity, is_new) = Identity::load_or_create(Path::new("hub_identity.json"))?;
+
+    // Where we are reachable from outside. Resolved here, after the identity
+    // exists, because a farm-hosted hub derives it from its farm's URL plus
+    // its own pubkey — the farm cannot pass it at spawn, since the key in it
+    // is generated on this very line. Everything downstream that needs a
+    // public address reads this, not `settings.public_url`.
+    let public_url = wavvon_hub::settings::effective_public_url(
+        settings.public_url.as_deref(),
+        settings.farm_url.as_deref(),
+        Some(&hub_identity.public_key_hex()),
+    );
+    if public_url.is_none() {
+        tracing::warn!(
+            "No public URL: {} is unset and this hub is not farm-managed. Voice, \
+             invite links and passkeys all need one and will be unavailable.",
+            wavvon_hub_env::PUBLIC_URL,
+        );
+    }
 
     // ---- LAN mode resolution ----
     // Must run before the TLS banner below: LAN mode can supply its own
@@ -782,13 +827,20 @@ async fn main() -> Result<()> {
         );
     }
 
-    let db_url = settings
-        .database_url
-        .as_deref()
-        .unwrap_or("postgres://postgres:postgres@localhost:5432/wavvon");
+    let db_url = settings.database_url.as_deref().unwrap_or_else(|| {
+        // Provisional: an unset URL is going to mean "start the embedded
+        // PostgreSQL" (decisions.md). Until then, say which database we
+        // guessed rather than connecting to localhost silently.
+        eprintln!(
+            "WARN  {} is not set — using the built-in default {}",
+            wavvon_hub_env::DATABASE_URL,
+            wavvon_hub::settings::DEFAULT_DATABASE_URL,
+        );
+        wavvon_hub::settings::DEFAULT_DATABASE_URL
+    });
 
     let write_pool = PgPoolOptions::new()
-        .max_connections(5)
+        .max_connections(settings.db_max_connections)
         .connect(db_url)
         .await
         .expect("Failed to connect to database");
@@ -796,7 +848,7 @@ async fn main() -> Result<()> {
     let read_pool = if let Some(read_url) = settings.database_read_url.as_deref() {
         Some(
             PgPoolOptions::new()
-                .max_connections(5)
+                .max_connections(settings.db_max_connections)
                 .connect(read_url)
                 .await
                 .expect("Failed to connect to read-replica database"),
@@ -807,6 +859,14 @@ async fn main() -> Result<()> {
 
     let db = write_pool;
     let db_read = read_pool;
+
+    // Before migrations: a server below the floor otherwise fails partway
+    // through applying the schema, and the operator sees a CREATE TABLE
+    // syntax error instead of "your PostgreSQL is too old".
+    if let Err(e) = db::version::ensure_supported(&db).await {
+        eprintln!("FATAL {e}");
+        std::process::exit(1);
+    }
 
     db::migrations::run(&db).await?;
 
@@ -892,32 +952,31 @@ async fn main() -> Result<()> {
 
         // Fresh hubs default to invite_only=true (task #31), which would
         // otherwise leave no invite-free path for anyone to become owner.
-        // Mint (or reuse) the one-time owner-granting invite and print both
-        // link forms so the operator has a concrete way in. No-op once the
-        // hub already has a real user — see maybe_mint_first_boot_owner_invite.
+        // Mint (or reuse) the one-time owner-granting invite and print the
+        // plain /join link so the operator has a concrete way in. No-op once
+        // the hub already has a real user — see maybe_mint_first_boot_owner_invite.
         match wavvon_hub::routes::invites::maybe_mint_first_boot_owner_invite(&db).await {
             Ok(Some(code)) => {
                 // The /join link must be copy-pasteable: an explicit scheme in
                 // public_url wins; a bare public host is assumed TLS-fronted;
                 // the localhost fallback matches this process's own TLS state.
-                let join_scheme = match settings.public_url.as_deref() {
+                let join_scheme = match public_url.as_deref() {
                     Some(u) if u.starts_with("http://") => "http",
                     Some(_) => "https",
                     None => scheme,
                 };
-                let raw_host = settings
-                    .public_url
+                // `public_url` may carry a path (a farm-hosted hub lives under
+                // /hub/<pubkey>), so this is the whole base, not just a host —
+                // stripping the scheme and appending /join gives the right
+                // link either way.
+                let raw_host = public_url
                     .clone()
                     .unwrap_or_else(|| format!("localhost:{}", settings.http_port));
                 let host = raw_host
                     .trim_start_matches("https://")
                     .trim_start_matches("http://")
                     .trim_end_matches('/');
-                let serial = hub_identity.public_key_hex();
-                tracing::warn!(
-                    "First-boot owner invite: wavvon://{host}/i/{serial}/{code}  \
-                     (or {join_scheme}://{host}/join/{code})"
-                );
+                tracing::warn!("First-boot owner invite: {join_scheme}://{host}/join/{code}");
             }
             Ok(None) => {}
             Err((_, e)) => {
@@ -987,25 +1046,24 @@ async fn main() -> Result<()> {
 
     let store: Arc<dyn store::HubStore> = Arc::new(PostgresStore::new(db.clone()));
 
-    // Publicly-reachable host for the voice UDP relay: WAVVON_PUBLIC_URL's
-    // host wins (explicit operator override), falling back to the LAN-mode
-    // advertise address when set. No public host is known otherwise — the
-    // hub doesn't guess at its own internet-facing IP.
-    let voice_udp_host: Option<String> = settings
-        .public_url
+    // Publicly-reachable host for the voice WebTransport endpoint
+    // (voice-transport-v2.md). Voice is dialled directly, never through the
+    // farm's HTTP proxy — a datagram carries no path to route on — so only
+    // the *host* is taken here, and the port is this hub's own allocated one.
+    let voice_udp_host: Option<String> = public_url
         .as_deref()
         .and_then(|u| Url::parse(u).ok())
         .and_then(|parsed| parsed.host_str().map(|h| h.to_string()))
         .or_else(|| lan_advertise_ip.map(|ip| ip.to_string()));
-    let voice_udp_addr: Option<String> =
-        voice_udp_host.map(|host| format!("{host}:{voice_udp_port}"));
+    let voice_wt_url: Option<String> =
+        voice_udp_host.map(|host| format!("https://{host}:{voice_udp_port}/voice"));
 
     // ---- WebAuthn / passkey setup ----
     let rp_id: String = settings
         .webauthn_rp_id
         .clone()
         .or_else(|| {
-            settings.public_url.as_deref().and_then(|u| {
+            public_url.as_deref().and_then(|u| {
                 Url::parse(u)
                     .ok()
                     .and_then(|parsed| parsed.host_str().map(|h| h.to_string()))
@@ -1013,22 +1071,45 @@ async fn main() -> Result<()> {
         })
         .unwrap_or_else(|| "localhost".to_string());
 
-    let rp_origin: Url = settings
-        .public_url
+    // Origin only — scheme, host and port, never the path. WebAuthn compares
+    // the browser's origin, and a hub behind a farm (or any path-prefixing
+    // proxy) has a public URL with a path on the end; passing that whole URL
+    // would build a relying party nothing ever matches.
+    let rp_origin: Url = public_url
         .as_deref()
         .and_then(|u| Url::parse(u).ok())
+        .and_then(|parsed| Url::parse(&parsed.origin().ascii_serialization()).ok())
         .unwrap_or_else(|| {
             Url::parse(&format!("http://localhost:{}", settings.http_port)).unwrap()
         });
 
     let hub_display_name = "Wavvon Hub";
 
+    // A relying party the browser will refuse must not take the hub down with
+    // it. This used to `.expect()`, and the first farm-hosted hub to boot found
+    // out why that was wrong: a farm reached at an IP derives an rp_id of
+    // `127.0.0.1`, WebAuthn requires an effective *domain*, and the whole
+    // process died at startup. Losing passkeys on a hub that could never have
+    // offered them is the correct outcome; refusing to start is not — and on a
+    // farm it takes out a community per misconfigured address.
     let webauthn = Arc::new(
         WebauthnBuilder::new(&rp_id, &rp_origin)
-            .expect("Invalid WebAuthn rp_id/origin combination")
-            .rp_name(hub_display_name)
-            .build()
-            .expect("Failed to build Webauthn instance"),
+            .and_then(|b| b.rp_name(hub_display_name).build())
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    rp_id,
+                    rp_origin = %rp_origin,
+                    error = %e,
+                    "WebAuthn is unavailable on this hub: passkey registration and \
+                     sign-in will fail. A relying-party id must be a domain — an IP \
+                     address or a bare host cannot be one. Set WAVVON_WEBAUTHN_RP_ID, \
+                     or reach this hub by hostname."
+                );
+                let fallback = Url::parse("http://localhost").expect("static URL");
+                WebauthnBuilder::new("localhost", &fallback)
+                    .and_then(|b| b.rp_name(hub_display_name).build())
+                    .expect("the localhost relying party is always valid")
+            }),
     );
 
     let device_token_ttl_secs = (settings.device_token_ttl_days as i64) * 86400;
@@ -1052,11 +1133,16 @@ async fn main() -> Result<()> {
         peer_tokens: RwLock::new(HashMap::new()),
         http_client,
         voice_channels: RwLock::new(HashMap::new()),
-        voice_addr_map: RwLock::new(HashMap::new()),
+        voice_last_active: RwLock::new(HashMap::new()),
         voice_sender_ids: RwLock::new(HashMap::new()),
         voice_next_sender_id: RwLock::new(HashMap::new()),
         voice_udp_port,
-        voice_udp_addr,
+        voice_wt_url,
+        // Seeded with what we can work out ourselves; a farm-managed hub has
+        // this replaced by the farm's answer on the first heartbeat, which is
+        // also how a later rename reaches it.
+        canonical_url: Arc::new(RwLock::new(public_url.clone())),
+        voice_cert_hash: RwLock::new(None),
         voice_event_tx,
         dm_tx,
         online_users: RwLock::new(HashMap::new()),
@@ -1069,16 +1155,13 @@ async fn main() -> Result<()> {
         voice_zones: RwLock::new(HashMap::new()),
         video_channels: RwLock::new(HashMap::new()),
         started_at: std::time::Instant::now(),
-        whisper_targets: RwLock::new(HashMap::new()),
         whisper_target_defs: RwLock::new(HashMap::new()),
+        whisper_optouts: RwLock::new(std::collections::HashSet::new()),
         whisper_target_pubkeys: RwLock::new(HashMap::new()),
         voice_relay_active: RwLock::new(std::collections::HashSet::new()),
         staging_voice_grants: RwLock::new(HashMap::new()),
         voice_pending_binds: RwLock::new(HashMap::new()),
-        voice_consumed_tokens: RwLock::new(HashMap::new()),
-        voice_ws_senders: RwLock::new(HashMap::new()),
         ws_key_senders: RwLock::new(HashMap::new()),
-        voice_udp_socket: Arc::new(RwLock::new(None)),
         rate_limiters: Default::default(),
         preview_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         search,
@@ -1139,206 +1222,20 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Bind voice UDP socket and start forwarding task
-    let voice_socket = Arc::new(UdpSocket::bind(format!("0.0.0.0:{voice_udp_port}")).await?);
-    *state.voice_udp_socket.write().await = Some(voice_socket.clone());
-    tracing::info!("Voice UDP listening on port {voice_udp_port}");
-
-    let voice_state = state.clone();
-    tokio::spawn(async move {
-        // Register packet magic: b"VXRG" (4 bytes) followed by the 64 hex-char token.
-        // Total minimum length: 4 + 64 = 68 bytes.
-        // Cannot be confused with an audio packet: audio is raw Opus and never
-        // starts with the ASCII sequence 'V','X','R','G'.
-        const VXRG_MAGIC: &[u8] = b"VXRG";
-        const VXRG_TOKEN_LEN: usize = 64; // 32 bytes hex-encoded
-        const VXRG_MIN_LEN: usize = 4 + VXRG_TOKEN_LEN; // 68
-
-        // Ack packet sent back to a successfully registered source.
-        const VXRA: &[u8] = b"VXRA";
-
-        let mut buf = [0u8; 2048];
-        loop {
-            match voice_socket.recv_from(&mut buf).await {
-                Ok((len, from_addr)) => {
-                    let packet_data = &buf[..len];
-
-                    // ── VXRG register packet ──────────────────────────────────
-                    if len >= VXRG_MIN_LEN && &packet_data[..4] == VXRG_MAGIC {
-                        let token_bytes = &packet_data[4..4 + VXRG_TOKEN_LEN];
-                        let token = match std::str::from_utf8(token_bytes) {
-                            Ok(t) => t,
-                            Err(_) => continue, // not valid UTF-8 → drop
-                        };
-
-                        // Check consumed-token map first for idempotent re-ack.
-                        // If this source address is already bound (token was consumed
-                        // earlier), just ack again — the client may retry.
-                        {
-                            let already_bound = {
-                                let consumed = voice_state.voice_consumed_tokens.read().await;
-                                consumed.contains_key(&from_addr)
-                            };
-                            if already_bound {
-                                let _ = voice_socket.send_to(VXRA, from_addr).await;
-                                continue;
-                            }
-                        }
-
-                        // Look up the pending bind.
-                        let now = std::time::Instant::now();
-                        let bind_opt = {
-                            let mut binds = voice_state.voice_pending_binds.write().await;
-                            // Purge expired entries opportunistically.
-                            binds.retain(|_, v| v.expires_at > now);
-                            binds.remove(token)
-                        };
-
-                        let bind = match bind_opt {
-                            Some(b) if b.expires_at > now => b,
-                            _ => {
-                                // Unknown, expired, or already consumed from a
-                                // different address: drop silently (no reply).
-                                continue;
-                            }
-                        };
-
-                        // Bind the real source address.
-                        {
-                            let mut addr_map = voice_state.voice_addr_map.write().await;
-                            addr_map
-                                .insert(from_addr, (bind.channel_id.clone(), bind.pubkey.clone()));
-                        }
-                        // Update voice_channels to store the real address instead of the sentinel.
-                        {
-                            let mut channels = voice_state.voice_channels.write().await;
-                            if let Some(ch_map) = channels.get_mut(&bind.channel_id) {
-                                ch_map.insert(bind.pubkey.clone(), from_addr);
-                            }
-                        }
-                        // Record the consumed token so retries from the same address get re-acked.
-                        {
-                            let mut consumed = voice_state.voice_consumed_tokens.write().await;
-                            consumed.insert(
-                                from_addr,
-                                ConsumedVoiceToken {
-                                    bound_addr: from_addr,
-                                    channel_id: bind.channel_id.clone(),
-                                    pubkey: bind.pubkey.clone(),
-                                },
-                            );
-                        }
-
-                        tracing::debug!(
-                            "Voice VXRG: bound {} → channel {} pubkey {}",
-                            from_addr,
-                            &bind.channel_id[..8.min(bind.channel_id.len())],
-                            &bind.pubkey[..16.min(bind.pubkey.len())],
-                        );
-
-                        // Send ack.
-                        let _ = voice_socket.send_to(VXRA, from_addr).await;
-                        continue;
-                    }
-
-                    // ── Audio relay ───────────────────────────────────────────
-                    // O(1) lookup: which channel+peer owns this SocketAddr?
-                    let lookup = {
-                        let map = voice_state.voice_addr_map.read().await;
-                        map.get(&from_addr).cloned()
-                    };
-                    if let Some((channel_id, sender_pk)) = lookup {
-                        // Gate: drop the packet if this pubkey no longer has a
-                        // live WS-backed voice session.  This is the enforcement
-                        // point that ties UDP relay lifetime to WS session
-                        // lifetime — leave_voice() removes the entry, so a
-                        // packet arriving after WS disconnect is rejected here
-                        // before any fan-out work is done.
-                        {
-                            let active = voice_state.voice_relay_active.read().await;
-                            if !active.contains(&sender_pk) {
-                                continue;
-                            }
-                        }
-                        // Look up the sender's sender_id for this channel.
-                        let sender_id: u16 = {
-                            let sids = voice_state.voice_sender_ids.read().await;
-                            sids.get(&channel_id)
-                                .and_then(|m| m.get(&sender_pk))
-                                .copied()
-                                .unwrap_or(0)
-                        };
-                        let sender_id_bytes = sender_id.to_be_bytes();
-
-                        // Determine packet_type:
-                        //   0x01 = whisper (fan-out to resolved whisper target set only)
-                        //   0x00 = normal channel voice
-                        let packet_type: u8 = {
-                            let wt = voice_state.whisper_targets.read().await;
-                            if wt.contains_key(&sender_pk) {
-                                0x01u8
-                            } else {
-                                0x00u8
-                            }
-                        };
-
-                        // Build outbound: [sender_id: 2][packet_type: 1][original packet]
-                        let mut outbound = Vec::with_capacity(3 + packet_data.len());
-                        outbound.extend_from_slice(&sender_id_bytes);
-                        outbound.push(packet_type);
-                        outbound.extend_from_slice(packet_data);
-
-                        // Fan-out to UDP and WS participants.
-                        //
-                        // Hard invariant for UDP: only emit to addresses that have completed
-                        // an authenticated UDP bind (i.e. present in voice_addr_map).
-                        // The sentinel 0.0.0.0:0 is never in voice_addr_map, so
-                        // unregistered UDP participants are automatically excluded.
-                        // WS clients are identified by presence in voice_ws_senders.
-                        let sentinel: SocketAddr = "0.0.0.0:0".parse().unwrap();
-                        {
-                            let addr_map = voice_state.voice_addr_map.read().await;
-                            let channels = voice_state.voice_channels.read().await;
-                            let ws_senders = voice_state.voice_ws_senders.read().await;
-
-                            if packet_type == 0x01 {
-                                // Whisper: deliver to resolved target set only.
-                                // WS clients are not yet supported as whisper targets.
-                                let wt = voice_state.whisper_targets.read().await;
-                                if let Some(whisper_addrs) = wt.get(&sender_pk) {
-                                    for addr in whisper_addrs {
-                                        if addr_map.contains_key(addr) {
-                                            let _ = voice_socket.send_to(&outbound, *addr).await;
-                                        }
-                                    }
-                                }
-                            } else {
-                                // Normal: all channel participants except the sender.
-                                if let Some(participants) = channels.get(&channel_id) {
-                                    for (pk, addr) in participants {
-                                        if pk == &sender_pk {
-                                            continue;
-                                        }
-                                        if let Some(ws_tx) = ws_senders.get(pk.as_str()) {
-                                            let _ = ws_tx.send(outbound.clone());
-                                        } else if *addr != sentinel
-                                            && addr_map.contains_key(addr)
-                                            && *addr != from_addr
-                                        {
-                                            let _ = voice_socket.send_to(&outbound, *addr).await;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Voice UDP recv error: {e}");
-                }
-            }
-        }
-    });
+    // Start the WebTransport voice relay (voice-transport-v2.md). Uses the
+    // *raw* WAVVON_TLS_CERT/WAVVON_TLS_KEY, not `effective_tls_cert`/`_key`
+    // — a LAN-mode self-signed cert has no rotation story and isn't bounded
+    // to the 14-day validity `serverCertificateHashes` requires, so voice
+    // always manages its own identity independently of LAN mode.
+    let bound_voice_port = wavvon_hub::voice_wt::start(
+        state.clone(),
+        voice_udp_port,
+        settings.tls_cert.as_deref(),
+        settings.tls_key.as_deref(),
+    )
+    .await
+    .context("Failed to start voice WebTransport relay")?;
+    tracing::info!("Voice WebTransport listening on port {bound_voice_port}");
 
     // Retry undelivered federated DMs in the background.
     dm_worker::spawn(state.clone());
@@ -1351,6 +1248,9 @@ async fn main() -> Result<()> {
 
     // Sweep messages and forum posts past their channel retention deadline.
     wavvon_hub::retention_worker::spawn(state.clone());
+
+    // Auto-move idle voice participants into the configured AFK channel.
+    wavvon_hub::afk_worker::spawn(state.clone());
 
     // Sync federated ban lists from subscribed sources every 6 hours.
     wavvon_hub::banlist_worker::spawn(state.clone());
@@ -1371,26 +1271,71 @@ async fn main() -> Result<()> {
     if let Some(ref farm_url_for_hb) = state.farm_url {
         let hb_state = state.clone();
         let hb_url = farm_url_for_hb.clone();
+        // The farm allocated our row before this process existed, so it does
+        // not know our pubkey — it is generated on first boot. Reporting the
+        // id it gave us is how it binds the two. Without it the farm has a hub
+        // it can manage but cannot route to, because the proxy keys on
+        // `hubs.hub_pubkey`.
+        let hb_farm_hub_id = settings.farm_hub_id.clone();
+        if hb_farm_hub_id.is_none() {
+            tracing::warn!(
+                "{} is set but {} is not — the farm cannot bind this hub to its row, \
+                 so it will never be able to route traffic to us",
+                wavvon_hub_env::FARM_URL,
+                wavvon_hub_env::FARM_HUB_ID,
+            );
+        }
         tokio::spawn(async move {
+            // The first tick fires immediately, on purpose. This used to be
+            // skipped, which meant a freshly spawned hub said nothing for a
+            // full minute — and the first heartbeat is what claims its serial,
+            // so for that minute the farm had a hub it could not route to and
+            // its monitor had no evidence it was alive. Announce on boot, then
+            // every 60s.
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            interval.tick().await; // skip the immediate first tick
             loop {
                 interval.tick().await;
                 let online = hb_state.online_users.read().await.len() as u64;
                 let db_size = 0u64; // PostgreSQL: size reported separately by the DB server
                 let uptime = hb_state.started_at.elapsed().as_secs();
                 let payload = serde_json::json!({
+                    "hub_id": hb_farm_hub_id,
                     "hub_pubkey": hb_state.hub_identity.public_key_hex(),
                     "online_users": online,
                     "storage_bytes": db_size,
                     "uptime_seconds": uptime,
                 });
-                let _ = hb_state
+                // The reply carries the address the farm currently publishes
+                // for us. Adopting it here is what makes a rename propagate to
+                // every connected client within one interval, without a
+                // restart — clients re-read /info on connect and on
+                // hub_updated, and take the new URL from there.
+                if let Ok(resp) = hb_state
                     .http_client
                     .post(format!("{hb_url}/farm/heartbeat"))
                     .json(&payload)
                     .send()
-                    .await;
+                    .await
+                {
+                    if let Ok(body) = resp.json::<serde_json::Value>().await {
+                        if let Ok(siblings) =
+                            serde_json::from_value::<Vec<wavvon_hub::farm_siblings::Sibling>>(
+                                body.get("siblings")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null),
+                            )
+                        {
+                            wavvon_hub::farm_siblings::reconcile(&hb_state.db, &siblings).await;
+                        }
+                        if let Some(url) = body.get("canonical_url").and_then(|v| v.as_str()) {
+                            let mut current = hb_state.canonical_url.write().await;
+                            if current.as_deref() != Some(url) {
+                                tracing::info!(canonical_url = url, "Farm reports our address");
+                                *current = Some(url.to_string());
+                            }
+                        }
+                    }
+                }
             }
         });
     }
@@ -1566,21 +1511,95 @@ async fn run_self_update(check_only: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn backup(out_path: &str) -> anyhow::Result<()> {
+/// The database URL for CLI subcommands that run before `Settings` is loaded
+/// (`migrate`, `admin`).
+///
+/// These used to resolve it independently and disagreed: `migrate` read
+/// `WAVVON_DATABASE_URL` while `admin` read only the unprefixed
+/// `DATABASE_URL`, so `admin users set-owner` — the ownership bootstrap —
+/// silently hit the built-in default on any hub configured the documented
+/// way. `WAVVON_DATABASE_URL` is the documented variable (the one `Settings`
+/// resolves for the server path); the unprefixed name stays as a fallback.
+///
+/// Falling back to the built-in default is *announced*. These subcommands
+/// mutate ownership and schema, and "it said OK" against a database the
+/// operator did not mean is the failure this whole function exists to stop.
+fn cli_database_url() -> String {
+    std::env::var(wavvon_hub_env::DATABASE_URL)
+        .or_else(|_| std::env::var("DATABASE_URL"))
+        .unwrap_or_else(|_| {
+            eprintln!(
+                "WARN  {} is not set — using the built-in default {}. \
+                 Set it explicitly to be sure which database you are operating on.",
+                wavvon_hub_env::DATABASE_URL,
+                wavvon_hub::settings::DEFAULT_DATABASE_URL,
+            );
+            wavvon_hub::settings::DEFAULT_DATABASE_URL.to_string()
+        })
+}
+
+/// Everything a hub is, in one file: the database, the identity key, and the
+/// uploaded files.
+///
+/// It used to be the identity file and a metadata stub, with a comment saying
+/// to run `pg_dump` separately — so "take a backup first" in the upgrade docs
+/// pointed at a tool that did not take one. Uploads were missing too, which
+/// meant a restored hub came back with every attachment a broken link.
+///
+/// The Tantivy search index is deliberately absent: it is derived from the
+/// messages table and rebuilt by `POST /admin/search/reindex`, so carrying it
+/// would inflate every archive with data the hub can regenerate.
+async fn backup(out_path: &str, db_url: &str) -> anyhow::Result<()> {
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(db_url)
+        .await
+        .context("Cannot open the database to back it up")?;
+
+    let server_version_num = db::dump::server_version_num(&pool).await?;
+    // Whatever schema this hub actually lives in: `public` normally, or one of
+    // its own when a farm separates hubs by schema rather than by database.
+    // Recorded in the archive so a restore knows what it is holding.
+    let schema = db::dump::current_schema(&pool).await?;
+    let row_counts = db::dump::row_counts(&pool).await?;
+
+    // Dumped to a temp file first: the tar is written last, so a pg_dump that
+    // fails leaves no archive at all rather than a plausible-looking one that
+    // is missing the database.
+    let staging = tempfile::tempdir()?;
+    let dump_path = staging.path().join("database.dump");
+    println!("Dumping the database…");
+    db::dump::dump(db_url, &dump_path, &schema)?;
+
     let file = std::fs::File::create(out_path)?;
     let gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
     let mut tar = tar::Builder::new(gz);
-    // The database is PostgreSQL — back it up separately with pg_dump.
-    // This archive only captures the identity file.
+
+    tar.append_path_with_name(&dump_path, "database.dump")?;
+
     if std::path::Path::new("hub_identity.json").exists() {
         tar.append_path("hub_identity.json")?;
     }
+
+    let uploads = wavvon_hub::routes::uploads::uploads_dir();
+    let uploads_included = std::path::Path::new(&uploads).is_dir();
+    if uploads_included {
+        tar.append_dir_all("uploads", &uploads)?;
+    }
+
     let meta = serde_json::json!({
         "timestamp": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
         "wavvon_version": env!("CARGO_PKG_VERSION"),
+        // Read back at restore time to refuse a restore into an older major
+        // before anything is written.
+        "pg_server_version_num": server_version_num,
+        // Compared after the restore, so a partial one is reported as partial.
+        "row_counts": row_counts,
+        "schema": schema,
+        "uploads_included": uploads_included,
     });
     let meta_bytes = serde_json::to_vec_pretty(&meta)?;
     let mut header = tar::Header::new_gnu();
@@ -1589,20 +1608,114 @@ fn backup(out_path: &str) -> anyhow::Result<()> {
     header.set_cksum();
     tar.append_data(&mut header, "backup_meta.json", meta_bytes.as_slice())?;
     tar.finish()?;
+
+    let tables = row_counts.len();
+    let rows: i64 = row_counts.values().sum();
+    println!(
+        "Backed up {rows} rows across {tables} tables from PostgreSQL {}.{}.",
+        server_version_num / 10_000,
+        server_version_num % 10_000
+    );
+    if !uploads_included {
+        println!("No uploads directory at {uploads} — nothing to include.");
+    }
     Ok(())
 }
 
-fn restore(src_path: &str) -> anyhow::Result<()> {
-    let file = std::fs::File::open(src_path)?;
+/// Restore a backup archive over the configured database.
+///
+/// Refuses rather than half-writes, in this order: the destination must be
+/// empty, and its major must be at least the source's. `--force` waives only
+/// the emptiness check — the version rule is not the operator's to overrule,
+/// because past it `pg_restore` simply cannot parse the archive.
+async fn restore(src_path: &str, db_url: &str, force: bool) -> anyhow::Result<()> {
+    let file = std::fs::File::open(src_path)
+        .with_context(|| format!("Cannot open backup archive {src_path}"))?;
     let gz = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(gz);
     let staging = tempfile::tempdir()?;
-    archive.unpack(staging.path())?;
-    // The database is PostgreSQL — restore it separately with pg_restore/psql.
-    // This command only restores the identity file from the archive.
+    archive
+        .unpack(staging.path())
+        .context("Cannot unpack the backup archive")?;
+
+    let meta: serde_json::Value = std::fs::read(staging.path().join("backup_meta.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let dump_path = staging.path().join("database.dump");
+    if dump_path.exists() {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(db_url)
+            .await
+            .context("Cannot open the destination database")?;
+
+        // Direction first: it is the check that cannot be waived, so failing
+        // it should cost nothing.
+        if let Some(source) = meta["pg_server_version_num"].as_i64() {
+            let target = db::dump::server_version_num(&pool).await?;
+            db::dump::check_direction(source as i32, target)?;
+        }
+
+        if !db::dump::is_empty(&pool).await? && !force {
+            anyhow::bail!(
+                "the destination database already has tables. Restoring over them \
+                 would merge two hubs into one. Restore into an empty database, or \
+                 pass --force if you meant to write into this one."
+            );
+        }
+
+        println!("Restoring the database…");
+        db::dump::restore(db_url, &dump_path)?;
+
+        // The archive's counts are the contract: every table it carried must
+        // come back with the same number of rows.
+        if let Ok(expected) = serde_json::from_value::<std::collections::BTreeMap<String, i64>>(
+            meta["row_counts"].clone(),
+        ) {
+            let actual = db::dump::row_counts(&pool).await?;
+            db::dump::compare_row_counts(&expected, &actual)?;
+            let rows: i64 = expected.values().sum();
+            println!("Verified {rows} rows across {} tables.", expected.len());
+        }
+    } else {
+        println!(
+            "WARN  This archive has no database dump — it was written by a hub from \
+             when `backup` only captured the identity file. The database is NOT being \
+             restored."
+        );
+    }
+
     let src = staging.path().join("hub_identity.json");
     if src.exists() {
         std::fs::copy(&src, "hub_identity.json")?;
+        println!("Restored hub_identity.json.");
+    }
+
+    let uploads_src = staging.path().join("uploads");
+    if uploads_src.is_dir() {
+        let dest = wavvon_hub::routes::uploads::uploads_dir();
+        copy_dir_all(&uploads_src, std::path::Path::new(&dest))?;
+        println!("Restored uploads into {dest}.");
+    }
+
+    Ok(())
+}
+
+/// Recursive copy, merging into whatever is already there. Files present in
+/// the archive win; files only in the destination are left alone — a restore
+/// should not delete an attachment the archive simply predates.
+fn copy_dir_all(src: &std::path::Path, dest: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let to = dest.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&entry.path(), &to)?;
+        } else {
+            std::fs::copy(entry.path(), &to)?;
+        }
     }
     Ok(())
 }

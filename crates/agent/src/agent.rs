@@ -66,8 +66,15 @@ async fn handle_message(
         }
         "spawn_hub" => {
             let hub_id = msg.get("hub_id")?.as_str()?.to_string();
-            let db_path = msg.get("db_path")?.as_str()?.to_string();
+            let db_url = msg.get("db_url")?.as_str()?.to_string();
             let port = msg.get("port")?.as_u64()? as u16;
+            // Fall back to the default when an older farm doesn't send it —
+            // avoids a fatal bind collision if two hubs happen to spawn.
+            let voice_port = msg
+                .get("voice_port")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u16)
+                .unwrap_or(3001);
             let owner_pubkey = msg
                 .get("owner_pubkey")
                 .and_then(|v| v.as_str())
@@ -79,19 +86,25 @@ async fn handle_message(
 
             match manager.spawn_hub(
                 &hub_id,
-                &db_path,
+                &db_url,
                 port,
+                voice_port,
                 owner_pubkey.as_deref(),
                 farm_url.as_deref(),
             ).await {
-                Ok(()) => Some(serde_json::json!({"type": "hub_spawned", "hub_id": hub_id, "port": port}).to_string()),
+                Ok(()) => Some(serde_json::json!({"type": "hub_spawned", "hub_id": hub_id, "port": port, "voice_port": voice_port}).to_string()),
                 Err(e) => Some(serde_json::json!({"type": "error", "hub_id": hub_id, "code": "spawn_failed", "message": e.to_string()}).to_string()),
             }
         }
         "restart_hub" => {
             let hub_id = msg.get("hub_id")?.as_str()?.to_string();
-            let db_path = msg.get("db_path")?.as_str()?.to_string();
+            let db_url = msg.get("db_url")?.as_str()?.to_string();
             let port = msg.get("port")?.as_u64()? as u16;
+            let voice_port = msg
+                .get("voice_port")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u16)
+                .unwrap_or(3001);
             let owner_pubkey = msg
                 .get("owner_pubkey")
                 .and_then(|v| v.as_str())
@@ -104,14 +117,15 @@ async fn handle_message(
             match manager
                 .restart_hub(
                     &hub_id,
-                    &db_path,
+                    &db_url,
                     port,
+                    voice_port,
                     owner_pubkey.as_deref(),
                     farm_url.as_deref(),
                 )
                 .await
             {
-                Ok(()) => Some(serde_json::json!({"type": "hub_restarted", "hub_id": hub_id, "port": port}).to_string()),
+                Ok(()) => Some(serde_json::json!({"type": "hub_restarted", "hub_id": hub_id, "port": port, "voice_port": voice_port}).to_string()),
                 Err(e) => Some(serde_json::json!({"type": "error", "hub_id": hub_id, "code": "restart_failed", "message": e.to_string()}).to_string()),
             }
         }

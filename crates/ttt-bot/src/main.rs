@@ -339,7 +339,7 @@ async fn handle_ttt_command(
         return Some("Usage: /ttt @user".to_string());
     }
 
-    let opponent = resolve_opponent(ctx, channel_id, target).await;
+    let opponent = resolve_opponent(ctx, target).await;
     let opponent = match opponent {
         Some(p) if p == invoker => {
             return Some("You can't challenge yourself.".to_string());
@@ -396,15 +396,20 @@ fn public_url_from_token(_ctx: &Ctx) -> String {
     env_or("BOT_PUBLIC_URL", "http://127.0.0.1:8089")
 }
 
-/// Resolves `@display_name` (or a bare 64-hex pubkey) to a member of
-/// `channel_id`.
-async fn resolve_opponent(ctx: &Ctx, channel_id: &str, mention: &str) -> Option<String> {
+/// Resolves `@display_name` (or a bare 64-hex pubkey) to a hub member.
+///
+/// This used to read `/channels/{id}/members`, which ignored its channel_id
+/// and returned the hub roster anyway; that endpoint was deleted (2026-08-08)
+/// and this asks `/users` for the name directly, which is both what the old
+/// call actually did and one round-trip narrower.
+async fn resolve_opponent(ctx: &Ctx, mention: &str) -> Option<String> {
     if mention.len() == 64 && mention.chars().all(|c| c.is_ascii_hexdigit()) {
         return Some(mention.to_string());
     }
     let members: Vec<UserInfo> = ctx
         .http
-        .get(format!("{}/channels/{channel_id}/members", ctx.hub_url))
+        .get(format!("{}/users", ctx.hub_url))
+        .query(&[("q", mention)])
         .bearer_auth(&ctx.bot_token)
         .send()
         .await

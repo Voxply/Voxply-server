@@ -151,6 +151,13 @@ pub(in crate::routes::ws) async fn handle_set_status(
                             public_key: cs.public_key.clone(),
                             display_name,
                             is_bot,
+                            sender_id: state
+                                .voice_sender_ids
+                                .read()
+                                .await
+                                .get(&ch)
+                                .and_then(|m| m.get(&cs.public_key))
+                                .copied(),
                         },
                     },
                 ));

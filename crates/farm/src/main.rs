@@ -53,6 +53,10 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Computed early — before any partial move of `cfg`'s fields below makes
+    // a whole-struct method call on `cfg` impossible.
+    let voice_base_port = cfg.resolved_voice_base_port();
+
     let json_logs = cfg.log_format.to_lowercase() == "json";
 
     // Optional OpenTelemetry OTLP trace export.
@@ -86,15 +90,25 @@ async fn main() -> Result<()> {
         tracing_opentelemetry::layer().with_tracer(provider.tracer(env!("CARGO_PKG_NAME")))
     });
 
+    // Respect RUST_LOG; default to info (same fix as hub — an unfiltered
+    // subscriber logs TRACE from every dependency).
+    let env_filter = || {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+    };
     if json_logs {
         tracing_subscriber::registry()
             .with(otel_layer)
-            .with(tracing_subscriber::fmt::layer().json())
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_filter(env_filter()),
+            )
             .init();
     } else {
         tracing_subscriber::registry()
             .with(otel_layer)
-            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::fmt::layer().with_filter(env_filter()))
             .init();
     }
 
@@ -107,10 +121,9 @@ async fn main() -> Result<()> {
     // `wavvon-farm migrate` — run migrations and exit.
     let subcommand = std::env::args().nth(1);
     if subcommand.as_deref() == Some("migrate") {
-        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
         let db = PgPoolOptions::new()
             .max_connections(1)
-            .connect(&database_url)
+            .connect(&cfg.database_url)
             .await?;
         db::migrations::run(&db).await?;
         tracing::info!("Migrations applied to PostgreSQL database");
@@ -132,10 +145,9 @@ async fn main() -> Result<()> {
         tracing::info!("Loaded farm identity: {pubkey_hex}");
     }
 
-    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let db = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&database_url)
+        .max_connections(cfg.db_max_connections)
+        .connect(&cfg.database_url)
         .await?;
 
     db::migrations::run(&db).await?;
@@ -182,6 +194,12 @@ async fn main() -> Result<()> {
         hub_bin,
         farm_url.clone(),
         cfg.hub_base_port,
+        voice_base_port,
+        // Each hub's database is created on the same server the farm uses.
+        cfg.database_url.clone(),
+        // Each hub runs in its own directory under here, so they cannot share
+        // an identity file.
+        cfg.hubs_dir.clone(),
     ));
     hub_manager.spawn_all_from_db(&db).await?;
 

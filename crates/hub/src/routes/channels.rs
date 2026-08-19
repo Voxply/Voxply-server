@@ -271,8 +271,8 @@ pub async fn create_channel(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
 
     sqlx::query(
-        "INSERT INTO channels (id, name, created_by, parent_id, is_category, display_order, description, channel_type, created_at, banner_url, banner_file_id, spawner_name_template)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+        "INSERT INTO channels (id, name, created_by, parent_id, is_category, display_order, description, channel_type, created_at, banner_url, banner_file_id, spawner_name_template, nsfw)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
     )
     .bind(&id)
     .bind(&req.name)
@@ -286,6 +286,7 @@ pub async fn create_channel(
     .bind(&req.banner_url)
     .bind(&req.banner_file_id)
     .bind(&req.spawner_name_template)
+    .bind(req.nsfw)
     .execute(&state.db)
     .await
     .map_err(|e| {
@@ -315,6 +316,8 @@ pub async fn create_channel(
         owner_pubkey: None,
         spawner_name_template: req.spawner_name_template.clone(),
         event_id: None,
+        forum_require_tag: false,
+        nsfw: req.nsfw,
     };
 
     // Publish channel.created audit event.
@@ -369,11 +372,13 @@ pub async fn update_channel(
         || req.description.is_some()
         || req.parent_id.is_some()
         || req.banner_url.is_some()
-        || req.banner_file_id.is_some();
+        || req.banner_file_id.is_some()
+        || req.nsfw.is_some();
     let changing_appearance =
         req.icon.is_some() || req.color.is_some() || req.custom_icon_svg.is_some();
     let changing_talk_power = req.min_talk_power.is_some();
     let changing_retention = req.retention_days.is_some();
+    let changing_forum_require_tag = req.forum_require_tag.is_some();
 
     // Owner powers, v1: rename only (temp-voice-channels.md §3). A temp
     // channel's owner may change its name without MANAGE_CHANNELS, but any
@@ -384,7 +389,8 @@ pub async fn update_channel(
         && req.description.is_none()
         && req.parent_id.is_none()
         && req.banner_url.is_none()
-        && req.banner_file_id.is_none();
+        && req.banner_file_id.is_none()
+        && req.nsfw.is_none();
 
     if changing_structure && !owner_rename_only {
         perms.require(permissions::MANAGE_CHANNELS)?;
@@ -394,6 +400,15 @@ pub async fn update_channel(
     }
     if changing_talk_power || changing_retention {
         perms.require(permissions::ADMIN)?;
+    }
+    if changing_forum_require_tag {
+        if existing_type != "forum" {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "forum_require_tag is only valid for forum channels".to_string(),
+            ));
+        }
+        perms.require(permissions::MANAGE_POSTS)?;
     }
 
     if let Some(Some(parent_id)) = &req.parent_id {
@@ -500,7 +515,9 @@ pub async fn update_channel(
         || req.min_talk_power.is_some()
         || req.retention_days.is_some()
         || req.banner_url.is_some()
-        || req.banner_file_id.is_some();
+        || req.banner_file_id.is_some()
+        || req.forum_require_tag.is_some()
+        || req.nsfw.is_some();
 
     if needs_update {
         let mut qb = sqlx::QueryBuilder::new("UPDATE channels SET ");
@@ -546,6 +563,14 @@ pub async fn update_channel(
             sep.push("banner_file_id = ");
             sep.push_bind_unseparated(req.banner_file_id.as_deref());
             sep.push("banner_url = NULL");
+        }
+        if let Some(require_tag) = req.forum_require_tag {
+            sep.push("forum_require_tag = ");
+            sep.push_bind_unseparated(require_tag);
+        }
+        if let Some(nsfw) = req.nsfw {
+            sep.push("nsfw = ");
+            sep.push_bind_unseparated(nsfw);
         }
         qb.push(" WHERE id = ");
         qb.push_bind(&channel_id);
@@ -598,7 +623,7 @@ pub async fn list_channels(
     user: AuthUser,
 ) -> Result<Json<Vec<ChannelResponse>>, (StatusCode, String)> {
     let rows = sqlx::query_as::<_, ChannelRow>(
-        "SELECT id, name, created_by, parent_id, is_category, display_order, description, icon, color, custom_icon_svg, created_at, channel_type, banner_url, banner_file_id, is_temporary, owner_pubkey, spawner_name_template, event_id
+        "SELECT id, name, created_by, parent_id, is_category, display_order, description, icon, color, custom_icon_svg, created_at, channel_type, banner_url, banner_file_id, is_temporary, owner_pubkey, spawner_name_template, event_id, forum_require_tag, nsfw
          FROM channels
          ORDER BY display_order, created_at",
     )
@@ -639,6 +664,8 @@ pub async fn list_channels(
             owner_pubkey: r.owner_pubkey,
             spawner_name_template: r.spawner_name_template,
             event_id: r.event_id,
+            forum_require_tag: r.forum_require_tag,
+            nsfw: r.nsfw,
         })
         .collect();
 
@@ -787,6 +814,8 @@ struct ChannelRow {
     owner_pubkey: Option<String>,
     spawner_name_template: Option<String>,
     event_id: Option<String>,
+    forum_require_tag: bool,
+    nsfw: bool,
 }
 
 /// Returns the code-depth a new item would sit at if placed under `parent_id`

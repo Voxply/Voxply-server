@@ -18,7 +18,7 @@ pub struct VoiceJoinRequest {
 
 #[derive(Serialize)]
 pub struct VoiceJoinResponse {
-    pub voice_ws_url: String,
+    pub ws_url: String,
     pub channel_id: String,
 }
 
@@ -28,8 +28,11 @@ pub struct VoiceJoinResponse {
 /// authenticate as itself via `Authorization: Bearer <bot_token>` and the
 /// `{id}` path parameter must match its own public key.
 ///
-/// Returns the WebSocket URL the bot should connect to with its token as
-/// `?token=<bot_token>&channel_id=<channel_id>`.
+/// Returns the main hub WebSocket URL the bot should connect to with its
+/// token as `?token=<bot_token>`, then send a `voice_join` message for
+/// `channel_id` (voice-transport-v2.md: there is no dedicated voice
+/// WebSocket anymore — every voice participant, bot or human, joins the
+/// same way and gets a WebTransport session from the `voice_joined` reply).
 pub async fn bot_voice_join(
     Path(bot_id): Path<String>,
     State(state): State<Arc<AppState>>,
@@ -62,21 +65,25 @@ pub async fn bot_voice_join(
     // (`/admin/bots`, token-hash auth via `authenticate_bot`) and is
     // deliberately left ungated here, unchanged from its original M3
     // behavior. The `can_speak_voice` capability gate (soundboard.md §2)
-    // lives in `voice_ws_task` (`routes/voice_ws.rs`) instead, which is the
-    // actual connection/enforcement point and applies to the external-bot
-    // system (`is_bot=true` users authenticating via the normal Ed25519 +
-    // session-token flow, capabilities in `bot_profiles`) that the
-    // soundboard design doc's Part B targets. Self-service bots never
-    // populate `bot_profiles`, so gating this REST helper on that table
-    // would silently break the existing self-service voice-join flow for a
-    // system the capability model doesn't apply to.
+    // targets the external-bot system (`is_bot=true` users authenticating
+    // via the normal Ed25519 + session-token flow, capabilities in
+    // `bot_profiles`) -- self-service bots never populate `bot_profiles`, so
+    // gating this REST helper on that table would silently break the
+    // existing self-service voice-join flow for a system the capability
+    // model doesn't apply to.
+    //
+    // The `can_speak_voice` gate for external bots is enforced at
+    // `handle_voice_join` (`routes/ws/handlers/voice.rs`) — restored there
+    // per voice-transport-v2.md after the dedicated `/voice/ws` connection
+    // point (which used to enforce it) was deleted.
 
-    // Return the path the bot should connect to. The bot already knows the hub
-    // base URL; it connects to /voice/ws?token=<bot_token>&channel_id=<id>.
-    let voice_ws_url = "/voice/ws".to_string();
+    // Return the path the bot should connect to: the main hub WS. The bot
+    // already knows the hub base URL; it connects to /ws?token=<bot_token>
+    // and sends {"type":"voice_join","channel_id":<id>}.
+    let ws_url = "/ws".to_string();
 
     Ok(Json(VoiceJoinResponse {
-        voice_ws_url,
+        ws_url,
         channel_id: req.channel_id,
     }))
 }

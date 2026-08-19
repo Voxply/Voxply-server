@@ -75,7 +75,17 @@ pub async fn create_conversation(
     }
 
     let mut all_members = req.members.clone();
-    all_members.push(user.public_key);
+    all_members.push(user.public_key.clone());
+
+    // Announce the new conversation so already-connected members' WS
+    // connections learn the membership (their `my_conversations` set is a
+    // connect-time snapshot otherwise) and clients can show it live.
+    let _ = state.dm_tx.send(crate::state::DmEvent::MemberChanged {
+        conversation_id: id.clone(),
+        actor: user.public_key,
+        added: all_members.clone(),
+        removed: vec![],
+    });
 
     Ok((
         StatusCode::CREATED,

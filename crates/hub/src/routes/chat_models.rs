@@ -21,6 +21,10 @@ pub struct CreateChannelRequest {
     /// Defaults to `"{user}'s room"` when absent (see temp-voice-channels.md §2).
     #[serde(default)]
     pub spawner_name_template: Option<String>,
+    /// NSFW flag for this channel specifically (as opposed to the hub-wide
+    /// `nsfw` flag surfaced on `/info`). Defaults to false.
+    #[serde(default)]
+    pub nsfw: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -57,6 +61,15 @@ pub struct ChannelResponse {
     /// group them in the sidebar/staging panel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_id: Option<String>,
+    /// Forum-only (forum.md §10.1): when true, `POST`/`PATCH` on a post in
+    /// this channel must carry at least one `tag_id`. Always `false` on
+    /// non-forum channels.
+    #[serde(default)]
+    pub forum_require_tag: bool,
+    /// NSFW flag for this channel specifically (as opposed to the hub-wide
+    /// `nsfw` flag surfaced on `/info`).
+    #[serde(default)]
+    pub nsfw: bool,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -88,6 +101,15 @@ pub struct UpdateChannelRequest {
     pub banner_url: Option<String>,
     #[serde(default)]
     pub banner_file_id: Option<String>,
+    /// Forum-only "require at least one tag" toggle (forum.md §10.1). No
+    /// null-clear state needed -- the column is a plain `NOT NULL BOOLEAN`,
+    /// so absent = unchanged, `Some(bool)` = set.
+    #[serde(default)]
+    pub forum_require_tag: Option<bool>,
+    /// Per-channel NSFW toggle. No null-clear state needed -- the column is
+    /// a plain `NOT NULL BOOLEAN`, so absent = unchanged, `Some(bool)` = set.
+    #[serde(default)]
+    pub nsfw: Option<bool>,
 }
 
 /// Lets us distinguish "field missing" from "field explicitly null" in JSON.
@@ -303,6 +325,10 @@ pub enum ChatEvent {
     /// Returns "" from channel_id() so the subscription filter never matches; the WS
     /// dispatch loop handles it as a special broadcast-to-all case.
     ChannelsUpdated,
+    /// Hub-wide notification that hub branding/settings changed (PATCH /hub).
+    /// Payload-free — clients just refetch /info. Same broadcast-to-all handling
+    /// as `ChannelsUpdated`.
+    HubUpdated,
     /// A user's first WS session connected; delivered hub-wide.
     MemberOnline { public_key: String },
     /// A user's last WS session disconnected; delivered hub-wide.
@@ -352,10 +378,11 @@ impl ChatEvent {
             ChatEvent::StreamSubscriptionEnded {
                 source_channel_id, ..
             } => source_channel_id,
-            // ChannelsUpdated, MemberOnline, MemberOffline, WebhookDisabled are
-            // hub-wide; "" is never in any subscription set — handled as
-            // special broadcast-to-all cases.
+            // ChannelsUpdated, HubUpdated, MemberOnline, MemberOffline,
+            // WebhookDisabled are hub-wide; "" is never in any subscription
+            // set — handled as special broadcast-to-all cases.
             ChatEvent::ChannelsUpdated
+            | ChatEvent::HubUpdated
             | ChatEvent::MemberOnline { .. }
             | ChatEvent::MemberOffline { .. }
             | ChatEvent::MemberUpdated { .. }
@@ -391,7 +418,7 @@ pub enum WsClientMessage {
     #[serde(rename = "unsubscribe")]
     Unsubscribe { channel_id: String },
     #[serde(rename = "voice_join")]
-    VoiceJoin { channel_id: String, udp_port: u16 },
+    VoiceJoin { channel_id: String },
     #[serde(rename = "voice_watch")]
     VoiceWatch { channel_id: String },
     #[serde(rename = "voice_unwatch")]
@@ -540,6 +567,11 @@ pub enum WsClientMessage {
     #[serde(rename = "voice_whisper_stop")]
     VoiceWhisperStop,
 
+    /// Sender opts in or out of RECEIVING whispers (whisper.md). Does not
+    /// affect the sender's ability to start whispers of their own.
+    #[serde(rename = "voice_whisper_optout")]
+    VoiceWhisperOptout { enabled: bool },
+
     /// Request that the hub ask `target_pubkey` to leave-and-join
     /// `target_channel_id` (events.md §7.1). `event_id` is present when the
     /// move is driven by a staging panel (Phase 2); absent for the generic
@@ -672,12 +704,24 @@ pub enum WsServerMessage {
     #[serde(rename = "voice_joined")]
     VoiceJoined {
         channel_id: String,
-        hub_udp_port: u16,
+        /// The joiner's own numeric relay id in this channel (also present
+        /// in their `participants` entry; duplicated top-level so clients
+        /// don't have to self-locate by pubkey).
+        sender_id: u16,
         participants: Vec<VoiceParticipantInfo>,
-        /// Single-use token the client sends in a UDP VXRG register packet so
-        /// the hub can learn the client's real public source address.  Delivered
-        /// confidentially over the authenticated TLS WebSocket; 30-second TTL.
-        udp_register_token: String,
+        /// Single-use token the client presents when opening its WebTransport
+        /// session (`voice_wt_url?token=<hex>`) so the hub can bind the
+        /// session to (channel_id, pubkey). Delivered confidentially over
+        /// the authenticated TLS WebSocket; 30-second TTL.
+        voice_token: String,
+        /// Absolute `https://host:port/voice` URL for this hub's WebTransport
+        /// voice endpoint (voice-transport-v2.md). Built from the same
+        /// advertise host as the old `voice_udp_addr`.
+        voice_wt_url: String,
+        /// Hex SHA-256 digest of the WT endpoint's current certificate, for
+        /// `WebTransportOptions.serverCertificateHashes` (self-signed tier).
+        /// `None` when a CA-issued cert is in use.
+        voice_cert_hash: Option<String>,
     },
     #[serde(rename = "voice_participant_joined")]
     VoiceParticipantJoined {
@@ -949,6 +993,10 @@ pub enum WsServerMessage {
     #[serde(rename = "channels_updated")]
     ChannelsUpdated,
 
+    /// Hub-wide signal that hub branding/settings changed; clients should re-fetch /info.
+    #[serde(rename = "hub_updated")]
+    HubUpdated,
+
     /// Soundboard clip-played attribution (soundboard.md §1). Purely
     /// informational -- the server does not verify the clip was actually
     /// mixed into the sender's stream; clients render a transient
@@ -977,11 +1025,15 @@ pub enum WsServerMessage {
     MemberOffline { public_key: String },
     /// A user changed their display name and/or avatar. Carries the fresh
     /// values so clients update in place without re-fetching /users.
+    /// `name_color` is the server-resolved nickname color (member name
+    /// colors feature) at the time of the push.
     #[serde(rename = "member_updated")]
     MemberUpdated {
         public_key: String,
         display_name: Option<String>,
         avatar: Option<String>,
+        #[serde(default)]
+        name_color: Option<String>,
     },
     /// A user changed their presence status. `status` is None for plain
     /// online (away/dnd otherwise); `custom` is optional short status text.
@@ -1083,6 +1135,12 @@ pub struct VoiceParticipantInfo {
     pub display_name: Option<String>,
     #[serde(default)]
     pub is_bot: bool,
+    /// Numeric relay id for this participant in the channel — the id
+    /// carried in every downlink datagram header. Clients seed their
+    /// sender_id→pubkey map from `voice_joined.participants`, so this
+    /// must be present there (voice-transport-v2.md).
+    #[serde(default)]
+    pub sender_id: Option<u16>,
 }
 
 #[derive(Serialize, Clone)]

@@ -13,9 +13,30 @@ use std::sync::Arc;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
-fn base_db_url() -> String {
+/// The PostgreSQL server the suite runs against.
+///
+/// Public because a farm harness has to hand it to `HubManager`: creating a
+/// hub now provisions that hub its own database, and refuses the creation if
+/// it cannot — starting a hub on the shared default is the bug per-hub
+/// databases replaced, so there is no "skip it in tests" path that still
+/// exercises the real code.
+pub fn base_db_url() -> String {
     std::env::var("TEST_DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432".to_string())
+}
+
+/// The database a hub `db_url` names, when the name is one this harness is
+/// allowed to drop. Schema-isolated hubs share the farm database and so name
+/// it instead — that one is dropped by name anyway, and `IF EXISTS` makes the
+/// second attempt a no-op.
+fn hub_db_name(db_url: &str) -> Option<String> {
+    let name = db_url
+        .rsplit('/')
+        .next()?
+        .split(['?', '#'])
+        .next()?
+        .to_string();
+    name.starts_with("wavvon_hub_").then_some(name)
 }
 
 struct TestDbGuardInner {
@@ -33,15 +54,56 @@ impl Drop for TestDbGuardInner {
                 .enable_all()
                 .build()?;
             rt.block_on(async move {
+                // Hub databases provisioned during the test (db/provision.rs
+                // creates one per created hub). They are not children of the
+                // farm database and nothing else would ever remove them, so
+                // they would pile up on the test server exactly the way the
+                // per-test farm databases used to.
+                //
+                // Read which ones are ours *before* dropping the farm database
+                // that records them. This used to be a
+                // `LIKE 'wavvon_hub_%'` sweep of the whole server, which meant
+                // every finishing test force-dropped the hub databases of every
+                // test still running — the sibling lost its database mid-request
+                // and answered 500, so `farm_hub_e2e` failed whenever two tests
+                // overlapped in the wrong order. A developer running the suite
+                // against a Postgres that also hosts real farm-managed hubs lost
+                // those too: the names match.
                 let admin_pool = PgPoolOptions::new()
                     .max_connections(1)
                     .connect(&format!("{base_url}/postgres"))
                     .await?;
+
+                let ours: Vec<String> = match PgPoolOptions::new()
+                    .max_connections(1)
+                    .connect(&format!("{base_url}/{db_name}"))
+                    .await
+                {
+                    Ok(farm_pool) => {
+                        let urls: Vec<String> =
+                            sqlx::query_scalar("SELECT db_url FROM hubs WHERE db_url IS NOT NULL")
+                                .fetch_all(&farm_pool)
+                                .await
+                                .unwrap_or_default();
+                        farm_pool.close().await;
+                        urls.iter().filter_map(|u| hub_db_name(u)).collect()
+                    }
+                    // No farm database, or no schema in it: nothing to collect.
+                    Err(_) => Vec::new(),
+                };
+
                 sqlx::query(&format!(
                     "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
                 ))
                 .execute(&admin_pool)
                 .await?;
+
+                for name in ours {
+                    let _ =
+                        sqlx::query(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
+                            .execute(&admin_pool)
+                            .await;
+                }
                 Ok::<(), sqlx::Error>(())
             })
         })

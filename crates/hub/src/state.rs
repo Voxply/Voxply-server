@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -169,26 +168,15 @@ pub struct WhisperTargetDef {
     pub id: String,
 }
 
-/// A pending UDP address-bind for a voice participant.
+/// A pending WebTransport session-bind for a voice participant.
 ///
-/// Minted at `VoiceJoin` and consumed when the client sends a matching
-/// UDP register packet (VXRG) to the hub's voice port.  The token is
-/// single-use and expires after `expires_at`.
+/// Minted at `VoiceJoin` and consumed, single-use, when the client opens a
+/// WT session against `voice_wt_url` presenting the matching token
+/// (voice-transport-v2.md). Expires after `expires_at`.
 pub struct PendingVoiceBind {
     pub channel_id: String,
     pub pubkey: String,
     pub expires_at: Instant,
-}
-
-/// The source address and pubkey recorded after a token is consumed.
-///
-/// Stored so that an identical VXRG re-sent from the **same** address is
-/// answered with another ack (idempotent retry), while a VXRG from a
-/// **different** address is silently dropped.
-pub struct ConsumedVoiceToken {
-    pub bound_addr: SocketAddr,
-    pub channel_id: String,
-    pub pubkey: String,
 }
 
 /// Circuit breaker state for the auto-moderation webhook (ME2).
@@ -272,24 +260,36 @@ pub struct AppState {
     /// Plain HTTP client for outbound requests that don't go through the
     /// federation protocol (e.g. sending push invites to foreign hubs).
     pub http_client: reqwest::Client,
-    // Voice: channel_id → {public_key → udp_addr}
-    pub voice_channels: RwLock<HashMap<String, HashMap<String, SocketAddr>>>,
-    /// Reverse index: SocketAddr → (channel_id, public_key).
-    /// Kept in sync with voice_channels by VoiceJoin/VoiceLeave handlers in ws.rs.
-    pub voice_addr_map: RwLock<HashMap<SocketAddr, (String, String)>>,
+    // Voice (voice-transport-v2.md): channel_id → {public_key → WT session}.
+    // `None` means the pubkey has joined voice over WS but hasn't (yet, or
+    // no longer) bound a live WebTransport datagram session — mirrors the
+    // old sentinel-address membership marker, minus the sentinel.
+    pub voice_channels: RwLock<HashMap<String, HashMap<String, Option<wtransport::Connection>>>>,
     /// sender_id assignment: channel_id → { pubkey → sender_id }
     pub voice_sender_ids: RwLock<HashMap<String, HashMap<String, u16>>>,
     /// Next available sender_id counter per channel
     pub voice_next_sender_id: RwLock<HashMap<String, u16>>,
     pub voice_udp_port: u16,
-    /// Publicly-reachable `host:port` for this hub's voice UDP relay, or
-    /// `None` when no public host is known (no `WAVVON_PUBLIC_URL` and not
-    /// in LAN mode). Derived once at startup from (in priority order)
-    /// `WAVVON_PUBLIC_URL`'s host, then the LAN-mode advertise address, both
-    /// paired with `voice_udp_port`. Surfaced on `/info` so a farm-routed
-    /// client (or any client) can dial voice directly without guessing the
-    /// hub's public address — see "UDP voice" in farm-impl.md.
-    pub voice_udp_addr: Option<String>,
+    /// Absolute `https://host:port/voice` URL for this hub's WebTransport
+    /// voice endpoint, or `None` when no public host is known (no
+    /// `WAVVON_PUBLIC_URL` and not in LAN mode). Derived once at startup
+    /// from (in priority order) `WAVVON_PUBLIC_URL`'s host, then the
+    /// LAN-mode advertise address, both paired with `voice_udp_port`.
+    /// Surfaced on `/info` and in `voice_joined` — see voice-transport-v2.md.
+    pub voice_wt_url: Option<String>,
+    /// The address clients should store for this hub, published on `/info`.
+    ///
+    /// Starts as the locally-derived public URL and is replaced by whatever
+    /// the farm reports in its heartbeat response — that is how a hub learns
+    /// it has been given a new name, without a restart. `RwLock` because the
+    /// heartbeat task writes it while request handlers read it.
+    pub canonical_url: Arc<RwLock<Option<String>>>,
+    /// Hex SHA-256 digest of the WT endpoint's current self-signed
+    /// certificate. `None` when a CA-issued cert (`WAVVON_TLS_CERT`/`_KEY`)
+    /// is in use, or before the cert has been generated. Rotates in place
+    /// (see `voice_wt::spawn_cert_rotation`) — always read fresh, never cached
+    /// by callers.
+    pub voice_cert_hash: RwLock<Option<String>>,
     pub voice_event_tx: broadcast::Sender<(String, WsServerMessage)>,
     // DM relay: broadcast DMs to all WS clients (they filter by conversation membership)
     pub dm_tx: broadcast::Sender<DmEvent>,
@@ -340,25 +340,40 @@ pub struct AppState {
     /// Used to rate-limit re-fetch to at most once per 60s.
     pub last_farm_pubkey_fetch: Arc<RwLock<i64>>,
 
-    /// Active whisper sessions: sender_pubkey → set of target SocketAddrs.
-    /// When a sender has an entry here the UDP relay routes their frames
-    /// exclusively to this set with packet_type = 0x01.
-    pub whisper_targets: RwLock<HashMap<String, HashSet<SocketAddr>>>,
     /// Original target descriptors for re-resolution on any VoiceJoin/Leave.
     pub whisper_target_defs: RwLock<HashMap<String, Vec<WhisperTargetDef>>>,
-    /// Pubkey-based whisper targets: sender_pubkey → set of target pubkeys.
-    /// Parallel to `whisper_targets` (which is UDP-addr-based). The WS voice
-    /// relay (`voice_ws.rs`) routes a whispering sender's frames exclusively
-    /// to these pubkeys with packet_type = 0x01, so whisper works for web
-    /// clients (which have no stable UDP addr).
+    /// Whisper targets: sender_pubkey → set of target pubkeys. Since every
+    /// voice participant (desktop and web alike) is a WT session keyed by
+    /// pubkey (voice-transport-v2.md), this one pubkey-keyed set is enough —
+    /// there is no separate SocketAddr-based target set to keep in sync.
+    /// The WT receive loop (`voice_wt.rs`) routes a whispering sender's
+    /// datagrams exclusively to this set with packet_type = 0x01.
     pub whisper_target_pubkeys: RwLock<HashMap<String, HashSet<String>>>,
 
-    /// Pubkeys that currently own a live UDP relay slot.
+    /// pubkey → unix timestamp of last voice activity (join or a
+    /// `voice_speaking` message). Drives the AFK sweep in `afk_worker`:
+    /// a participant whose stamp is older than the hub's `afk_timeout_secs`
+    /// gets a `voice_move` push into the configured AFK channel.
+    ///
+    /// Ephemeral, in-memory only. Stamped on `VoiceJoin` and on every
+    /// `VoiceSpeaking` message; removed by `leave_voice`.
+    pub voice_last_active: RwLock<HashMap<String, i64>>,
+
+    /// Pubkeys that have opted out of RECEIVING whispers (whisper.md).
+    /// Ephemeral, in-memory only -- resets on hub restart. Consulted at the
+    /// top of every whisper-target resolution function (`resolve_whisper_targets`,
+    /// `resolve_role_addrs`, `resolve_whisper_target_pubkeys` in
+    /// `routes/ws/voice.rs`) so an opted-out pubkey is filtered out of every
+    /// target set. Opting out only affects receiving -- an opted-out user can
+    /// still start a whisper of their own.
+    pub whisper_optouts: RwLock<HashSet<String>>,
+
+    /// Pubkeys that currently own a live voice relay slot.
     ///
     /// Inserted on `VoiceJoin`; removed on `leave_voice` (called on WS
-    /// disconnect and on explicit `VoiceLeave`).  The UDP receive loop checks
-    /// this set before forwarding a packet so that stale source addresses from
-    /// a session whose WS connection closed cannot relay traffic.
+    /// disconnect and on explicit `VoiceLeave`).  The WT receive loop checks
+    /// this set before forwarding a datagram so that a session whose WS
+    /// connection closed cannot keep relaying traffic.
     ///
     /// O(1) read under a shared lock — intentionally kept as a plain
     /// `RwLock<HashSet>` to avoid adding a new crate dependency.
@@ -377,37 +392,21 @@ pub struct AppState {
     /// event read-gating all stay strict per the decisions.md entry.
     pub staging_voice_grants: RwLock<HashMap<String, HashSet<String>>>,
 
-    /// Pending UDP address-binds waiting for the client's VXRG register packet.
+    /// Pending WebTransport session-binds waiting for the client to open its
+    /// `voice_wt_url?token=<hex>` session (voice-transport-v2.md).
     ///
     /// Key is the hex register token (64 chars, 32 random bytes).
-    /// Entries are inserted at `VoiceJoin` and consumed on the first valid
-    /// VXRG packet.  Expired entries are purged opportunistically on each
-    /// new mint and on each register attempt.
+    /// Entries are inserted at `VoiceJoin` and consumed, single-use, on the
+    /// first WT session request presenting a matching token.  Expired
+    /// entries are purged opportunistically on each new mint and on each
+    /// session-accept attempt.
     pub voice_pending_binds: RwLock<HashMap<String, PendingVoiceBind>>,
-
-    /// Consumed register tokens, keyed by the bound SocketAddr.
-    ///
-    /// Allows the relay to answer a VXRG retry from the **same** source
-    /// with another ack without re-binding, while silently dropping a
-    /// VXRG from a **different** source for the same (now-consumed) token.
-    /// Also keyed by pubkey so cleanup on leave is O(1).
-    ///
-    /// Outer key: bound SocketAddr.  Inner value: ConsumedVoiceToken.
-    pub voice_consumed_tokens: RwLock<HashMap<SocketAddr, ConsumedVoiceToken>>,
-
-    /// WS voice clients (web browsers): pubkey → sender for forwarding
-    /// serialised ReceivedVoicePacket bytes. These clients bypass UDP.
-    pub voice_ws_senders: RwLock<HashMap<String, tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>,
 
     /// Per-user WS sender for targeted voice key distribution messages (V4).
     /// Registered on WS connect, deregistered on disconnect.
     /// Key: user public key hex.
     pub ws_key_senders:
         RwLock<HashMap<String, tokio::sync::mpsc::UnboundedSender<WsServerMessage>>>,
-
-    /// The hub's UDP voice socket, shared so the voice_ws handler can
-    /// fan out WS-originated frames to UDP participants.
-    pub voice_udp_socket: Arc<RwLock<Option<Arc<tokio::net::UdpSocket>>>>,
 
     /// Grouped rate limiters (auth per-IP, messages per-user).
     pub rate_limiters: RateLimiters,

@@ -15,9 +15,10 @@ use ed25519_dalek::{Signer, SigningKey};
 use sha2::{Digest, Sha512};
 use wavvon_identity::{
     dm_envelope_signing_bytes, group_dm_envelope_signing_bytes, recovery_attestation_signing_bytes,
-    recovery_request_signing_bytes, sender_key_dist_signing_bytes, unwrap_blob_key, wrap_blob_key,
-    DhKeyRecord, HomeHubList, PairingClaim, PairingComplete, PairingOffer, PairingStatus,
-    RevocationEntry, SignedPrefsBlob, SubkeyCert,
+    recovery_request_signing_bytes, sender_key_dist_signing_bytes, unwrap_blob_key,
+    voice_key_unwrap, voice_key_wrap_with_nonce, voice_packet_open, voice_packet_seal,
+    wrap_blob_key, DhKeyRecord, HomeHubList, PairingClaim, PairingComplete, PairingOffer,
+    PairingStatus, RevocationEntry, SignedPrefsBlob, SubkeyCert,
 };
 
 const TS: u64 = 1_700_000_000;
@@ -169,6 +170,202 @@ const RECOVERY_ATTESTATION_SIG: &str =
 
 fn new_pub() -> String {
     hex_pubkey(&new_key_signing_key())
+}
+
+// ---------------------------------------------------------------------------
+// Voice-transport v2 key-wrap / packet-seal vectors (voice-transport-v2.md
+// §"E2E key distribution" / §"Datagram wire format"). Fixed seeds continue
+// the incrementing pattern (master 0x01..0x20, subkey 0x21..0x40, new-key
+// 0x41..0x60): voice sender 0x61..0x80, voice recipient 0x81..0xa0.
+// ---------------------------------------------------------------------------
+
+fn voice_sender_seed() -> [u8; 32] {
+    let mut seed = [0u8; 32];
+    for (i, b) in seed.iter_mut().enumerate() {
+        *b = (i + 0x61) as u8;
+    }
+    seed
+}
+
+fn voice_recipient_seed() -> [u8; 32] {
+    let mut seed = [0u8; 32];
+    for (i, b) in seed.iter_mut().enumerate() {
+        *b = (i + 0x81) as u8;
+    }
+    seed
+}
+
+/// Same ed25519→x25519 derivation as `master_dh_pub_hex` above, applied to
+/// an arbitrary fixed seed.
+fn x25519_pub_from_seed(seed: &[u8; 32]) -> [u8; 32] {
+    let hash = Sha512::digest(seed);
+    let mut scalar = [0u8; 32];
+    scalar.copy_from_slice(&hash[..32]);
+    scalar[0] &= 248;
+    scalar[31] &= 127;
+    scalar[31] |= 64;
+    let secret = x25519_dalek::StaticSecret::from(scalar);
+    *x25519_dalek::PublicKey::from(&secret).as_bytes()
+}
+
+const VOICE_CHANNEL_ID: &str = "chan-vector-1";
+const VOICE_SENDER_KEY: [u8; 32] = [
+    0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xcb, 0xcc, 0xcd, 0xce, 0xcf, 0xd0,
+    0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xdb, 0xdc, 0xdd, 0xde, 0xdf, 0xe0,
+];
+const VOICE_NONCE_SALT: [u8; 4] = [0xaa, 0xbb, 0xcc, 0xdd];
+const VOICE_KEY_ID: u32 = 99;
+const VOICE_WRAP_NONCE: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+
+const VOICE_KEY_WRAP_CIPHERTEXT_HEX: &str = "98c781916feb2ea99f7dbf23f15fd58bb9ab8613ec348ebe8c93814ee695a11de59ce0341e00d354b9ff665b5ab38d27a0ab526c71cf495e";
+
+const VOICE_PACKET_CTR0_HEX: &str = "000000630000000000000000000003e832dbc83526f73e83a90b59aaab331078f359b00fcfab1fa0e6c514ea2034da79b2";
+const VOICE_PACKET_CTR7_HEX: &str = "0000006300000000000000070000138823adf6d5a771baa49d8de5ed1c99e5d5f12e9fffa9ba4fb471ca80882171360024";
+
+#[test]
+fn voice_key_wrap_signing_bytes_vector() {
+    let recipient_pub = x25519_pub_from_seed(&voice_recipient_seed());
+    let ciphertext = voice_key_wrap_with_nonce(
+        &voice_sender_seed(),
+        &recipient_pub,
+        VOICE_CHANNEL_ID,
+        &VOICE_SENDER_KEY,
+        &VOICE_NONCE_SALT,
+        VOICE_KEY_ID,
+        &VOICE_WRAP_NONCE,
+    )
+    .unwrap();
+    assert_eq!(hex::encode(&ciphertext), VOICE_KEY_WRAP_CIPHERTEXT_HEX);
+}
+
+#[test]
+fn voice_key_unwrap_round_trips_vector() {
+    let recipient_pub = x25519_pub_from_seed(&voice_recipient_seed());
+    let ciphertext = voice_key_wrap_with_nonce(
+        &voice_sender_seed(),
+        &recipient_pub,
+        VOICE_CHANNEL_ID,
+        &VOICE_SENDER_KEY,
+        &VOICE_NONCE_SALT,
+        VOICE_KEY_ID,
+        &VOICE_WRAP_NONCE,
+    )
+    .unwrap();
+
+    let sender_pub = x25519_pub_from_seed(&voice_sender_seed());
+    let (sender_key, nonce_salt, key_id) = voice_key_unwrap(
+        &voice_recipient_seed(),
+        &sender_pub,
+        VOICE_CHANNEL_ID,
+        &ciphertext,
+        &VOICE_WRAP_NONCE,
+    )
+    .unwrap();
+
+    assert_eq!(sender_key, VOICE_SENDER_KEY);
+    assert_eq!(nonce_salt, VOICE_NONCE_SALT);
+    assert_eq!(key_id, VOICE_KEY_ID);
+}
+
+#[test]
+fn voice_packet_seal_ctr0_vector() {
+    let packet = voice_packet_seal(
+        &VOICE_SENDER_KEY,
+        &VOICE_NONCE_SALT,
+        VOICE_KEY_ID,
+        0,
+        1000,
+        b"opus-frame-vector",
+    );
+    assert_eq!(hex::encode(&packet), VOICE_PACKET_CTR0_HEX);
+}
+
+#[test]
+fn voice_packet_seal_ctr7_vector() {
+    let packet = voice_packet_seal(
+        &VOICE_SENDER_KEY,
+        &VOICE_NONCE_SALT,
+        VOICE_KEY_ID,
+        7,
+        5000,
+        b"opus-frame-vector",
+    );
+    assert_eq!(hex::encode(&packet), VOICE_PACKET_CTR7_HEX);
+}
+
+#[test]
+fn voice_packet_open_round_trips_ctr0_and_ctr7() {
+    for (ctr, ts) in [(0u64, 1000u32), (7u64, 5000u32)] {
+        let packet = voice_packet_seal(
+            &VOICE_SENDER_KEY,
+            &VOICE_NONCE_SALT,
+            VOICE_KEY_ID,
+            ctr,
+            ts,
+            b"opus-frame-vector",
+        );
+        let (key_id, opened_ctr, opened_ts, opus) =
+            voice_packet_open(&VOICE_SENDER_KEY, &VOICE_NONCE_SALT, &packet).unwrap();
+        assert_eq!(key_id, VOICE_KEY_ID);
+        assert_eq!(opened_ctr, ctr);
+        assert_eq!(opened_ts, ts);
+        assert_eq!(opus, b"opus-frame-vector");
+    }
+}
+
+#[test]
+fn voice_packet_open_rejects_tampered_header() {
+    let mut packet = voice_packet_seal(
+        &VOICE_SENDER_KEY,
+        &VOICE_NONCE_SALT,
+        VOICE_KEY_ID,
+        0,
+        1000,
+        b"opus-frame-vector",
+    );
+    packet[0] ^= 0xff; // flip a key_id header byte
+    let result = voice_packet_open(&VOICE_SENDER_KEY, &VOICE_NONCE_SALT, &packet);
+    assert!(result.is_err());
+}
+
+#[test]
+#[ignore]
+fn gen_voice_vectors() {
+    let recipient_pub = x25519_pub_from_seed(&voice_recipient_seed());
+    let ciphertext = voice_key_wrap_with_nonce(
+        &voice_sender_seed(),
+        &recipient_pub,
+        VOICE_CHANNEL_ID,
+        &VOICE_SENDER_KEY,
+        &VOICE_NONCE_SALT,
+        VOICE_KEY_ID,
+        &VOICE_WRAP_NONCE,
+    )
+    .unwrap();
+    println!(
+        "VOICE_KEY_WRAP_CIPHERTEXT_HEX: {}",
+        hex::encode(&ciphertext)
+    );
+
+    let packet0 = voice_packet_seal(
+        &VOICE_SENDER_KEY,
+        &VOICE_NONCE_SALT,
+        VOICE_KEY_ID,
+        0,
+        1000,
+        b"opus-frame-vector",
+    );
+    println!("VOICE_PACKET_CTR0_HEX: {}", hex::encode(&packet0));
+
+    let packet7 = voice_packet_seal(
+        &VOICE_SENDER_KEY,
+        &VOICE_NONCE_SALT,
+        VOICE_KEY_ID,
+        7,
+        5000,
+        b"opus-frame-vector",
+    );
+    println!("VOICE_PACKET_CTR7_HEX: {}", hex::encode(&packet7));
 }
 
 fn dist_recipients() -> Vec<(String, String)> {

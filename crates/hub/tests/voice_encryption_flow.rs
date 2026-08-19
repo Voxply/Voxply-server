@@ -44,13 +44,15 @@ async fn start_hub() -> (String, Arc<AppState>, common::TestDbGuard) {
         federation_client: FederationClient::new(),
         peer_tokens: RwLock::new(HashMap::new()),
         voice_channels: RwLock::new(HashMap::new()),
-        voice_addr_map: RwLock::new(HashMap::new()),
+        voice_last_active: RwLock::new(HashMap::new()),
         whisper_target_pubkeys: RwLock::new(HashMap::new()),
         voice_sender_ids: RwLock::new(HashMap::new()),
         voice_next_sender_id: RwLock::new(HashMap::new()),
         voice_zones: RwLock::new(HashMap::new()),
         voice_udp_port: 0,
-        voice_udp_addr: None,
+        voice_wt_url: None,
+        canonical_url: Arc::new(RwLock::new(None)),
+        voice_cert_hash: RwLock::new(None),
         voice_event_tx,
         dm_tx: broadcast::channel(16).0,
         online_users: RwLock::new(HashMap::new()),
@@ -63,15 +65,12 @@ async fn start_hub() -> (String, Arc<AppState>, common::TestDbGuard) {
         last_farm_pubkey_fetch: Arc::new(RwLock::new(0)),
         video_channels: RwLock::new(HashMap::new()),
         started_at: std::time::Instant::now(),
-        whisper_targets: RwLock::new(HashMap::new()),
         whisper_target_defs: RwLock::new(HashMap::new()),
+        whisper_optouts: RwLock::new(std::collections::HashSet::new()),
         voice_relay_active: RwLock::new(std::collections::HashSet::new()),
         staging_voice_grants: RwLock::new(std::collections::HashMap::new()),
         voice_pending_binds: RwLock::new(HashMap::new()),
-        voice_consumed_tokens: RwLock::new(HashMap::new()),
-        voice_ws_senders: RwLock::new(HashMap::new()),
         ws_key_senders: RwLock::new(HashMap::new()),
-        voice_udp_socket: Arc::new(RwLock::new(None)),
         rate_limiters: Default::default(),
         preview_cache: std::sync::Mutex::new(HashMap::new()),
         search: Arc::new(wavvon_hub::search::null_search::NullSearch),
@@ -346,15 +345,10 @@ async fn key_offer_unknown_recipient_is_silently_dropped() {
     // The connection must remain alive — we can still receive voice_joined
     // (already consumed) so we just verify no error arrives within 1 s.
     let no_error = tokio::time::timeout(std::time::Duration::from_millis(500), async {
-        loop {
-            match rx_a.next().await {
-                Some(Ok(TsMessage::Text(raw))) => {
-                    let v: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
-                    if v.get("type").and_then(|t| t.as_str()) == Some("error") {
-                        panic!("unexpected error from hub: {v}");
-                    }
-                }
-                _ => break,
+        while let Some(Ok(TsMessage::Text(raw))) = rx_a.next().await {
+            let v: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+            if v.get("type").and_then(|t| t.as_str()) == Some("error") {
+                panic!("unexpected error from hub: {v}");
             }
         }
     })

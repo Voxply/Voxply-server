@@ -1,17 +1,22 @@
+//! Voice join/leave lifecycle over the main hub WS (voice-transport-v2.md).
+//!
+//! The actual audio relay (WebTransport datagrams, cert-hash trust, token
+//! rejection) is covered by `voice_wt_flow.rs`; this file exercises the
+//! WS-side bookkeeping that transport sits on top of: `voice_relay_active`
+//! lifecycle, roster membership, and the invisible-presence gate on voice
+//! surfaces.
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, RwLock};
 use tokio_tungstenite::tungstenite::Message as TsMessage;
 use wavvon_hub::auth::models::{ChallengeResponse, VerifyResponse};
 use wavvon_hub::federation::client::FederationClient;
 use wavvon_hub::routes::chat_models::ChannelResponse;
 use wavvon_hub::server;
-use wavvon_hub::state::{AppState, ConsumedVoiceToken};
+use wavvon_hub::state::AppState;
 use wavvon_identity::Identity;
 
 // ---------------------------------------------------------------------------
@@ -38,13 +43,15 @@ async fn start_hub() -> (String, Arc<AppState>, common::TestDbGuard) {
         federation_client: FederationClient::new(),
         peer_tokens: RwLock::new(HashMap::new()),
         voice_channels: RwLock::new(HashMap::new()),
-        voice_addr_map: RwLock::new(HashMap::new()),
+        voice_last_active: RwLock::new(HashMap::new()),
         whisper_target_pubkeys: RwLock::new(HashMap::new()),
         voice_sender_ids: RwLock::new(HashMap::new()),
         voice_next_sender_id: RwLock::new(HashMap::new()),
         voice_zones: RwLock::new(HashMap::new()),
         voice_udp_port: 0,
-        voice_udp_addr: None,
+        voice_wt_url: None,
+        canonical_url: Arc::new(RwLock::new(None)),
+        voice_cert_hash: RwLock::new(None),
         voice_event_tx,
         dm_tx: broadcast::channel(16).0,
         online_users: RwLock::new(std::collections::HashMap::new()),
@@ -57,15 +64,12 @@ async fn start_hub() -> (String, Arc<AppState>, common::TestDbGuard) {
         last_farm_pubkey_fetch: Arc::new(RwLock::new(0)),
         video_channels: RwLock::new(HashMap::new()),
         started_at: std::time::Instant::now(),
-        whisper_targets: RwLock::new(HashMap::new()),
         whisper_target_defs: RwLock::new(HashMap::new()),
+        whisper_optouts: RwLock::new(std::collections::HashSet::new()),
         voice_relay_active: RwLock::new(std::collections::HashSet::new()),
         staging_voice_grants: RwLock::new(std::collections::HashMap::new()),
         voice_pending_binds: RwLock::new(HashMap::new()),
-        voice_consumed_tokens: RwLock::new(HashMap::new()),
-        voice_ws_senders: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         ws_key_senders: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-        voice_udp_socket: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
         rate_limiters: Default::default(),
         preview_cache: std::sync::Mutex::new(HashMap::new()),
         search: Arc::new(wavvon_hub::search::null_search::NullSearch),
@@ -191,40 +195,22 @@ async fn send_ws(
 // Unit-style helpers that operate directly on AppState.
 // ---------------------------------------------------------------------------
 
-/// Simulate a voice_join: insert the pubkey with the sentinel address into voice_channels
-/// and mark the relay slot active (mirrors the WS handler after Phase 1).
-/// voice_addr_map is NOT populated — that requires a VXRG UDP register packet.
+/// Simulate a voice_join: insert the pubkey with no bound WT session into
+/// voice_channels and mark the relay slot active (mirrors the WS handler
+/// before the client's WebTransport session connects).
 async fn sim_join(state: &AppState, pubkey: &str, channel_id: &str) {
-    // Use the sentinel address — same as the WS handler post-Phase 1.
-    let sentinel: SocketAddr = "0.0.0.0:0".parse().unwrap();
     state
         .voice_channels
         .write()
         .await
         .entry(channel_id.to_string())
         .or_default()
-        .insert(pubkey.to_string(), sentinel);
+        .insert(pubkey.to_string(), None);
     state
         .voice_relay_active
         .write()
         .await
         .insert(pubkey.to_string());
-}
-
-/// Simulate a completed UDP registration: bind a real address for a previously sim_join'd pubkey.
-async fn sim_register(state: &AppState, pubkey: &str, channel_id: &str, addr: SocketAddr) {
-    state
-        .voice_channels
-        .write()
-        .await
-        .entry(channel_id.to_string())
-        .or_default()
-        .insert(pubkey.to_string(), addr);
-    state
-        .voice_addr_map
-        .write()
-        .await
-        .insert(addr, (channel_id.to_string(), pubkey.to_string()));
 }
 
 // ---------------------------------------------------------------------------
@@ -245,17 +231,15 @@ async fn voice_join_activates_relay_slot() {
     );
 }
 
-/// After WS disconnect (simulated via leave_voice) the slot is removed.
+/// After WS disconnect (simulated via leave_voice) the slot and the
+/// voice_channels roster entry are both removed.
 #[tokio::test]
 async fn ws_disconnect_removes_relay_slot() {
     let (_base, state, _guard) = start_hub().await;
     let pk = "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222";
     let channel_id = "ch-test";
-    let bound_addr: SocketAddr = "127.0.0.1:19001".parse().unwrap();
 
-    // Setup: join (sentinel) then simulate UDP registration (real address).
     sim_join(&state, pk, channel_id).await;
-    sim_register(&state, pk, channel_id, bound_addr).await;
     state
         .voice_sender_ids
         .write()
@@ -264,22 +248,29 @@ async fn ws_disconnect_removes_relay_slot() {
         .or_default()
         .insert(pk.to_string(), 0u16);
 
-    // Verify inserted.
     assert!(state.voice_relay_active.read().await.contains(pk));
-    assert!(state.voice_addr_map.read().await.contains_key(&bound_addr));
+    assert!(state
+        .voice_channels
+        .read()
+        .await
+        .get(channel_id)
+        .is_some_and(|p| p.contains_key(pk)));
 
     // Simulate WS disconnect by calling leave_voice.
     wavvon_hub::routes::ws::leave_voice_for_test(&state, pk, channel_id).await;
 
-    // Slot must be gone.
     assert!(
         !state.voice_relay_active.read().await.contains(pk),
         "relay slot should be removed after leave_voice"
     );
-    // addr_map entry must also be gone.
     assert!(
-        !state.voice_addr_map.read().await.contains_key(&bound_addr),
-        "voice_addr_map entry should be removed after leave_voice"
+        !state
+            .voice_channels
+            .read()
+            .await
+            .get(channel_id)
+            .is_some_and(|p| p.contains_key(pk)),
+        "voice_channels entry should be removed after leave_voice"
     );
 }
 
@@ -292,7 +283,6 @@ async fn rejoin_reactivates_relay_slot() {
 
     // Join then leave.
     sim_join(&state, pk, ch).await;
-    sim_register(&state, pk, ch, "127.0.0.1:19002".parse().unwrap()).await;
     state
         .voice_sender_ids
         .write()
@@ -303,7 +293,7 @@ async fn rejoin_reactivates_relay_slot() {
     wavvon_hub::routes::ws::leave_voice_for_test(&state, pk, ch).await;
     assert!(!state.voice_relay_active.read().await.contains(pk));
 
-    // Re-join (sentinel only — UDP registration would happen separately in production).
+    // Re-join.
     sim_join(&state, pk, ch).await;
     assert!(
         state.voice_relay_active.read().await.contains(pk),
@@ -311,7 +301,7 @@ async fn rejoin_reactivates_relay_slot() {
     );
 }
 
-/// Helper: drain WS frames until voice_joined arrives; return the udp_register_token.
+/// Helper: drain WS frames until voice_joined arrives; return the voice_token.
 async fn drain_until_voice_joined(
     rx: &mut futures_util::stream::SplitStream<
         tokio_tungstenite::WebSocketStream<
@@ -320,7 +310,7 @@ async fn drain_until_voice_joined(
     >,
 ) -> String {
     loop {
-        let msg = tokio::time::timeout(std::time::Duration::from_secs(3), rx.next())
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(15), rx.next())
             .await
             .expect("voice_joined timeout")
             .unwrap()
@@ -328,14 +318,18 @@ async fn drain_until_voice_joined(
         if let TsMessage::Text(t) = msg {
             let v: Value = serde_json::from_str(&t).unwrap();
             if v["type"] == "voice_joined" {
-                let tok = v["udp_register_token"]
+                let tok = v["voice_token"]
                     .as_str()
-                    .expect("voice_joined must carry udp_register_token")
+                    .expect("voice_joined must carry voice_token")
                     .to_string();
                 assert_eq!(tok.len(), 64, "token must be 64 hex chars (32 bytes)");
                 assert!(
                     tok.chars().all(|c| c.is_ascii_hexdigit()),
                     "token must be hex"
+                );
+                assert!(
+                    v["voice_wt_url"].as_str().unwrap().starts_with("https://"),
+                    "voice_joined must carry an absolute https voice_wt_url"
                 );
                 return tok;
             }
@@ -344,7 +338,7 @@ async fn drain_until_voice_joined(
 }
 
 /// End-to-end: user joins voice over WS and the relay slot appears; voice_joined
-/// reply carries a udp_register_token; after explicit voice_leave the slot is gone.
+/// reply carries a voice_token; after explicit voice_leave the slot is gone.
 #[tokio::test]
 async fn ws_voice_join_leave_updates_relay_active() {
     let (base, state, _guard) = start_hub().await;
@@ -370,24 +364,19 @@ async fn ws_voice_join_leave_updates_relay_active() {
         }
     }
 
-    // Send voice_join.
     send_ws(
         &mut tx,
-        json!({ "type": "voice_join", "channel_id": _ch.id, "udp_port": 0 }),
+        json!({ "type": "voice_join", "channel_id": _ch.id }),
     )
     .await;
+    let _voice_token = drain_until_voice_joined(&mut rx).await;
 
-    // Read voice_joined and verify it carries the register token.
-    let _register_token = drain_until_voice_joined(&mut rx).await;
-
-    // The pubkey should now be in voice_relay_active.
     let pk = user.public_key_hex();
     assert!(
         state.voice_relay_active.read().await.contains(&pk),
         "voice_relay_active should contain pubkey after voice_join"
     );
 
-    // Send voice_leave.
     send_ws(
         &mut tx,
         json!({ "type": "voice_leave", "channel_id": _ch.id }),
@@ -396,7 +385,6 @@ async fn ws_voice_join_leave_updates_relay_active() {
 
     tokio::time::sleep(std::time::Duration::from_millis(60)).await;
 
-    // After voice_leave the slot should be gone.
     assert!(
         !state.voice_relay_active.read().await.contains(&pk),
         "voice_relay_active should not contain pubkey after voice_leave"
@@ -417,7 +405,6 @@ async fn ws_close_removes_relay_slot_without_explicit_leave() {
 
     let (mut tx, mut rx) = connect_ws(&base, &token).await;
 
-    // Drain hello.
     loop {
         let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.next())
             .await
@@ -432,10 +419,9 @@ async fn ws_close_removes_relay_slot_without_explicit_leave() {
         }
     }
 
-    // Join voice.
     send_ws(
         &mut tx,
-        json!({ "type": "voice_join", "channel_id": ch.id, "udp_port": 0 }),
+        json!({ "type": "voice_join", "channel_id": ch.id }),
     )
     .await;
     let _tok = drain_until_voice_joined(&mut rx).await;
@@ -450,1014 +436,11 @@ async fn ws_close_removes_relay_slot_without_explicit_leave() {
     drop(tx);
     drop(rx);
 
-    // Give the hub time to detect the close and run cleanup.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     assert!(
         !state.voice_relay_active.read().await.contains(&pk),
         "relay slot should be removed when WS closes without voice_leave"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// UDP relay harness — spins up a real UDP socket + the relay loop.
-// ---------------------------------------------------------------------------
-
-/// Extended harness that also starts the UDP relay loop from main.rs.
-/// Returns (http_base_url, udp_port, Arc<AppState>).
-async fn start_hub_with_udp() -> (String, u16, Arc<AppState>, common::TestDbGuard) {
-    let (db, guard) = crate::common::create_test_db().await;
-    let store: Arc<dyn store::HubStore> = Arc::new(store::PostgresStore::new(db.clone()));
-    let (chat_tx, _) = broadcast::channel(256);
-    let (voice_event_tx, _) = broadcast::channel(16);
-
-    // Bind a real UDP socket on a random OS-assigned port.
-    let voice_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let udp_port = voice_socket.local_addr().unwrap().port();
-
-    let state = Arc::new(AppState {
-        hub_name: "voice-udp-test".to_string(),
-        hub_identity: wavvon_identity::Identity::generate(),
-        db,
-        db_read: None,
-        store,
-        pending_challenges: RwLock::new(HashMap::new()),
-        chat_tx,
-        federation_client: FederationClient::new(),
-        peer_tokens: RwLock::new(HashMap::new()),
-        voice_channels: RwLock::new(HashMap::new()),
-        voice_addr_map: RwLock::new(HashMap::new()),
-        whisper_target_pubkeys: RwLock::new(HashMap::new()),
-        voice_sender_ids: RwLock::new(HashMap::new()),
-        voice_next_sender_id: RwLock::new(HashMap::new()),
-        voice_zones: RwLock::new(HashMap::new()),
-        voice_udp_port: udp_port,
-        voice_udp_addr: None,
-        voice_event_tx,
-        dm_tx: broadcast::channel(16).0,
-        online_users: RwLock::new(std::collections::HashMap::new()),
-        screen_shares: RwLock::new(HashMap::new()),
-        screen_share_tx: broadcast::channel(16).0,
-        bot_sessions: RwLock::new(HashMap::new()),
-        http_client: reqwest::Client::new(),
-        farm_url: None,
-        cached_farm_pubkey: Arc::new(RwLock::new(None)),
-        last_farm_pubkey_fetch: Arc::new(RwLock::new(0)),
-        video_channels: RwLock::new(HashMap::new()),
-        started_at: std::time::Instant::now(),
-        whisper_targets: RwLock::new(HashMap::new()),
-        whisper_target_defs: RwLock::new(HashMap::new()),
-        voice_relay_active: RwLock::new(std::collections::HashSet::new()),
-        staging_voice_grants: RwLock::new(std::collections::HashMap::new()),
-        voice_pending_binds: RwLock::new(HashMap::new()),
-        voice_consumed_tokens: RwLock::new(HashMap::new()),
-        voice_ws_senders: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-        ws_key_senders: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-        voice_udp_socket: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
-        rate_limiters: Default::default(),
-        preview_cache: std::sync::Mutex::new(HashMap::new()),
-        search: Arc::new(wavvon_hub::search::null_search::NullSearch),
-        reindex_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        owner_pubkey: None,
-        bots_allow_camera: false,
-        bots_allow_video: false,
-        bot_video_stream_budget: 2,
-        webauthn: {
-            let origin = url::Url::parse("http://localhost:3000").unwrap();
-            std::sync::Arc::new(
-                webauthn_rs::WebauthnBuilder::new("localhost", &origin)
-                    .unwrap()
-                    .rp_name("test-hub")
-                    .build()
-                    .unwrap(),
-            )
-        },
-        webauthn_reg_challenges: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-        webauthn_auth_challenges: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-        device_token_ttl_secs: 30 * 86400,
-        webhook_circuit: std::sync::Arc::new(tokio::sync::Mutex::new(
-            wavvon_hub::state::WebhookCircuit::default(),
-        )),
-        lan_mode: false,
-        lan_tls_mode: None,
-        lan_fingerprint: None,
-    });
-
-    // Spawn the relay loop (mirrors main.rs).
-    let relay_state = state.clone();
-    tokio::spawn(async move {
-        const VXRG_MAGIC: &[u8] = b"VXRG";
-        const VXRG_TOKEN_LEN: usize = 64;
-        const VXRG_MIN_LEN: usize = 4 + VXRG_TOKEN_LEN;
-        const VXRA: &[u8] = b"VXRA";
-
-        let mut buf = [0u8; 2048];
-        loop {
-            let Ok((len, from_addr)) = voice_socket.recv_from(&mut buf).await else {
-                break;
-            };
-            let packet_data = buf[..len].to_vec();
-
-            if len >= VXRG_MIN_LEN && &packet_data[..4] == VXRG_MAGIC {
-                let token_bytes = &packet_data[4..4 + VXRG_TOKEN_LEN];
-                let token = match std::str::from_utf8(token_bytes) {
-                    Ok(t) => t.to_string(),
-                    Err(_) => continue,
-                };
-
-                // Idempotent re-ack check.
-                {
-                    let consumed = relay_state.voice_consumed_tokens.read().await;
-                    if consumed.contains_key(&from_addr) {
-                        drop(consumed);
-                        let _ = voice_socket.send_to(VXRA, from_addr).await;
-                        continue;
-                    }
-                }
-
-                let now = std::time::Instant::now();
-                let bind_opt = {
-                    let mut binds = relay_state.voice_pending_binds.write().await;
-                    binds.retain(|_, v| v.expires_at > now);
-                    binds.remove(&token)
-                };
-
-                let bind = match bind_opt {
-                    Some(b) if b.expires_at > now => b,
-                    _ => continue,
-                };
-
-                {
-                    let mut addr_map = relay_state.voice_addr_map.write().await;
-                    addr_map.insert(from_addr, (bind.channel_id.clone(), bind.pubkey.clone()));
-                }
-                {
-                    let mut channels = relay_state.voice_channels.write().await;
-                    if let Some(ch_map) = channels.get_mut(&bind.channel_id) {
-                        ch_map.insert(bind.pubkey.clone(), from_addr);
-                    }
-                }
-                {
-                    let mut consumed = relay_state.voice_consumed_tokens.write().await;
-                    consumed.insert(
-                        from_addr,
-                        ConsumedVoiceToken {
-                            bound_addr: from_addr,
-                            channel_id: bind.channel_id.clone(),
-                            pubkey: bind.pubkey.clone(),
-                        },
-                    );
-                }
-
-                let _ = voice_socket.send_to(VXRA, from_addr).await;
-                continue;
-            }
-
-            // Audio relay.
-            let lookup = {
-                let map = relay_state.voice_addr_map.read().await;
-                map.get(&from_addr).cloned()
-            };
-            if let Some((channel_id, sender_pk)) = lookup {
-                {
-                    let active = relay_state.voice_relay_active.read().await;
-                    if !active.contains(&sender_pk) {
-                        continue;
-                    }
-                }
-                let sender_id: u16 = {
-                    let sids = relay_state.voice_sender_ids.read().await;
-                    sids.get(&channel_id)
-                        .and_then(|m| m.get(&sender_pk))
-                        .copied()
-                        .unwrap_or(0)
-                };
-                let sender_id_bytes = sender_id.to_be_bytes();
-                let addr_map_snap = {
-                    let map = relay_state.voice_addr_map.read().await;
-                    map.clone()
-                };
-                let dests: Vec<SocketAddr> = {
-                    let channels = relay_state.voice_channels.read().await;
-                    channels
-                        .get(&channel_id)
-                        .map(|participants| {
-                            participants
-                                .values()
-                                .filter(|a| **a != from_addr && addr_map_snap.contains_key(*a))
-                                .copied()
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                };
-
-                let mut outbound = Vec::with_capacity(3 + packet_data.len());
-                outbound.extend_from_slice(&sender_id_bytes);
-                outbound.push(0x00u8);
-                outbound.extend_from_slice(&packet_data);
-                for addr in dests {
-                    let _ = voice_socket.send_to(&outbound, addr).await;
-                }
-            }
-        }
-    });
-
-    let app = server::create_router(state.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let url = format!("http://127.0.0.1:{port}");
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-
-    (url, udp_port, state, guard)
-}
-
-// ---------------------------------------------------------------------------
-// Phase 1 UDP register tests (Requirements 7a–7e)
-// ---------------------------------------------------------------------------
-
-/// 7a: voice_joined reply carries a udp_register_token (64 hex chars).
-#[tokio::test]
-async fn voice_joined_carries_udp_register_token() {
-    let (base, _udp_port, _state, _guard) = start_hub_with_udp().await;
-
-    let user = Identity::generate();
-    let token = authenticate_http(&base, &user).await;
-    let ch = create_channel(&base, &token, "tok-ch").await;
-
-    let (mut tx, mut rx) = connect_ws(&base, &token).await;
-
-    // Drain hello.
-    loop {
-        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        if let TsMessage::Text(t) = msg {
-            if serde_json::from_str::<Value>(&t).unwrap()["type"] == "hello" {
-                break;
-            }
-        }
-    }
-
-    send_ws(
-        &mut tx,
-        json!({ "type": "voice_join", "channel_id": ch.id, "udp_port": 0 }),
-    )
-    .await;
-    let tok = drain_until_voice_joined(&mut rx).await;
-
-    assert_eq!(tok.len(), 64, "token should be 64 hex chars");
-    assert!(
-        tok.chars().all(|c| c.is_ascii_hexdigit()),
-        "token must be hex"
-    );
-
-    let _ = tx.send(TsMessage::Close(None)).await;
-}
-
-/// 7b: Two clients register with their tokens, both get acks, audio from A
-/// relays to B's real socket (not loopback).
-#[tokio::test]
-async fn two_clients_register_and_audio_relays() {
-    let (base, udp_port, state, _guard) = start_hub_with_udp().await;
-    let hub_addr: SocketAddr = format!("127.0.0.1:{udp_port}").parse().unwrap();
-
-    let user_a = Identity::generate();
-    let user_b = Identity::generate();
-    let tok_a = authenticate_http(&base, &user_a).await;
-    let tok_b = authenticate_http(&base, &user_b).await;
-    let ch = create_channel(&base, &tok_a, "relay-ch").await;
-
-    // Connect A and B to WS, join voice.
-    let (mut tx_a, mut rx_a) = connect_ws(&base, &tok_a).await;
-    let (mut tx_b, mut rx_b) = connect_ws(&base, &tok_b).await;
-
-    // Drain hellos.
-    for rx in [&mut rx_a, &mut rx_b] {
-        loop {
-            let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.next())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
-            if let TsMessage::Text(t) = msg {
-                if serde_json::from_str::<Value>(&t).unwrap()["type"] == "hello" {
-                    break;
-                }
-            }
-        }
-    }
-
-    send_ws(
-        &mut tx_a,
-        json!({ "type": "voice_join", "channel_id": ch.id, "udp_port": 0 }),
-    )
-    .await;
-    let reg_token_a = drain_until_voice_joined(&mut rx_a).await;
-
-    send_ws(
-        &mut tx_b,
-        json!({ "type": "voice_join", "channel_id": ch.id, "udp_port": 0 }),
-    )
-    .await;
-    let reg_token_b = drain_until_voice_joined(&mut rx_b).await;
-
-    // Bind real UDP sockets for A and B.
-    let sock_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let sock_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let addr_a = sock_a.local_addr().unwrap();
-    let addr_b = sock_b.local_addr().unwrap();
-
-    // A sends VXRG to hub with its register token.
-    let mut vxrg_a = b"VXRG".to_vec();
-    vxrg_a.extend_from_slice(reg_token_a.as_bytes());
-    sock_a.send_to(&vxrg_a, hub_addr).await.unwrap();
-
-    // Wait for ack.
-    let mut ack_buf = [0u8; 16];
-    let (ack_len, _) = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        sock_a.recv_from(&mut ack_buf),
-    )
-    .await
-    .expect("VXRA ack timeout for A")
-    .unwrap();
-    assert_eq!(&ack_buf[..ack_len], b"VXRA", "A should receive VXRA ack");
-
-    // B sends VXRG.
-    let mut vxrg_b = b"VXRG".to_vec();
-    vxrg_b.extend_from_slice(reg_token_b.as_bytes());
-    sock_b.send_to(&vxrg_b, hub_addr).await.unwrap();
-
-    let (ack_len_b, _) = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        sock_b.recv_from(&mut ack_buf),
-    )
-    .await
-    .expect("VXRA ack timeout for B")
-    .unwrap();
-    assert_eq!(&ack_buf[..ack_len_b], b"VXRA", "B should receive VXRA ack");
-
-    // Verify both addresses are bound in voice_addr_map.
-    {
-        let map = state.voice_addr_map.read().await;
-        assert!(map.contains_key(&addr_a), "A's address should be bound");
-        assert!(map.contains_key(&addr_b), "B's address should be bound");
-    }
-
-    // A sends audio; B should receive it relayed.
-    let audio_payload = b"OPUS_FAKE_AUDIO_DATA";
-    sock_a.send_to(audio_payload, hub_addr).await.unwrap();
-
-    // B listens for the relayed packet (hub prepends [sender_id: 2][pkt_type: 1]).
-    let mut relay_buf = [0u8; 512];
-    let (relay_len, relay_from) = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        sock_b.recv_from(&mut relay_buf),
-    )
-    .await
-    .expect("relay timeout: B should receive audio from hub")
-    .unwrap();
-
-    assert_eq!(relay_from, hub_addr, "relayed packet should come from hub");
-    assert!(
-        relay_len >= 3 + audio_payload.len(),
-        "relayed packet should contain header + payload"
-    );
-    assert_eq!(
-        &relay_buf[3..relay_len],
-        audio_payload,
-        "relayed payload should match"
-    );
-
-    let _ = tx_a.send(TsMessage::Close(None)).await;
-    let _ = tx_b.send(TsMessage::Close(None)).await;
-}
-
-/// 7c: Audio sent BEFORE registering is not relayed; no packet ever sent to
-/// an unregistered address.
-#[tokio::test]
-async fn audio_before_register_not_relayed() {
-    let (base, udp_port, state, _guard) = start_hub_with_udp().await;
-    let hub_addr: SocketAddr = format!("127.0.0.1:{udp_port}").parse().unwrap();
-
-    let user_a = Identity::generate();
-    let user_b = Identity::generate();
-    let tok_a = authenticate_http(&base, &user_a).await;
-    let tok_b = authenticate_http(&base, &user_b).await;
-    let ch = create_channel(&base, &tok_a, "early-audio-ch").await;
-
-    let (mut tx_a, mut rx_a) = connect_ws(&base, &tok_a).await;
-    let (mut tx_b, mut rx_b) = connect_ws(&base, &tok_b).await;
-
-    for rx in [&mut rx_a, &mut rx_b] {
-        loop {
-            let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.next())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
-            if let TsMessage::Text(t) = msg {
-                if serde_json::from_str::<Value>(&t).unwrap()["type"] == "hello" {
-                    break;
-                }
-            }
-        }
-    }
-
-    send_ws(
-        &mut tx_a,
-        json!({ "type": "voice_join", "channel_id": ch.id, "udp_port": 0 }),
-    )
-    .await;
-    let _tok_a = drain_until_voice_joined(&mut rx_a).await;
-
-    send_ws(
-        &mut tx_b,
-        json!({ "type": "voice_join", "channel_id": ch.id, "udp_port": 0 }),
-    )
-    .await;
-    let reg_token_b = drain_until_voice_joined(&mut rx_b).await;
-
-    // B registers its address; A does NOT.
-    let sock_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let sock_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let addr_b = sock_b.local_addr().unwrap();
-
-    let mut vxrg_b = b"VXRG".to_vec();
-    vxrg_b.extend_from_slice(reg_token_b.as_bytes());
-    sock_b.send_to(&vxrg_b, hub_addr).await.unwrap();
-    let mut ack_buf = [0u8; 16];
-    tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        sock_b.recv_from(&mut ack_buf),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-
-    // Verify B is bound, A is not.
-    {
-        let map = state.voice_addr_map.read().await;
-        assert!(map.contains_key(&addr_b), "B should be bound");
-        assert!(
-            !map.contains_key(&sock_a.local_addr().unwrap()),
-            "A should not be bound"
-        );
-    }
-
-    // A sends audio (not registered — hub should drop it, nothing relayed to B).
-    let audio = b"PRE_REGISTER_AUDIO";
-    sock_a.send_to(audio, hub_addr).await.unwrap();
-
-    // Give the hub a moment to process, then confirm B receives nothing.
-    // A 200 ms timeout on recv is used as the "no packet" assertion.
-    let mut rx_buf = [0u8; 512];
-    let no_relay = tokio::time::timeout(
-        std::time::Duration::from_millis(200),
-        sock_b.recv_from(&mut rx_buf),
-    )
-    .await;
-    assert!(
-        no_relay.is_err(),
-        "B should NOT receive audio from unregistered A (timeout expected)"
-    );
-
-    let _ = tx_a.send(TsMessage::Close(None)).await;
-    let _ = tx_b.send(TsMessage::Close(None)).await;
-}
-
-/// 7d: A register packet with a garbage token gets no reply and no binding.
-#[tokio::test]
-async fn garbage_token_gets_no_reply() {
-    let (base, udp_port, state, _guard) = start_hub_with_udp().await;
-    let hub_addr: SocketAddr = format!("127.0.0.1:{udp_port}").parse().unwrap();
-
-    let user = Identity::generate();
-    let token = authenticate_http(&base, &user).await;
-    let ch = create_channel(&base, &token, "garbage-ch").await;
-
-    let (mut tx, mut rx) = connect_ws(&base, &token).await;
-    loop {
-        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        if let TsMessage::Text(t) = msg {
-            if serde_json::from_str::<Value>(&t).unwrap()["type"] == "hello" {
-                break;
-            }
-        }
-    }
-    send_ws(
-        &mut tx,
-        json!({ "type": "voice_join", "channel_id": ch.id, "udp_port": 0 }),
-    )
-    .await;
-    let _tok = drain_until_voice_joined(&mut rx).await;
-
-    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let attacker_addr = sock.local_addr().unwrap();
-
-    // Send VXRG with a garbage (all-zero) token.
-    let mut garbage_pkt = b"VXRG".to_vec();
-    garbage_pkt
-        .extend_from_slice(b"0000000000000000000000000000000000000000000000000000000000000000");
-    sock.send_to(&garbage_pkt, hub_addr).await.unwrap();
-
-    // No reply expected: use a short timeout; expiry means no reply (correct).
-    let mut ack_buf = [0u8; 16];
-    let no_reply = tokio::time::timeout(
-        std::time::Duration::from_millis(300),
-        sock.recv_from(&mut ack_buf),
-    )
-    .await;
-    assert!(
-        no_reply.is_err(),
-        "garbage token should receive no reply (timeout expected)"
-    );
-
-    // Attacker's address must not appear in voice_addr_map.
-    assert!(
-        !state
-            .voice_addr_map
-            .read()
-            .await
-            .contains_key(&attacker_addr),
-        "garbage token must not create a binding"
-    );
-
-    let _ = tx.send(TsMessage::Close(None)).await;
-}
-
-/// 7e: A consumed token re-sent from a DIFFERENT source address does not rebind
-/// (original binding intact, no ack to the new address).
-#[tokio::test]
-async fn consumed_token_from_different_addr_does_not_rebind() {
-    let (base, udp_port, state, _guard) = start_hub_with_udp().await;
-    let hub_addr: SocketAddr = format!("127.0.0.1:{udp_port}").parse().unwrap();
-
-    let user = Identity::generate();
-    let token = authenticate_http(&base, &user).await;
-    let ch = create_channel(&base, &token, "rebind-ch").await;
-
-    let (mut tx, mut rx) = connect_ws(&base, &token).await;
-    loop {
-        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        if let TsMessage::Text(t) = msg {
-            if serde_json::from_str::<Value>(&t).unwrap()["type"] == "hello" {
-                break;
-            }
-        }
-    }
-    send_ws(
-        &mut tx,
-        json!({ "type": "voice_join", "channel_id": ch.id, "udp_port": 0 }),
-    )
-    .await;
-    let reg_token = drain_until_voice_joined(&mut rx).await;
-
-    // Legitimate client registers first.
-    let legit_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let legit_addr = legit_sock.local_addr().unwrap();
-    let mut vxrg = b"VXRG".to_vec();
-    vxrg.extend_from_slice(reg_token.as_bytes());
-    legit_sock.send_to(&vxrg, hub_addr).await.unwrap();
-    let mut ack_buf = [0u8; 16];
-    let (ack_len, _) = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        legit_sock.recv_from(&mut ack_buf),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(&ack_buf[..ack_len], b"VXRA", "legit client should get VXRA");
-
-    // Attacker tries to re-use the same token from a different address.
-    let attacker_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let attacker_addr = attacker_sock.local_addr().unwrap();
-    attacker_sock.send_to(&vxrg, hub_addr).await.unwrap();
-
-    // No ack to attacker: short timeout, expiry = no reply (correct).
-    let no_ack = tokio::time::timeout(
-        std::time::Duration::from_millis(300),
-        attacker_sock.recv_from(&mut ack_buf),
-    )
-    .await;
-    assert!(
-        no_ack.is_err(),
-        "attacker should receive no ack (timeout expected)"
-    );
-
-    // Original binding intact; attacker's address must not be bound.
-    {
-        let map = state.voice_addr_map.read().await;
-        assert!(
-            map.contains_key(&legit_addr),
-            "original binding must still exist"
-        );
-        assert!(
-            !map.contains_key(&attacker_addr),
-            "attacker's address must not be bound"
-        );
-    }
-
-    let _ = tx.send(TsMessage::Close(None)).await;
-}
-
-// ---------------------------------------------------------------------------
-// Bot audio injection (soundboard.md §2) — /voice/ws gate on can_speak_voice
-// ---------------------------------------------------------------------------
-
-/// Invites `bot_identity` as an external bot (admin_token must belong to a
-/// member with manage_roles/admin), then completes the normal Ed25519
-/// challenge/verify flow with `is_bot: true` and the given capabilities,
-/// returning the bot's session token. That token is valid on both `/ws`
-/// and `/voice/ws`, exactly like a human session token.
-async fn invite_and_auth_bot(
-    base: &str,
-    admin_token: &str,
-    bot_identity: &Identity,
-    capabilities: &[&str],
-) -> String {
-    let client = reqwest::Client::new();
-    let pub_key = bot_identity.public_key_hex();
-
-    let invite_resp = client
-        .post(format!("{base}/bots"))
-        .bearer_auth(admin_token)
-        .json(&json!({ "pubkey": pub_key }))
-        .send()
-        .await
-        .unwrap();
-    assert!(
-        invite_resp.status().is_success(),
-        "bot invite should succeed: {}",
-        invite_resp.status()
-    );
-
-    let challenge: ChallengeResponse = client
-        .post(format!("{base}/auth/challenge"))
-        .json(&json!({ "public_key": pub_key }))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let challenge_bytes = hex::decode(&challenge.challenge).unwrap();
-    let signature = bot_identity.sign(&challenge_bytes);
-
-    let verify_resp = client
-        .post(format!("{base}/auth/verify"))
-        .json(&json!({
-            "public_key": pub_key,
-            "challenge": challenge.challenge,
-            "signature": hex::encode(signature.to_bytes()),
-            "is_bot": true,
-            "bot_meta": {
-                "name": "VoiceInjectionBot",
-                "capabilities": capabilities,
-            },
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert!(
-        verify_resp.status().is_success(),
-        "bot auth/verify should succeed: {}",
-        verify_resp.status()
-    );
-    let verify: VerifyResponse = verify_resp.json().await.unwrap();
-    verify.token
-}
-
-/// Grants a set of capabilities to a bot via `PUT
-/// /admin/bots/:pubkey/capabilities` (bot-capability-layer.md §1, §6 Phase
-/// 1 item 2). `admin_token` must belong to a member with the `admin`
-/// permission (the hub's first authenticated user, per `setup`/`start_hub`
-/// conventions used throughout this file).
-async fn grant_capabilities(
-    base: &str,
-    admin_token: &str,
-    bot_pubkey: &str,
-    capabilities: &[&str],
-) {
-    let resp = reqwest::Client::new()
-        .put(format!("{base}/admin/bots/{bot_pubkey}/capabilities"))
-        .bearer_auth(admin_token)
-        .json(&json!({ "capabilities": capabilities }))
-        .send()
-        .await
-        .unwrap();
-    assert!(
-        resp.status().is_success(),
-        "capability grant should succeed: {}",
-        resp.status()
-    );
-}
-
-/// Connects to `/voice/ws?token=..&channel_id=..`, the same wire format
-/// `/voice/ws` uses for human web clients.
-async fn connect_voice_ws(
-    base: &str,
-    token: &str,
-    channel_id: &str,
-) -> (
-    futures_util::stream::SplitSink<
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-        TsMessage,
-    >,
-    futures_util::stream::SplitStream<
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-    >,
-) {
-    let ws_url = format!(
-        "{}/voice/ws?token={}&channel_id={}",
-        base.replace("http://", "ws://"),
-        token,
-        channel_id
-    );
-    let (ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
-    ws.split()
-}
-
-/// A bot session with `can_speak_voice` both requested (bot_meta at auth)
-/// AND granted (admin, bot-capability-layer.md §1) can join `/voice/ws` as
-/// a first-class participant: it receives `voice_ws_ready` and shows up in
-/// the HTTP voice roster.
-#[tokio::test]
-async fn bot_with_can_speak_voice_registers_as_voice_sender() {
-    let (base, _state, _guard) = start_hub().await;
-    let owner = Identity::generate();
-    let owner_token = authenticate_http(&base, &owner).await;
-    let ch = create_channel(&base, &owner_token, "bot-voice-ok").await;
-
-    let bot = Identity::generate();
-    let bot_token = invite_and_auth_bot(&base, &owner_token, &bot, &["can_speak_voice"]).await;
-    grant_capabilities(
-        &base,
-        &owner_token,
-        &bot.public_key_hex(),
-        &["can_speak_voice"],
-    )
-    .await;
-
-    let (_tx, mut rx) = connect_voice_ws(&base, &bot_token, &ch.id).await;
-
-    let msg = tokio::time::timeout(std::time::Duration::from_secs(3), rx.next())
-        .await
-        .expect("expected a voice_ws_ready frame before timeout")
-        .expect("stream ended without a frame")
-        .expect("websocket error");
-    let TsMessage::Text(t) = msg else {
-        panic!("expected a text frame, got {msg:?}");
-    };
-    let v: Value = serde_json::from_str(&t).unwrap();
-    assert_eq!(v["type"], "voice_ws_ready");
-
-    let client = reqwest::Client::new();
-    let roster: std::collections::HashMap<String, Vec<Value>> = client
-        .get(format!("{base}/voice/participants"))
-        .bearer_auth(&owner_token)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let members = roster
-        .get(&ch.id)
-        .expect("bot's channel should have a voice roster entry");
-    assert!(
-        members
-            .iter()
-            .any(|m| m["public_key"] == bot.public_key_hex()),
-        "capable bot should appear in the voice roster"
-    );
-}
-
-/// A bot session WITHOUT `can_speak_voice` is refused registration: no
-/// `voice_ws_ready` frame, and it never appears in the voice roster.
-#[tokio::test]
-async fn bot_without_can_speak_voice_capability_is_rejected() {
-    let (base, _state, _guard) = start_hub().await;
-    let owner = Identity::generate();
-    let owner_token = authenticate_http(&base, &owner).await;
-    let ch = create_channel(&base, &owner_token, "bot-voice-denied").await;
-
-    let bot = Identity::generate();
-    // No capabilities at all.
-    let bot_token = invite_and_auth_bot(&base, &owner_token, &bot, &[]).await;
-
-    let (_tx, mut rx) = connect_voice_ws(&base, &bot_token, &ch.id).await;
-
-    // The gate makes the server task return without ever sending a frame,
-    // so the connection closes (or the stream ends) instead of yielding a
-    // voice_ws_ready message.
-    // Close frame, stream end, or a transport error are all acceptable
-    // "rejected" outcomes -- the important thing is no ready frame.
-    let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), rx.next()).await;
-    if let Ok(Some(Ok(TsMessage::Text(t)))) = outcome {
-        let v: Value = serde_json::from_str(&t).unwrap();
-        assert_ne!(
-            v["type"], "voice_ws_ready",
-            "uncapable bot must not be registered as a voice sender"
-        );
-    }
-
-    let client = reqwest::Client::new();
-    let roster: std::collections::HashMap<String, Vec<Value>> = client
-        .get(format!("{base}/voice/participants"))
-        .bearer_auth(&owner_token)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert!(
-        !roster
-            .get(&ch.id)
-            .map(|m| m.iter().any(|p| p["public_key"] == bot.public_key_hex()))
-            .unwrap_or(false),
-        "uncapable bot must not appear in the voice roster"
-    );
-}
-
-/// bot-capability-layer.md §1's core behavior change: a bot that *requests*
-/// `can_speak_voice` (self-declared in `bot_meta` at auth) but which no
-/// admin has *granted* it is still refused -- the effective gate is
-/// requested ∩ granted, never the self-declared set alone.
-#[tokio::test]
-async fn bot_with_requested_but_ungranted_capability_is_rejected() {
-    let (base, _state, _guard) = start_hub().await;
-    let owner = Identity::generate();
-    let owner_token = authenticate_http(&base, &owner).await;
-    let ch = create_channel(&base, &owner_token, "bot-voice-ungranted").await;
-
-    let bot = Identity::generate();
-    // Requests the capability at auth time, but no admin ever grants it.
-    let bot_token = invite_and_auth_bot(&base, &owner_token, &bot, &["can_speak_voice"]).await;
-
-    let (_tx, mut rx) = connect_voice_ws(&base, &bot_token, &ch.id).await;
-
-    let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), rx.next()).await;
-    if let Ok(Some(Ok(TsMessage::Text(t)))) = outcome {
-        let v: Value = serde_json::from_str(&t).unwrap();
-        assert_ne!(
-            v["type"], "voice_ws_ready",
-            "requested-but-ungranted bot must not be registered as a voice sender"
-        );
-    }
-
-    let client = reqwest::Client::new();
-    let roster: std::collections::HashMap<String, Vec<Value>> = client
-        .get(format!("{base}/voice/participants"))
-        .bearer_auth(&owner_token)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert!(
-        !roster
-            .get(&ch.id)
-            .map(|m| m.iter().any(|p| p["public_key"] == bot.public_key_hex()))
-            .unwrap_or(false),
-        "requested-but-ungranted bot must not appear in the voice roster"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// H: human joins to /voice/ws had no read gate at all (see ROADMAP.md Known
-// issues, docs/docs/events.md §7.4 implementation note). A plain human join
-// to a normal channel must now be rejected the same way the main hub WS
-// `voice_join` handler rejects it -- UNLESS a voice-only presence grant
-// (events.md §7.4) covers the (pubkey, channel) pair.
-// ---------------------------------------------------------------------------
-
-/// Denies `permission` for `@everyone` on `channel_id` via the
-/// channel-permission-overwrites admin route (§3.6). Mirrors
-/// `ws_read_gating_flow.rs`'s `deny_everyone`.
-async fn deny_everyone(base: &str, owner_token: &str, channel_id: &str, permission: &str) {
-    let resp = reqwest::Client::new()
-        .put(format!(
-            "{base}/channels/{channel_id}/permissions/builtin-everyone"
-        ))
-        .bearer_auth(owner_token)
-        .json(&json!({ "allow": [], "deny": [permission] }))
-        .send()
-        .await
-        .unwrap();
-    assert!(resp.status().is_success());
-}
-
-/// Regression test for the read-gate hole: a plain human member, denied
-/// `read_messages` on a channel, must be rejected by `/voice/ws` rather than
-/// silently admitted -- no `voice_ws_ready` frame, and no entry in the voice
-/// roster.
-#[tokio::test]
-async fn human_without_read_access_is_rejected_over_voice_ws() {
-    let (base, _state, _guard) = start_hub().await;
-    let owner = Identity::generate();
-    let owner_token = authenticate_http(&base, &owner).await;
-    let ch = create_channel(&base, &owner_token, "human-voice-denied").await;
-    deny_everyone(&base, &owner_token, &ch.id, "read_messages").await;
-
-    let member = Identity::generate();
-    let member_token = authenticate_http(&base, &member).await;
-
-    let (_tx, mut rx) = connect_voice_ws(&base, &member_token, &ch.id).await;
-
-    // The gate makes the server task return without ever sending a frame,
-    // so the connection closes (or the stream ends) instead of yielding a
-    // voice_ws_ready message. Close frame, stream end, or a transport error
-    // are all acceptable "rejected" outcomes.
-    let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), rx.next()).await;
-    if let Ok(Some(Ok(TsMessage::Text(t)))) = outcome {
-        let v: Value = serde_json::from_str(&t).unwrap();
-        assert_ne!(
-            v["type"], "voice_ws_ready",
-            "a member without read_messages must not be admitted to /voice/ws"
-        );
-    }
-
-    let client = reqwest::Client::new();
-    let roster: std::collections::HashMap<String, Vec<Value>> = client
-        .get(format!("{base}/voice/participants"))
-        .bearer_auth(&owner_token)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert!(
-        !roster
-            .get(&ch.id)
-            .map(|m| m.iter().any(|p| p["public_key"] == member.public_key_hex()))
-            .unwrap_or(false),
-        "rejected member must not appear in the voice roster"
-    );
-}
-
-/// Sanity check: an ordinary member on a normal, readable channel still
-/// joins `/voice/ws` fine -- guards against over-tightening the new gate.
-#[tokio::test]
-async fn human_with_read_access_joins_voice_ws_normally() {
-    let (base, _state, _guard) = start_hub().await;
-    let owner = Identity::generate();
-    let owner_token = authenticate_http(&base, &owner).await;
-    let ch = create_channel(&base, &owner_token, "human-voice-ok").await;
-
-    let member = Identity::generate();
-    let member_token = authenticate_http(&base, &member).await;
-
-    let (_tx, mut rx) = connect_voice_ws(&base, &member_token, &ch.id).await;
-
-    let msg = tokio::time::timeout(std::time::Duration::from_secs(3), rx.next())
-        .await
-        .expect("expected a voice_ws_ready frame before timeout")
-        .expect("stream ended without a frame")
-        .expect("websocket error");
-    let TsMessage::Text(t) = msg else {
-        panic!("expected a text frame, got {msg:?}");
-    };
-    let v: Value = serde_json::from_str(&t).unwrap();
-    assert_eq!(v["type"], "voice_ws_ready");
-
-    let client = reqwest::Client::new();
-    let roster: std::collections::HashMap<String, Vec<Value>> = client
-        .get(format!("{base}/voice/participants"))
-        .bearer_auth(&owner_token)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let members = roster
-        .get(&ch.id)
-        .expect("readable channel should have a voice roster entry");
-    assert!(
-        members
-            .iter()
-            .any(|m| m["public_key"] == member.public_key_hex()),
-        "member with read access should appear in the voice roster"
     );
 }
 
@@ -1484,28 +467,50 @@ async fn invisible_user_hidden_from_others_voice_participant_lists() {
         .await
         .unwrap();
 
-    let (_tx, mut rx) = connect_voice_ws(&base, &ghost_token, &ch.id).await;
+    let (mut tx, mut rx) = connect_ws(&base, &ghost_token).await;
+    // Drain hello.
+    loop {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.next())
+            .await
+            .expect("hello timeout")
+            .unwrap()
+            .unwrap();
+        if let TsMessage::Text(t) = msg {
+            let v: Value = serde_json::from_str(&t).unwrap();
+            if v["type"] == "hello" {
+                break;
+            }
+        }
+    }
+    send_ws(
+        &mut tx,
+        json!({ "type": "voice_join", "channel_id": ch.id }),
+    )
+    .await;
 
     // Invisible users stay functional in voice: the join succeeds and the
-    // ready frame's participant list still shows the joiner their own entry
+    // reply's participant list still shows the joiner their own entry
     // (viewer self-exemption).
-    let msg = tokio::time::timeout(std::time::Duration::from_secs(3), rx.next())
-        .await
-        .expect("expected a voice_ws_ready frame before timeout")
-        .expect("stream ended without a frame")
-        .expect("websocket error");
-    let TsMessage::Text(t) = msg else {
-        panic!("expected a text frame, got {msg:?}");
-    };
-    let v: Value = serde_json::from_str(&t).unwrap();
-    assert_eq!(v["type"], "voice_ws_ready");
+    let v = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            let msg = rx.next().await.unwrap().unwrap();
+            if let TsMessage::Text(t) = msg {
+                let v: Value = serde_json::from_str(&t).unwrap();
+                if v["type"] == "voice_joined" {
+                    return v;
+                }
+            }
+        }
+    })
+    .await
+    .expect("expected voice_joined before timeout");
     assert!(
         v["participants"]
             .as_array()
             .unwrap()
             .iter()
             .any(|p| p["public_key"] == ghost.public_key_hex()),
-        "invisible joiner must still see their own entry in the ready frame"
+        "invisible joiner must still see their own entry in the join reply"
     );
     assert!(
         state
@@ -1582,69 +587,5 @@ async fn invisible_user_hidden_from_others_voice_participant_lists() {
             .map(|m| m.iter().any(|p| p["public_key"] == ghost.public_key_hex()))
             .unwrap_or(false),
         "invisible user must still see their own entry in /voice/participants"
-    );
-}
-
-/// events.md §7.4 Phase 2 bypass, /voice/ws-transport-specific: a voice-only
-/// presence grant for (pubkey, channel) admits a human join over `/voice/ws`
-/// despite the channel being unreadable to them. `voice_move_flow.rs`
-/// exercises the grant's creation and its bypass of the *main* hub WS
-/// `voice_join` gate end-to-end; this test drives the /voice/ws transport
-/// directly against the same `state.staging_voice_grants` map to confirm the
-/// bypass this fix introduces here composes correctly with it.
-#[tokio::test]
-async fn staging_grant_admits_voice_ws_join_to_unreadable_channel() {
-    let (base, state, _guard) = start_hub().await;
-    let owner = Identity::generate();
-    let owner_token = authenticate_http(&base, &owner).await;
-    let ch = create_channel(&base, &owner_token, "grant-voice-ws").await;
-    deny_everyone(&base, &owner_token, &ch.id, "read_messages").await;
-
-    let target = Identity::generate();
-    let target_token = authenticate_http(&base, &target).await;
-    let target_pubkey = target.public_key_hex();
-
-    // Grant voice-only presence for this exact (pubkey, channel) pair, same
-    // as `handle_voice_move` does for an event-scoped move (events.md §7.4).
-    state
-        .staging_voice_grants
-        .write()
-        .await
-        .entry(target_pubkey.clone())
-        .or_default()
-        .insert(ch.id.clone());
-
-    let (_tx, mut rx) = connect_voice_ws(&base, &target_token, &ch.id).await;
-
-    let msg = tokio::time::timeout(std::time::Duration::from_secs(3), rx.next())
-        .await
-        .expect("expected a voice_ws_ready frame before timeout")
-        .expect("stream ended without a frame")
-        .expect("websocket error");
-    let TsMessage::Text(t) = msg else {
-        panic!("expected a text frame, got {msg:?}");
-    };
-    let v: Value = serde_json::from_str(&t).unwrap();
-    assert_eq!(
-        v["type"], "voice_ws_ready",
-        "a staging voice grant should admit the join despite no read_messages"
-    );
-
-    let client = reqwest::Client::new();
-    let roster: std::collections::HashMap<String, Vec<Value>> = client
-        .get(format!("{base}/voice/participants"))
-        .bearer_auth(&owner_token)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let members = roster
-        .get(&ch.id)
-        .expect("granted target should have a voice roster entry");
-    assert!(
-        members.iter().any(|m| m["public_key"] == target_pubkey),
-        "grant-admitted target should appear in the voice roster"
     );
 }

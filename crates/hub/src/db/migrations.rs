@@ -1845,6 +1845,61 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     .execute(pool)
     .await;
 
+    // Post tags (forum.md §10 "Post tags"): admin-curated, channel-scoped
+    // labels for filtering the forum post list. Definitions table + join
+    // table, not a JSON column on `posts` -- tag CRUD must work
+    // independently of any one post, and the join gives an indexed EXISTS
+    // filter plus FK cascade (delete a tag -> assignments vanish, no
+    // app-side sweep) for free.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS forum_tags (
+            id         TEXT PRIMARY KEY,
+            channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            label      TEXT NOT NULL,
+            color      TEXT,
+            position   BIGINT NOT NULL DEFAULT 0,
+            created_at BIGINT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_forum_tags_channel ON forum_tags(channel_id, position)",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS post_tags (
+            post_id TEXT NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+            tag_id  TEXT NOT NULL REFERENCES forum_tags(id) ON DELETE CASCADE,
+            PRIMARY KEY (post_id, tag_id)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_post_tags_tag ON post_tags(tag_id)")
+        .execute(pool)
+        .await?;
+
+    // Per-channel "require at least one tag" toggle (forum.md §10.1 Q2),
+    // default off. Only meaningful on `channel_type='forum'` leaves, like
+    // the other forum-only columns.
+    let _ = sqlx::query(
+        "ALTER TABLE channels ADD COLUMN forum_require_tag BOOLEAN NOT NULL DEFAULT FALSE",
+    )
+    .execute(pool)
+    .await;
+
+    // Per-channel NSFW flag, letting part of a hub be marked NSFW instead of
+    // only the whole hub (the hub-wide `nsfw` flag surfaced on `/info`).
+    // Default off.
+    let _ = sqlx::query("ALTER TABLE channels ADD COLUMN nsfw BOOLEAN NOT NULL DEFAULT FALSE")
+        .execute(pool)
+        .await;
+
     // Admin-only local label for an external bot row (bots.md §4 "Admin UI"):
     // set at invite time via `POST /bots`, surfaced on `GET /admin/bots/external`.
     // Distinct from `bot_profiles.name`, which the bot operator controls.
@@ -1860,6 +1915,22 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     // predate signature verification entirely and can no longer collect
     // attestations through the new endpoints.
     let _ = sqlx::query("ALTER TABLE key_rotation_requests ADD COLUMN nonce TEXT")
+        .execute(pool)
+        .await;
+
+    // Member birthday, month+day only -- never a year (privacy). Stored as
+    // "MM-DD"; validated at the route layer (routes/me.rs), never here.
+    let _ = sqlx::query("ALTER TABLE users ADD COLUMN birthday TEXT")
+        .execute(pool)
+        .await;
+
+    // Per-user nickname color override for the member name colors feature.
+    // "#rrggbb" or NULL; validated at the route layer (routes/me.rs), same
+    // "empty string clears it" semantics as `accent_color`. The hub-wide
+    // `name_color_mode` setting (hub_settings key/value table) decides
+    // whether this or a role's `color` wins when resolving the color shown
+    // for a member (routes/users.rs `resolve_name_color`).
+    let _ = sqlx::query("ALTER TABLE users ADD COLUMN name_color TEXT")
         .execute(pool)
         .await;
 
