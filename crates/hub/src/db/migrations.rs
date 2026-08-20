@@ -1,12 +1,25 @@
-// Schema baseline reset 2026-07-05 (pre-production).
+// Schema baseline reset 2026-08-20 (pre-1.0), following the same reset of
+// 2026-07-05.
 //
-// All ALTER TABLE ... ADD COLUMN statements accumulated up to this point
-// have been folded into their owning CREATE TABLE definitions, and the
-// tables have been regrouped into logical sections (identity/users →
-// channels/messages → roles → moderation → federation/alliances → bots →
-// webhooks → DMs/E2E → multi-device+recovery+certs → misc content). No
-// table, column, type, default, or REFERENCES clause changed meaning in
-// the process — this is a pure reorganization of a single migration file.
+// Every ALTER TABLE ... ADD COLUMN accumulated since the July baseline has
+// been folded into its owning CREATE TABLE, and the two forum-tag tables
+// have moved up into the forum section they belong to. Columns were
+// **appended in the order the ALTERs ran**, so the physical column order is
+// unchanged and the resulting schema is byte-identical to the pre-fold one —
+// verified by diffing `pg_dump --schema-only` before and after, not by
+// reading. No table, column, type, default or REFERENCES clause changed
+// meaning.
+//
+// Exactly one ALTER survives, and it has to: `invites.grant_role_id`
+// REFERENCES `roles`, which this file creates *after* `invites`.
+//
+// This is safe to do only because nothing in production runs this schema
+// yet. Folding an ADD COLUMN deletes the statement that would upgrade an
+// existing database, and `CREATE TABLE IF NOT EXISTS` then skips the table
+// silently — a database created before a folded column would simply lack it,
+// with no error until a query touches it. Once there are hub databases in
+// the field, a fold needs a schema-version marker and a refuse-to-start
+// check first (same shape as `db/version.rs`).
 //
 // Going forward from this baseline, the additive-only rule applies again:
 // new columns on existing tables must be `ALTER TABLE ... ADD COLUMN`,
@@ -38,7 +51,21 @@ pub async fn run(pool: &PgPool) -> Result<()> {
             is_webhook        BOOLEAN NOT NULL DEFAULT FALSE,
             lobby_status      TEXT NOT NULL DEFAULT 'none',
             lobby_entered_at  BIGINT,
-            pow_level         BIGINT NOT NULL DEFAULT 0
+            pow_level         BIGINT NOT NULL DEFAULT 0,
+            presence_status    TEXT, -- away/dnd, NULL = plain online; survives reconnects
+            presence_custom    TEXT,
+            bio                TEXT, -- profile fields below: PATCH /me, empty string clears
+            pronouns           TEXT,
+            interests          TEXT, -- dormant: superseded by status_message + activities
+            status_message     TEXT,
+            activities         TEXT,
+            accent_color       TEXT, -- #rrggbb, drives the profile banner with cover
+            cover              TEXT,
+            favorite_hubs      TEXT, -- JSON [{url,name,icon}]; show_hubs gates visibility
+            show_hubs          BOOLEAN, -- NULL = false
+            bot_local_note     TEXT, -- admin-only label for an external bot (bots.md 4)
+            birthday           TEXT, -- MM-DD, never a year; validated in routes/me.rs
+            name_color         TEXT -- per-user override; hub name_color_mode picks the winner
         )",
     )
     .execute(pool)
@@ -54,7 +81,10 @@ pub async fn run(pool: &PgPool) -> Result<()> {
             public_key        TEXT NOT NULL REFERENCES users(public_key),
             created_at        BIGINT NOT NULL,
             expires_at        BIGINT,
-            expiry_warned_at  BIGINT
+            expiry_warned_at  BIGINT,
+            scope              TEXT NOT NULL DEFAULT 'member', -- 'member' | 'lobby' | 'mini_app'
+            mini_app_channel_id TEXT, -- set only for scope='mini_app': bound channel + bot
+            mini_app_bot_id    TEXT
         )",
     )
     .execute(pool)
@@ -195,7 +225,10 @@ pub async fn run(pool: &PgPool) -> Result<()> {
             is_temporary          BOOLEAN NOT NULL DEFAULT FALSE,
             owner_pubkey          TEXT,
             spawner_name_template TEXT,
-            empty_since           BIGINT
+            empty_since           BIGINT,
+            event_id           TEXT, -- squad room's originating event; nullable, no FK on purpose
+            forum_require_tag  BOOLEAN NOT NULL DEFAULT FALSE, -- forum leaves only (forum.md 10.1)
+            nsfw               BOOLEAN NOT NULL DEFAULT FALSE -- per-channel, distinct from the hub-wide flag
         )",
     )
     .execute(pool)
@@ -222,7 +255,8 @@ pub async fn run(pool: &PgPool) -> Result<()> {
             reply_to          TEXT,
             visible_to_pubkey TEXT,
             embeds            TEXT,
-            reply_count       BIGINT NOT NULL DEFAULT 0
+            reply_count       BIGINT NOT NULL DEFAULT 0,
+            game               TEXT -- bot launch card {entry_url,name,...}; bot-authored only
         )",
     )
     .execute(pool)
@@ -646,7 +680,8 @@ pub async fn run(pool: &PgPool) -> Result<()> {
             channel_id          TEXT NOT NULL REFERENCES channels(id),
             shared_at           BIGINT NOT NULL,
             include_descendants BOOLEAN NOT NULL DEFAULT FALSE,
-            PRIMARY KEY (alliance_id, channel_id)
+            PRIMARY KEY (alliance_id, channel_id),
+            forum_remote_write TEXT NOT NULL DEFAULT 'replies_only' -- 'none' | 'replies_only' | 'posts_and_replies' (forum.md 9)
         )",
     )
     .execute(pool)
@@ -692,7 +727,10 @@ pub async fn run(pool: &PgPool) -> Result<()> {
             webhook_url  TEXT,
             homepage_url TEXT,
             capabilities TEXT NOT NULL DEFAULT '[]',
-            updated_at   BIGINT NOT NULL
+            updated_at   BIGINT NOT NULL,
+            mini_app_url       TEXT, -- self-declared via BotMeta or PUT /bots/me/profile
+            requires_camera    BOOLEAN NOT NULL DEFAULT FALSE,
+            game               TEXT -- same GameLaunchCard shape as messages.game
         )",
     )
     .execute(pool)
@@ -1107,7 +1145,8 @@ pub async fn run(pool: &PgPool) -> Result<()> {
             cert_json       TEXT,
             wrapped_key_hex TEXT,
             created_at      BIGINT NOT NULL,
-            updated_at      BIGINT NOT NULL
+            updated_at      BIGINT NOT NULL,
+            wrapped_dh_seed_hex TEXT -- ECIES-wrapped canonical DH scalar (Mechanism A)
         )",
     )
     .execute(pool)
@@ -1153,7 +1192,8 @@ pub async fn run(pool: &PgPool) -> Result<()> {
             status     TEXT NOT NULL DEFAULT 'pending',
             created_at BIGINT NOT NULL,
             decided_at BIGINT,
-            decided_by TEXT
+            decided_by TEXT,
+            nonce              TEXT -- binds a contact attestation to one request
         )",
     )
     .execute(pool)
@@ -1389,7 +1429,8 @@ pub async fn run(pool: &PgPool) -> Result<()> {
             attachments      TEXT NOT NULL DEFAULT '[]',
             search_vector    tsvector GENERATED ALWAYS AS (
                 to_tsvector('simple', title || ' ' || body)
-            ) STORED
+            ) STORED,
+            author_hub         TEXT -- origin hub pubkey for proxied writes; hub-asserted only
         )",
     )
     .execute(pool)
@@ -1422,7 +1463,8 @@ pub async fn run(pool: &PgPool) -> Result<()> {
             edited_at     BIGINT,
             reply_to_id   TEXT REFERENCES post_replies(id) ON DELETE SET NULL,
             deleted_at    BIGINT,
-            attachments   TEXT NOT NULL DEFAULT '[]'
+            attachments   TEXT NOT NULL DEFAULT '[]',
+            author_hub         TEXT -- origin hub pubkey for proxied writes; hub-asserted only
         )",
     )
     .execute(pool)
@@ -1434,6 +1476,44 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     )
     .execute(pool)
     .await?;
+
+    // Post tags (forum.md §10): admin-curated, channel-scoped labels for
+    // filtering the forum post list. A definitions table plus a join table,
+    // not a JSON column on `posts` -- tag CRUD must work independently of any
+    // one post, and the join gives an indexed EXISTS filter plus FK cascade
+    // (delete a tag -> assignments vanish, no app-side sweep) for free.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS forum_tags (
+            id         TEXT PRIMARY KEY,
+            channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            label      TEXT NOT NULL,
+            color      TEXT,
+            position   BIGINT NOT NULL DEFAULT 0,
+            created_at BIGINT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_forum_tags_channel ON forum_tags(channel_id, position)",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS post_tags (
+            post_id TEXT NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+            tag_id  TEXT NOT NULL REFERENCES forum_tags(id) ON DELETE CASCADE,
+            PRIMARY KEY (post_id, tag_id)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_post_tags_tag ON post_tags(tag_id)")
+        .execute(pool)
+        .await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS post_reads (
@@ -1500,7 +1580,9 @@ pub async fn run(pool: &PgPool) -> Result<()> {
             location         TEXT,
             created_at       BIGINT NOT NULL,
             reminder_minutes BIGINT,
-            reminder_sent_at BIGINT
+            reminder_sent_at BIGINT,
+            hub_wide           BOOLEAN NOT NULL DEFAULT FALSE, -- community-wide: bypasses the anchor's read gate
+            propagate_to_children BOOLEAN NOT NULL DEFAULT FALSE -- fans cards out to descendants; one event row
         )",
     )
     .execute(pool)
@@ -1644,293 +1726,20 @@ pub async fn run(pool: &PgPool) -> Result<()> {
         .await?;
 
     // =======================================================================
-    // Post-v0.3.0-baseline additive migrations
+    // Additive migrations after the 2026-08-20 baseline
     // =======================================================================
     // The additive-only rule (see the file header): ALTER TABLE ADD COLUMN,
     // wrapped in `let _ =` so "already exists" errors are ignored.
 
-    // Presence status (away/dnd + custom text), set over WS `set_status`.
-    // NULL presence_status = plain online. Persisted so it survives
-    // reconnects; only meaningful for currently-online users.
-    let _ = sqlx::query("ALTER TABLE users ADD COLUMN presence_status TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE users ADD COLUMN presence_custom TEXT")
-        .execute(pool)
-        .await;
-
-    // Session scope (lobby-bot-survey.md Feature 1). "member" (default) or
-    // "lobby" — a lobby-scoped session is confined by the `AuthUser`
-    // extractor to a small allowlist of paths until the user's PoW level
-    // reaches `min_security_level` and the session is promoted in place
-    // (see routes/lobby.rs submit_pow). Backfilled to 'member' for every
-    // pre-existing session row so nothing already issued becomes confined.
-    let _ = sqlx::query("ALTER TABLE sessions ADD COLUMN scope TEXT NOT NULL DEFAULT 'member'")
-        .execute(pool)
-        .await;
-
-    // Mini-app session binding (bot-mini-apps.md "Scoped session token"):
-    // a `scope = 'mini_app'` session (minted by `bot_app_join`, see
-    // routes/ws/handlers/mini_app.rs) is bound to exactly one channel and
-    // one bot ID. NULL for every other scope. Recorded so the WS layer can
-    // confine auto-subscription to the bound channel only, and so a future
-    // `DELETE /bots/{id}/sessions/{token}` revocation endpoint can look up
-    // which bot a given mini-app session belongs to.
-    let _ = sqlx::query("ALTER TABLE sessions ADD COLUMN mini_app_channel_id TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE sessions ADD COLUMN mini_app_bot_id TEXT")
-        .execute(pool)
-        .await;
-
-    // Role-granting invites (task #34). NULL = a plain invite (today's
-    // behavior). When set, the role is assigned to the joining user in
-    // addition to builtin-everyone — see routes::invites::create_invite for
-    // the priority/admin guards and auth::handlers::verify for the grant.
+    // Role-granting invites (task #34). NULL = a plain invite. When set, the
+    // role is assigned to the joining user in addition to builtin-everyone --
+    // see routes::invites::create_invite for the priority/admin guards and
+    // auth::handlers::verify for the grant.
+    //
+    // This one cannot be folded into `CREATE TABLE invites`: it REFERENCES
+    // `roles`, which this file creates *after* `invites`. Folding it would
+    // make the create fail on a fresh database. Left as an ALTER on purpose.
     let _ = sqlx::query("ALTER TABLE invites ADD COLUMN grant_role_id TEXT REFERENCES roles(id)")
-        .execute(pool)
-        .await;
-
-    // Wrapped canonical DH scalar relayed through pairing complete
-    // (decisions.md "Paired-device DMs attribute to canonical via
-    // cert-chained envelopes" — Mechanism A). ECIES-wrapped for the
-    // claiming subkey, same shape as the existing `wrapped_key_hex`
-    // (prefs-blob key). NULL for pairings completed before this field
-    // existed and for any peer that hasn't relayed one.
-    let _ = sqlx::query("ALTER TABLE pairing_offers ADD COLUMN wrapped_dh_seed_hex TEXT")
-        .execute(pool)
-        .await;
-
-    // Per-hub member profile fields: free-text bio and pronouns, set via
-    // PATCH /me (routes/me.rs) and surfaced on GET /me and the public
-    // GET /users/:pubkey/profile endpoint. NULL = unset, same "empty string
-    // clears it" semantics as `avatar`.
-    let _ = sqlx::query("ALTER TABLE users ADD COLUMN bio TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE users ADD COLUMN pronouns TEXT")
-        .execute(pool)
-        .await;
-
-    // Additional member profile fields, all on the same PATCH /me /
-    // GET /users/:pubkey/profile surfaces as bio/pronouns, same "empty clears
-    // it" semantics as `avatar`. `interests` is dormant — it was the earlier
-    // structured-interests JSON column, superseded by the free-text
-    // `status_message` + `activities` fields (additive-only: kept, unused).
-    // `accent_color` (#rrggbb) and `cover` (image data URL) drive the banner.
-    let _ = sqlx::query("ALTER TABLE users ADD COLUMN interests TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE users ADD COLUMN status_message TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE users ADD COLUMN activities TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE users ADD COLUMN accent_color TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE users ADD COLUMN cover TEXT")
-        .execute(pool)
-        .await;
-
-    // Opt-in favorite-hubs list (member profile field, mirrors bio/pronouns/
-    // status_message/activities above). `favorite_hubs` is a JSON array of
-    // `{ url, name, icon }` set via PATCH /me (routes/me.rs) and surfaced on
-    // GET /me (always) and the public GET /users/:pubkey/profile endpoint
-    // (gated by `show_hubs`, except for the profile owner viewing their own
-    // profile). NULL/empty = no favorites. `show_hubs` controls visibility
-    // of that list to other members; NULL is treated as false.
-    let _ = sqlx::query("ALTER TABLE users ADD COLUMN favorite_hubs TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE users ADD COLUMN show_hubs BOOLEAN")
-        .execute(pool)
-        .await;
-
-    // Hub-level events + propagation (events.md §5, §6). `hub_wide` marks an
-    // event as belonging to the whole community rather than just its anchor
-    // channel -- `channel_id` stays NOT NULL (see events.md's "Decisions"),
-    // the card/reminder still anchor there, but `list_events`/`get_event`
-    // bypass the anchor's read-gate for these rows. `propagate_to_children`
-    // fans the announcement/reminder cards out to every descendant of the
-    // anchor in the channels tree; the event itself stays one row.
-    let _ =
-        sqlx::query("ALTER TABLE hub_events ADD COLUMN hub_wide BOOLEAN NOT NULL DEFAULT FALSE")
-            .execute(pool)
-            .await;
-    let _ = sqlx::query(
-        "ALTER TABLE hub_events ADD COLUMN propagate_to_children BOOLEAN NOT NULL DEFAULT FALSE",
-    )
-    .execute(pool)
-    .await;
-
-    // Auto-spawned squad channels (events.md §7.5, updated lifetime). Links a
-    // temp voice channel back to the event that spawned it -- nullable, no
-    // FK. A FK with `ON DELETE SET NULL` would silently sever this link the
-    // moment the event is deleted, orphaning the room from both the
-    // event-end sweep and `delete_event`'s explicit cleanup; `ON DELETE
-    // CASCADE` would instead destroy an occupied room out from under its
-    // participants, which the doc's lifetime rule forbids ("never yank an
-    // occupied room"). Both are handled by hand instead: `delete_event`
-    // deletes its squad rooms before removing the event row, and
-    // `reminder_worker`'s sweep deletes only the *empty* rooms of an ended
-    // event, leaving occupied ones to drain via the ordinary temp-channel
-    // empty-GC path.
-    let _ = sqlx::query("ALTER TABLE channels ADD COLUMN event_id TEXT")
-        .execute(pool)
-        .await;
-
-    // Bot-launched game modal (bot-capability-layer.md §2): a launch-card
-    // field carrying { entry_url, name, description?, thumbnail_url? },
-    // additive on `messages` alongside `embeds`/`components`. NULL = no
-    // launch card. Bot-authored only, enforced at write time in
-    // routes/messages.rs and bots/dispatch.rs, not by this column.
-    let _ = sqlx::query("ALTER TABLE messages ADD COLUMN game TEXT")
-        .execute(pool)
-        .await;
-
-    // External-bot mini-app registration (bot-mini-apps.md "A bot can
-    // declare a mini_app_url in its registration payload"; bots.md §17
-    // "Bot registration"). This was previously wired only to the
-    // self-service `bots` table (see the `bot_app_join` lookup in
-    // routes/ws/handlers/mini_app.rs and the migration backfill above), which
-    // left external bots -- the only bot kind with slash commands and a live
-    // WS session, i.e. the only kind that can actually own game state -- with
-    // no way to register a mini-app at all. Additive columns, self-declared
-    // via `BotMeta` at auth/accept-invite time or `PUT /bots/me/profile`,
-    // same pattern as `webhook_url`.
-    let _ = sqlx::query("ALTER TABLE bot_profiles ADD COLUMN mini_app_url TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query(
-        "ALTER TABLE bot_profiles ADD COLUMN requires_camera BOOLEAN NOT NULL DEFAULT FALSE",
-    )
-    .execute(pool)
-    .await;
-
-    // Profile-declared game descriptor (bot-capability-layer.md §11 "the one
-    // thin slice worth building now"): lets the per-hub bot directory render
-    // a Play affordance without a live launch-card message in view. JSON of
-    // the same `GameLaunchCard` shape as the `messages.game` launch card
-    // (`{ entry_url, name, description?, thumbnail_url? }`). NULL = this bot
-    // has no game to advertise. Self-declared via `BotMeta` at auth /
-    // accept-invite time or `PUT /bots/me/profile`, same pattern as
-    // `mini_app_url` -- no backfill needed since this is a brand-new field
-    // with no prior data to migrate.
-    let _ = sqlx::query("ALTER TABLE bot_profiles ADD COLUMN game TEXT")
-        .execute(pool)
-        .await;
-
-    // Forum federation phase 2 (forum.md §9 "Proxied writes"). `author_hub`
-    // is the origin hub's public key hex when a post/reply was created via
-    // the alliance forum write-proxy; NULL for locally-authored content.
-    // Hub-asserted, not cryptographically proven -- render as "via HubName",
-    // never as a verified badge (see forum.md's threat-model deltas).
-    let _ = sqlx::query("ALTER TABLE posts ADD COLUMN author_hub TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE post_replies ADD COLUMN author_hub TEXT")
-        .execute(pool)
-        .await;
-
-    // Per-shared-channel policy for federated forum writes (forum.md §9
-    // "Threat-model deltas"): 'none' | 'replies_only' | 'posts_and_replies'.
-    // Lets an announcement forum accept allied replies without opening up
-    // allied post creation. Default 'replies_only' per the doc.
-    let _ = sqlx::query(
-        "ALTER TABLE alliance_shared_channels
-         ADD COLUMN forum_remote_write TEXT NOT NULL DEFAULT 'replies_only'",
-    )
-    .execute(pool)
-    .await;
-
-    // Post tags (forum.md §10 "Post tags"): admin-curated, channel-scoped
-    // labels for filtering the forum post list. Definitions table + join
-    // table, not a JSON column on `posts` -- tag CRUD must work
-    // independently of any one post, and the join gives an indexed EXISTS
-    // filter plus FK cascade (delete a tag -> assignments vanish, no
-    // app-side sweep) for free.
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS forum_tags (
-            id         TEXT PRIMARY KEY,
-            channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
-            label      TEXT NOT NULL,
-            color      TEXT,
-            position   BIGINT NOT NULL DEFAULT 0,
-            created_at BIGINT NOT NULL
-        )",
-    )
-    .execute(pool)
-    .await?;
-
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_forum_tags_channel ON forum_tags(channel_id, position)",
-    )
-    .execute(pool)
-    .await?;
-
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS post_tags (
-            post_id TEXT NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
-            tag_id  TEXT NOT NULL REFERENCES forum_tags(id) ON DELETE CASCADE,
-            PRIMARY KEY (post_id, tag_id)
-        )",
-    )
-    .execute(pool)
-    .await?;
-
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_post_tags_tag ON post_tags(tag_id)")
-        .execute(pool)
-        .await?;
-
-    // Per-channel "require at least one tag" toggle (forum.md §10.1 Q2),
-    // default off. Only meaningful on `channel_type='forum'` leaves, like
-    // the other forum-only columns.
-    let _ = sqlx::query(
-        "ALTER TABLE channels ADD COLUMN forum_require_tag BOOLEAN NOT NULL DEFAULT FALSE",
-    )
-    .execute(pool)
-    .await;
-
-    // Per-channel NSFW flag, letting part of a hub be marked NSFW instead of
-    // only the whole hub (the hub-wide `nsfw` flag surfaced on `/info`).
-    // Default off.
-    let _ = sqlx::query("ALTER TABLE channels ADD COLUMN nsfw BOOLEAN NOT NULL DEFAULT FALSE")
-        .execute(pool)
-        .await;
-
-    // Admin-only local label for an external bot row (bots.md §4 "Admin UI"):
-    // set at invite time via `POST /bots`, surfaced on `GET /admin/bots/external`.
-    // Distinct from `bot_profiles.name`, which the bot operator controls.
-    let _ = sqlx::query("ALTER TABLE users ADD COLUMN bot_local_note TEXT")
-        .execute(pool)
-        .await;
-
-    // Recovery-attestation nonce (recovery-attestation.md §2 "Nonce (hub)").
-    // Generated by `POST /recovery/rotate-key` and returned to the
-    // requester; binds a contact's attestation signature to this one
-    // request (`hub_pubkey` in the signed bundle binds it to this one hub).
-    // NULL for rows created before this column existed -- those requests
-    // predate signature verification entirely and can no longer collect
-    // attestations through the new endpoints.
-    let _ = sqlx::query("ALTER TABLE key_rotation_requests ADD COLUMN nonce TEXT")
-        .execute(pool)
-        .await;
-
-    // Member birthday, month+day only -- never a year (privacy). Stored as
-    // "MM-DD"; validated at the route layer (routes/me.rs), never here.
-    let _ = sqlx::query("ALTER TABLE users ADD COLUMN birthday TEXT")
-        .execute(pool)
-        .await;
-
-    // Per-user nickname color override for the member name colors feature.
-    // "#rrggbb" or NULL; validated at the route layer (routes/me.rs), same
-    // "empty string clears it" semantics as `accent_color`. The hub-wide
-    // `name_color_mode` setting (hub_settings key/value table) decides
-    // whether this or a role's `color` wins when resolving the color shown
-    // for a member (routes/users.rs `resolve_name_color`).
-    let _ = sqlx::query("ALTER TABLE users ADD COLUMN name_color TEXT")
         .execute(pool)
         .await;
 
