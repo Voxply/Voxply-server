@@ -136,6 +136,18 @@ pub async fn update_hub(
         }
         upsert_setting(&state.db, "afk_timeout_secs", &secs.to_string()).await?;
     }
+    if let Some(bytes) = req.max_attachment_bytes {
+        if !(MIN_MAX_ATTACHMENT_BYTES..=MAX_MAX_ATTACHMENT_BYTES).contains(&bytes) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "max_attachment_bytes must be between {} and {} bytes",
+                    MIN_MAX_ATTACHMENT_BYTES, MAX_MAX_ATTACHMENT_BYTES
+                ),
+            ));
+        }
+        upsert_setting(&state.db, "max_attachment_bytes", &bytes.to_string()).await?;
+    }
     if let Some(mode) = req.name_color_mode.as_deref() {
         if !crate::routes::users::NAME_COLOR_MODES.contains(&mode) {
             return Err((
@@ -385,6 +397,8 @@ pub async fn get_hub_settings(
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_AFK_TIMEOUT_SECS);
 
+    let max_attachment_bytes = read_attachment_cap(&state.db).await;
+
     let name_color_mode = crate::routes::users::name_color_mode(&state.db).await;
 
     Ok(Json(HubSettings {
@@ -398,7 +412,37 @@ pub async fn get_hub_settings(
         afk_channel_id,
         afk_timeout_secs,
         name_color_mode,
+        max_attachment_bytes,
     }))
+}
+
+/// Default attachment cap: the value that used to be the compile-time
+/// constant, so an existing hub behaves identically until an operator changes
+/// it.
+pub const DEFAULT_MAX_ATTACHMENT_BYTES: u64 = 3 * 1024 * 1024;
+
+/// Floor. Below this, ordinary screenshots stop working and the setting looks
+/// broken rather than strict.
+pub const MIN_MAX_ATTACHMENT_BYTES: u64 = 64 * 1024;
+
+/// Ceiling, and it is not arbitrary. Attachments are stored **inline** — the
+/// `attachments` column is TEXT holding base64 — so the cap is really a cap on
+/// how large a single message row may get, and base64 inflates by a third
+/// on top. A reverse proxy in front will refuse the request first anyway:
+/// hosting.md's nginx vhost sets `client_max_body_size 10M`. Letting an
+/// operator raise this past that point would produce uploads that fail at the
+/// proxy with no explanation from the hub.
+pub const MAX_MAX_ATTACHMENT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The configured attachment cap, falling back to the default when unset or
+/// unparseable. Read per request: an operator raising the limit should not
+/// need to restart the hub.
+pub async fn read_attachment_cap(db: &sqlx::PgPool) -> u64 {
+    read_setting(db, "max_attachment_bytes")
+        .await
+        .and_then(|v| v.parse().ok())
+        .filter(|b| *b >= MIN_MAX_ATTACHMENT_BYTES && *b <= MAX_MAX_ATTACHMENT_BYTES)
+        .unwrap_or(DEFAULT_MAX_ATTACHMENT_BYTES)
 }
 
 /// Default idle threshold for the AFK sweep when a channel is configured but
@@ -436,6 +480,14 @@ pub struct HubSettings {
     /// "user_only", "none". Defaults to "role_over_user" when unset.
     #[serde(default = "default_name_color_mode")]
     pub name_color_mode: String,
+    /// Largest total attachment payload a single message may carry, in bytes.
+    /// Was a compile-time constant, so an operator had no way to change it.
+    #[serde(default = "default_attachment_cap")]
+    pub max_attachment_bytes: u64,
+}
+
+fn default_attachment_cap() -> u64 {
+    DEFAULT_MAX_ATTACHMENT_BYTES
 }
 
 fn default_afk_timeout() -> u32 {
@@ -528,6 +580,11 @@ pub struct UpdateHubRequest {
     /// Idle threshold for the AFK sweep, in seconds. Minimum 60.
     #[serde(default)]
     pub afk_timeout_secs: Option<u32>,
+    /// Largest total attachment payload per message, in bytes. Clamped to
+    /// [`MIN_MAX_ATTACHMENT_BYTES`, `MAX_MAX_ATTACHMENT_BYTES`] — see those
+    /// constants for why there is a ceiling at all.
+    #[serde(default)]
+    pub max_attachment_bytes: Option<u64>,
     /// Priority order for resolving a member's displayed name color (member
     /// name colors feature). Must be one of `NAME_COLOR_MODES`
     /// ("user_over_role", "role_over_user", "role_only", "user_only",

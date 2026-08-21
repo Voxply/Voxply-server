@@ -132,10 +132,10 @@ pub struct Attachment {
     pub data_b64: String,
 }
 
-/// Hard cap per message, summed across all attachments. 3 MB of base64
-/// is roughly 2.25 MB of binary -- enough for screenshots, small images,
-/// short clips, but bounded so the DB and WS frames don't get crushed.
-pub const MAX_ATTACHMENTS_BYTES: usize = 3 * 1024 * 1024;
+// The per-message attachment cap moved to hub_settings and lives in
+// routes::hub as DEFAULT_MAX_ATTACHMENT_BYTES (plus its floor and ceiling).
+// It was a compile-time constant here, which is why an operator had no way to
+// change it.
 
 #[derive(Serialize, Deserialize)]
 pub struct SendMessageRequest {

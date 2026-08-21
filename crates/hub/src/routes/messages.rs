@@ -11,7 +11,7 @@ use crate::permissions;
 use crate::routes::bot_models::{Embed, GameLaunchCard};
 use crate::routes::chat_models::{
     Attachment, ChatEvent, EditMessageRequest, MessageResponse, PaginationParams, ReactionRequest,
-    ReactionSummary, ReplyContext, SendMessageRequest, MAX_ATTACHMENTS_BYTES,
+    ReactionSummary, ReplyContext, SendMessageRequest,
 };
 use crate::state::AppState;
 
@@ -88,14 +88,18 @@ pub async fn send_message(
 
     // Cap attachments size. The base64 payload is what counts toward the
     // limit since that's what travels over WS and lands in the DB.
-    let attach_total: usize = req.attachments.iter().map(|a| a.data_b64.len()).sum();
-    if attach_total > MAX_ATTACHMENTS_BYTES {
+    // Operator-configurable since 2026-08-21 (hub_settings
+    // `max_attachment_bytes`); the old constant is now only the default.
+    let cap = crate::routes::hub::read_attachment_cap(&state.db).await;
+    let attach_total: u64 = req
+        .attachments
+        .iter()
+        .map(|a| a.data_b64.len() as u64)
+        .sum();
+    if attach_total > cap {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
-            format!(
-                "Attachments exceed {}MB cap",
-                MAX_ATTACHMENTS_BYTES / 1024 / 1024
-            ),
+            format!("Attachments exceed {}MB cap", cap / 1024 / 1024),
         ));
     }
 

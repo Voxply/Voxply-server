@@ -31,6 +31,11 @@ pub const CAPABILITIES: &[&str] = &[
     // talking to a hub that still has `POST /admin/bots`, so its admin panel
     // must offer the hub-minted-token flow instead of an invite field.
     "bots.external",
+    // `/info` carries `max_attachment_bytes` and hub admin can change it. A
+    // client that does not see this string is talking to a hub whose cap is a
+    // compile-time 3 MB, so it must keep using its own constant rather than
+    // trusting a field that will not be there.
+    "limits.attachments",
     // `GET /users`, `GET /conversations/{id}/messages` and `GET
     // /admin/reports` honour `limit` + a keyset `cursor`. Without this the
     // hub ignores both and returns one truncated page — a client that pages

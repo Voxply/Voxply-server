@@ -131,6 +131,7 @@ pub async fn info(State(state): State<Arc<AppState>>) -> Json<InfoResponse> {
     .filter(|s| !s.is_empty());
 
     let birthdays_enabled = crate::routes::hub::birthdays_enabled(&state.db).await;
+    let max_attachment_bytes = crate::routes::hub::read_attachment_cap(&state.db).await;
 
     Json(InfoResponse {
         name: branding.name,
@@ -164,6 +165,7 @@ pub async fn info(State(state): State<Arc<AppState>>) -> Json<InfoResponse> {
         voice_cert_hash: state.voice_cert_hash.read().await.clone(),
         timezone,
         birthdays_enabled,
+        max_attachment_bytes,
         canonical_url: state.canonical_url.read().await.clone(),
     })
 }
@@ -273,6 +275,11 @@ pub struct InfoResponse {
     /// true when never configured.
     #[serde(default = "default_true")]
     pub birthdays_enabled: bool,
+    /// Per-message attachment cap in bytes, operator-configurable. Public
+    /// because every client needs it to refuse an oversized file *before*
+    /// uploading it — a client with its own hardcoded copy silently ignores
+    /// an operator who raised or lowered the limit.
+    pub max_attachment_bytes: u64,
     /// The address this hub says clients should use for it.
     ///
     /// Behind a farm this is the hub's canonical slug URL and it **changes**

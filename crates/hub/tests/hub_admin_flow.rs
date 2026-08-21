@@ -294,3 +294,121 @@ async fn welcome_banner_label_too_long_rejected() {
     let info: serde_json::Value = server.get("/info").await.json();
     assert!(info.get("welcome_label").is_none());
 }
+
+// ---------------------------------------------------------------------------
+// Per-message attachment cap — an operator-settable limit
+// ---------------------------------------------------------------------------
+
+/// The cap was a compile-time constant, so an operator asking "where do I
+/// change the upload limit?" had no answer. It is a hub setting now, with a
+/// floor and a ceiling that exist for a reason (attachments are stored inline,
+/// and a reverse proxy in front refuses oversized bodies first).
+#[tokio::test]
+async fn admin_sets_and_reads_the_attachment_cap() {
+    let server = common::setup().await;
+    let owner = Identity::generate();
+    let token = common::authenticate(&server, &owner).await;
+
+    // Defaults to the value the old constant had, so an existing hub does not
+    // change behaviour just because the setting appeared.
+    let settings: serde_json::Value = server
+        .get("/hub/settings")
+        .authorization_bearer(&token)
+        .await
+        .json();
+    assert_eq!(settings["max_attachment_bytes"], 3 * 1024 * 1024);
+
+    server
+        .patch("/hub")
+        .authorization_bearer(&token)
+        .json(&json!({ "max_attachment_bytes": 5 * 1024 * 1024 }))
+        .await
+        .assert_status_ok();
+
+    let settings: serde_json::Value = server
+        .get("/hub/settings")
+        .authorization_bearer(&token)
+        .await
+        .json();
+    assert_eq!(settings["max_attachment_bytes"], 5 * 1024 * 1024);
+}
+
+#[tokio::test]
+async fn attachment_cap_rejects_values_outside_the_bounds() {
+    let server = common::setup().await;
+    let owner = Identity::generate();
+    let token = common::authenticate(&server, &owner).await;
+
+    // Below the floor: ordinary screenshots would stop working and the setting
+    // would look broken rather than strict.
+    server
+        .patch("/hub")
+        .authorization_bearer(&token)
+        .json(&json!({ "max_attachment_bytes": 1024 }))
+        .await
+        .assert_status(axum::http::StatusCode::BAD_REQUEST);
+
+    // Above the ceiling: hosting.md's nginx vhost caps bodies at 10M, so a
+    // larger hub-side limit only produces uploads that die at the proxy.
+    server
+        .patch("/hub")
+        .authorization_bearer(&token)
+        .json(&json!({ "max_attachment_bytes": 64 * 1024 * 1024 }))
+        .await
+        .assert_status(axum::http::StatusCode::BAD_REQUEST);
+
+    // Rejected means unchanged, not partially applied.
+    let settings: serde_json::Value = server
+        .get("/hub/settings")
+        .authorization_bearer(&token)
+        .await
+        .json();
+    assert_eq!(settings["max_attachment_bytes"], 3 * 1024 * 1024);
+}
+
+#[tokio::test]
+async fn a_message_over_the_configured_cap_is_refused() {
+    let server = common::setup().await;
+    let owner = Identity::generate();
+    let token = common::authenticate(&server, &owner).await;
+
+    let chan: serde_json::Value = server
+        .post("/channels")
+        .authorization_bearer(&token)
+        .json(&json!({ "name": "uploads" }))
+        .await
+        .json();
+    let channel_id = chan["id"].as_str().unwrap().to_string();
+
+    // Tighten the cap, then send just over it. Proves the send path reads the
+    // setting rather than the old constant — with the constant still in force
+    // this 200 KB payload would sail through.
+    server
+        .patch("/hub")
+        .authorization_bearer(&token)
+        .json(&json!({ "max_attachment_bytes": 128 * 1024 }))
+        .await
+        .assert_status_ok();
+
+    let payload = "A".repeat(200 * 1024);
+    let resp = server
+        .post(&format!("/channels/{channel_id}/messages"))
+        .authorization_bearer(&token)
+        .json(&json!({
+            "content": "too big",
+            "attachments": [{ "name": "big.bin", "mime": "application/octet-stream", "data_b64": payload }],
+        }))
+        .await;
+    resp.assert_status(axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+
+    // And a small one still goes through under the same tightened cap.
+    server
+        .post(&format!("/channels/{channel_id}/messages"))
+        .authorization_bearer(&token)
+        .json(&json!({
+            "content": "small enough",
+            "attachments": [{ "name": "ok.bin", "mime": "application/octet-stream", "data_b64": "A".repeat(1024) }],
+        }))
+        .await
+        .assert_status_success();
+}
