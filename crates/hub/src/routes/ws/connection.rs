@@ -8,6 +8,15 @@ use crate::routes::chat_models::{WsClientMessage, WsServerMessage};
 use crate::state::AppState;
 
 use super::conn_state::{ConnState, DispatchResult};
+
+/// How often the hub pings an idle socket.
+const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How long a socket may go without a single inbound frame before it is
+/// treated as dead. Three missed pings — generous enough to survive a brief
+/// stall, short enough that a phantom voice participant clears in a minute
+/// rather than never.
+const KEEPALIVE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(65);
 use super::handlers::{bot, chat, mini_app, screen, voice};
 use super::voice::get_voice_roster;
 
@@ -211,6 +220,22 @@ pub(super) async fn handle_socket(
         }
     }
 
+    // ── Liveness ─────────────────────────────────────────────────────────────
+    //
+    // Nothing used to notice a client that vanished without closing its socket
+    // — a slept laptop, a changed network, a killed tab. The read loop stayed
+    // parked on a half-open TCP connection for as long as the OS took to
+    // notice, and because the disconnect cleanup below is the *only* thing
+    // that calls `leave_voice`, that member sat in the voice roster the whole
+    // time. Reconnecting then showed them talking to themselves.
+    //
+    // WebSocket ping is the right tool: browsers answer at the protocol level,
+    // so this needs no client cooperation. Any inbound frame counts as proof
+    // of life, pong included.
+    let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_seen = std::time::Instant::now();
+
     // ── Main select! loop ────────────────────────────────────────────────────
 
     loop {
@@ -345,7 +370,28 @@ pub(super) async fn handle_socket(
             }
 
             // ── Inbound client frame ──────────────────────────────────────
+            // ── Liveness probe ────────────────────────────────────────────
+            _ = keepalive.tick() => {
+                if last_seen.elapsed() > KEEPALIVE_DEADLINE {
+                    // Breaking runs the disconnect cleanup below, which is
+                    // what actually frees the voice roster entry.
+                    tracing::debug!(
+                        "WebSocket liveness timeout, closing: {}",
+                        public_key
+                    );
+                    break;
+                }
+                if ws_tx.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
+            }
+
             msg = ws_rx.next() => {
+                // Proof of life before anything else: a pong, or a frame this
+                // loop ignores, still means the peer is there.
+                if matches!(msg, Some(Ok(_))) {
+                    last_seen = std::time::Instant::now();
+                }
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         // Silently ignore unparseable frames (protocol contract).
