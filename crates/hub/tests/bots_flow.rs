@@ -693,73 +693,6 @@ async fn external_bot_can_poll_events() {
 }
 
 #[tokio::test]
-async fn external_bot_voice_join_returns_ws_url() {
-    let (server, owner_token) = common::setup_with_owner().await;
-
-    let chan: serde_json::Value = server
-        .post("/channels")
-        .authorization_bearer(&owner_token)
-        .json(&json!({ "name": "voice-test" }))
-        .await
-        .json();
-    let channel_id = chan["id"].as_str().unwrap().to_string();
-
-    let bot = Identity::generate();
-    let bot_token = invite_and_auth_bot(&server, &owner_token, &bot).await;
-    let bot_key = bot.public_key_hex();
-
-    let join = server
-        .post(&format!("/bots/{bot_key}/voice/join"))
-        .authorization_bearer(&bot_token)
-        .json(&json!({ "channel_id": channel_id }))
-        .await;
-    join.assert_status_success();
-    let body: serde_json::Value = join.json();
-    assert_eq!(body["ws_url"], "/ws");
-    assert_eq!(body["channel_id"], channel_id);
-}
-
-#[tokio::test]
-async fn external_bot_voice_join_rejects_a_different_bot_in_the_path() {
-    let (server, owner_token) = common::setup_with_owner().await;
-
-    let chan: serde_json::Value = server
-        .post("/channels")
-        .authorization_bearer(&owner_token)
-        .json(&json!({ "name": "voice-test" }))
-        .await
-        .json();
-    let channel_id = chan["id"].as_str().unwrap().to_string();
-
-    let caller = Identity::generate();
-    let caller_token = invite_and_auth_bot(&server, &owner_token, &caller).await;
-    let other = Identity::generate();
-    invite_and_auth_bot(&server, &owner_token, &other).await;
-
-    let resp = server
-        .post(&format!("/bots/{}/voice/join", other.public_key_hex()))
-        .authorization_bearer(&caller_token)
-        .json(&json!({ "channel_id": channel_id }))
-        .await;
-    resp.assert_status(axum::http::StatusCode::FORBIDDEN);
-}
-
-#[tokio::test]
-async fn external_bot_voice_join_rejects_missing_channel() {
-    let (server, owner_token) = common::setup_with_owner().await;
-
-    let bot = Identity::generate();
-    let bot_token = invite_and_auth_bot(&server, &owner_token, &bot).await;
-
-    let resp = server
-        .post(&format!("/bots/{}/voice/join", bot.public_key_hex()))
-        .authorization_bearer(&bot_token)
-        .json(&json!({ "channel_id": "no-such-channel" }))
-        .await;
-    resp.assert_status(axum::http::StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
 async fn external_bot_voice_leave_succeeds() {
     let (server, owner_token) = common::setup_with_owner().await;
 
@@ -816,4 +749,50 @@ async fn external_bot_screenshare_start_and_stop() {
         .json(&json!({ "channel_id": channel_id, "stream_id": stream_id }))
         .await
         .assert_status_success();
+}
+
+#[tokio::test]
+async fn external_bot_voice_leave_rejects_a_different_bot_in_the_path() {
+    let (server, owner_token) = common::setup_with_owner().await;
+
+    let chan: serde_json::Value = server
+        .post("/channels")
+        .authorization_bearer(&owner_token)
+        .json(&json!({ "name": "voice-test" }))
+        .await
+        .json();
+    let channel_id = chan["id"].as_str().unwrap().to_string();
+
+    let caller = Identity::generate();
+    let caller_token = invite_and_auth_bot(&server, &owner_token, &caller).await;
+    let other = Identity::generate();
+    invite_and_auth_bot(&server, &owner_token, &other).await;
+
+    let resp = server
+        .delete(&format!("/bots/{}/voice/leave", other.public_key_hex()))
+        .authorization_bearer(&caller_token)
+        .json(&json!({ "channel_id": channel_id }))
+        .await;
+    resp.assert_status(axum::http::StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn bot_voice_join_rest_endpoint_is_gone() {
+    let (server, owner_token) = common::setup_with_owner().await;
+
+    let bot = Identity::generate();
+    let bot_token = invite_and_auth_bot(&server, &owner_token, &bot).await;
+
+    // It only ever echoed back a constant "/ws" after an auth check. Voice is
+    // joined over the WebSocket, which is also where the capability gate is.
+    let resp = server
+        .post(&format!("/bots/{}/voice/join", bot.public_key_hex()))
+        .authorization_bearer(&bot_token)
+        .json(&json!({ "channel_id": "whatever" }))
+        .await;
+    assert!(
+        !resp.status_code().is_success(),
+        "the join helper must not route; got {}",
+        resp.status_code()
+    );
 }

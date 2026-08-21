@@ -335,10 +335,6 @@ pub fn create_router_full(
         .route("/bots/{pubkey}", delete(routes::bots::ext_remove_bot))
         // ---- Bot voice REST endpoints ----
         .route(
-            "/bots/{id}/voice/join",
-            post(routes::bots::voice::bot_voice_join),
-        )
-        .route(
             "/bots/{id}/voice/leave",
             delete(routes::bots::voice::bot_voice_leave),
         )

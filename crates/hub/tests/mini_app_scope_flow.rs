@@ -170,26 +170,67 @@ async fn send_message(base: &str, token: &str, channel_id: &str, content: &str) 
     assert!(resp.status().is_success());
 }
 
-/// POST /admin/bots — registers a bot with a `mini_app_url`, then grants it
+/// Invites a bot that self-declares a `mini_app_url`, then grants it
 /// `can_use_interactive_ui` (bot-capability-layer.md §1, §6 Phase 1 item 3)
 /// via the new admin capabilities route so this file's tests -- which cover
 /// session-token scoping, not the capability gate itself -- keep exercising
 /// a bot that's actually allowed to open the mini-app modal. `token` is
 /// always the hub owner in this file's callers, so it already holds admin.
 async fn create_mini_app_bot(base: &str, token: &str) -> Value {
-    let resp = reqwest::Client::new()
-        .post(format!("{base}/admin/bots"))
+    let client = reqwest::Client::new();
+    let bot = Identity::generate();
+    let bot_id = bot.public_key_hex();
+
+    // Invite by pubkey — the only way a bot comes into existence now
+    // (decisions.md, "Every bot is an external bot").
+    let invited = client
+        .post(format!("{base}/bots"))
         .bearer_auth(token)
-        .json(&json!({
-            "display_name": "Gartic Bot",
-            "mini_app_url": "https://gartic.example.com/wavvon",
-        }))
+        .json(&json!({ "pubkey": bot_id }))
         .send()
         .await
         .unwrap();
-    assert!(resp.status().is_success(), "bot creation should succeed");
-    let bot: Value = resp.json().await.unwrap();
+    assert!(invited.status().is_success(), "bot invite should succeed");
 
+    let challenge: Value = client
+        .post(format!("{base}/auth/challenge"))
+        .json(&json!({ "public_key": bot_id }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let challenge_bytes = hex::decode(challenge["challenge"].as_str().unwrap()).unwrap();
+    let signature = bot.sign(&challenge_bytes);
+
+    // The bot self-declares the mini-app URL and the capability; the grant
+    // below is the other half of requested ∩ granted.
+    let verify: Value = client
+        .post(format!("{base}/auth/verify"))
+        .json(&json!({
+            "public_key": bot_id,
+            "challenge": challenge["challenge"],
+            "signature": hex::encode(signature.to_bytes()),
+            "is_bot": true,
+            "bot_meta": {
+                "name": "Gartic Bot",
+                "mini_app_url": "https://gartic.example.com/wavvon",
+                "capabilities": ["can_use_interactive_ui"],
+            },
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        verify["token"].is_string(),
+        "bot auth should return a token"
+    );
+
+    let bot = json!({ "public_key": bot_id });
     let bot_id = bot["public_key"].as_str().unwrap();
     let grant = reqwest::Client::new()
         .put(format!("{base}/admin/bots/{bot_id}/capabilities"))
@@ -391,8 +432,11 @@ async fn mini_app_token_cannot_call_admin_route() {
 
     let session_token = join_mini_app(&base, &member_token, &bot_id, &channel_id).await;
 
+    // Any admin route will do; this one has to still exist, or a 404 from
+    // routing would masquerade as the scope check doing its job. GET
+    // /admin/bots used to stand here and stopped existing.
     let resp = reqwest::Client::new()
-        .get(format!("{base}/admin/bots"))
+        .get(format!("{base}/admin/audit-log"))
         .bearer_auth(&session_token)
         .send()
         .await
