@@ -275,6 +275,17 @@ fn make_test_webauthn() -> Arc<webauthn_rs::Webauthn> {
 /// (which doesn't, for tests that specifically exercise the invite-first
 /// default from task #31).
 async fn build_harness(db: PgPool, guard: TestDbGuard) -> TestHarness {
+    build_harness_with_web_client(db, guard, None).await
+}
+
+/// Same harness, with an optional web client mounted. Only the join-link test
+/// needs one: `GET /join/{code}` answers a browser with the client and a
+/// program with JSON, and with no client configured there is nothing to serve.
+async fn build_harness_with_web_client(
+    db: PgPool,
+    guard: TestDbGuard,
+    web_client: Option<Arc<wavvon_hub::web_client::WebClientConfig>>,
+) -> TestHarness {
     let store: Arc<dyn store::HubStore> = Arc::new(PostgresStore::new(db.clone()));
     let (chat_tx, _) = broadcast::channel(256);
     let (voice_event_tx, _) = broadcast::channel(16);
@@ -336,7 +347,7 @@ async fn build_harness(db: PgPool, guard: TestDbGuard) -> TestHarness {
         lan_tls_mode: None,
         lan_fingerprint: None,
     });
-    let app = server::create_router(state.clone());
+    let app = server::create_router_full(state.clone(), "*", false, web_client);
     TestHarness {
         server: TestServer::new(app),
         _guard: guard,
@@ -385,6 +396,22 @@ pub async fn authenticate(server: &TestServer, identity: &Identity) -> String {
         .await;
     let verify: VerifyResponse = resp.json();
     verify.token
+}
+
+/// A harness whose hub serves a web client out of `dir`, plus an owner token.
+/// `dir` must contain an `index.html`; the caller owns its lifetime (use a
+/// tempdir that outlives the harness).
+#[allow(dead_code)]
+pub async fn setup_with_owner_and_web_client(
+    dir: impl Into<std::path::PathBuf>,
+) -> (TestHarness, String) {
+    let cfg =
+        wavvon_hub::web_client::WebClientConfig::load(dir).expect("web client dir should load");
+    let (db, guard) = create_test_db().await;
+    let server = build_harness_with_web_client(db, guard, Some(Arc::new(cfg))).await;
+    let owner = Identity::generate();
+    let token = authenticate(&server, &owner).await;
+    (server, token)
 }
 
 #[allow(dead_code)]

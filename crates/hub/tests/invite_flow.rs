@@ -1065,3 +1065,81 @@ async fn default_invite_role_can_be_set_and_cleared() {
     let settings: HubSettings = resp.json();
     assert!(settings.default_invite_role_id.is_none());
 }
+
+// ---------------------------------------------------------------------------
+// GET /join/:code answers a person and a program differently
+// ---------------------------------------------------------------------------
+
+/// The pilot operator sent this link to a friend, who saw
+/// `{"code":…,"hub_name":…}` on a white page and asked what to do with it.
+/// A browser must land in the web client; the JSON preview stays for callers
+/// that ask for it.
+#[tokio::test]
+async fn join_link_serves_the_web_client_to_a_browser() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("index.html"),
+        "<!doctype html><html><head><title>Wavvon</title></head><body></body></html>",
+    )
+    .unwrap();
+
+    let (server, owner_token) = common::setup_with_owner_and_web_client(dir.path()).await;
+
+    let invite: serde_json::Value = server
+        .post("/invites")
+        .authorization_bearer(&owner_token)
+        .json(&json!({}))
+        .await
+        .json();
+    let code = invite["code"].as_str().unwrap().to_string();
+
+    // A browser sends Accept: text/html and gets the SPA shell.
+    let page = server
+        .get(&format!("/join/{code}"))
+        .add_header("accept", "text/html,application/xhtml+xml")
+        .await;
+    page.assert_status_success();
+    let body = page.text();
+    assert!(
+        body.contains("<!doctype html"),
+        "a browser must get the web client, got: {}",
+        &body[..body.len().min(120)]
+    );
+    assert!(
+        !body.contains("\"hub_name\""),
+        "the JSON preview must not be what a browser sees"
+    );
+
+    // An API caller still gets the preview.
+    let api = server
+        .get(&format!("/join/{code}"))
+        .add_header("accept", "application/json")
+        .await;
+    api.assert_status_success();
+    let json: serde_json::Value = api.json();
+    assert_eq!(json["code"], code);
+    assert!(json["hub_name"].is_string());
+}
+
+/// With no web client configured there is nothing better to answer with, so
+/// the endpoint keeps its old behaviour rather than 404ing a browser.
+#[tokio::test]
+async fn join_link_falls_back_to_json_when_no_web_client_is_served() {
+    let (server, owner_token) = common::setup_with_owner().await;
+
+    let invite: serde_json::Value = server
+        .post("/invites")
+        .authorization_bearer(&owner_token)
+        .json(&json!({}))
+        .await
+        .json();
+    let code = invite["code"].as_str().unwrap().to_string();
+
+    let resp = server
+        .get(&format!("/join/{code}"))
+        .add_header("accept", "text/html")
+        .await;
+    resp.assert_status_success();
+    let json: serde_json::Value = resp.json();
+    assert_eq!(json["code"], code);
+}

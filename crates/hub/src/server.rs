@@ -93,6 +93,11 @@ pub fn create_router_full(
     let auth_limiter = RateLimiter::new(Config::AUTH, trusted_proxy);
     let write_limiter = RateLimiter::new(Config::WRITE, trusted_proxy);
 
+    // `GET /join/{code}` answers a browser with the web client and a program
+    // with JSON, so it needs the index bytes. Cloned out before the builder
+    // chain consumes `web_client` for the SPA fallback at the end.
+    let join_index_html = web_client.as_ref().map(|c| c.index_html.clone());
+
     // Rate-limited auth sub-router (strict, because anyone can hit these).
     let auth_routes = Router::new()
         .route("/auth/challenge", post(auth::handlers::challenge))
@@ -498,7 +503,17 @@ pub fn create_router_full(
         // ---- Join links (Feature 5) ----
         .route(
             "/join/{code}",
-            get(routes::invites::get_join_info).post(routes::invites::join_with_invite),
+            get(
+                move |state: axum::extract::State<Arc<AppState>>,
+                      path: axum::extract::Path<String>,
+                      headers: axum::http::HeaderMap| {
+                    let index = join_index_html.clone();
+                    async move {
+                        routes::invites::get_join_page_or_info(state, path, headers, index).await
+                    }
+                },
+            )
+            .post(routes::invites::join_with_invite),
         )
         // ---- Unread counts (Feature 2) ----
         // Must be registered before /channels/{channel_id} to avoid "unread" being matched as a path param.

@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use rand::RngCore;
 
@@ -532,4 +533,42 @@ struct InviteRow {
     expires_at: Option<i64>,
     created_at: i64,
     grant_role_id: Option<String>,
+}
+
+/// GET /join/:code — the same URL for a person and for a program.
+///
+/// This is the link an operator pastes into a chat, so opening it in a browser
+/// has to land in the web client. It used to answer JSON unconditionally, which
+/// meant a new user’s first contact with Wavvon was
+/// `{"code":…,"hub_name":…}` on a white page. A request that accepts HTML now
+/// gets the client (which reads the code back out of the path); anything else,
+/// including every API caller, still gets the preview JSON.
+///
+/// `index_html` is `None` when the hub serves no web client, and then there is
+/// nothing better to answer with than the JSON.
+pub async fn get_join_page_or_info(
+    State(state): State<Arc<AppState>>,
+    Path(code): Path<String>,
+    headers: HeaderMap,
+    index_html: Option<Arc<[u8]>>,
+) -> Response {
+    let wants_html = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|accept| accept.contains("text/html"));
+
+    if wants_html {
+        if let Some(bytes) = index_html {
+            return (
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                bytes.to_vec(),
+            )
+                .into_response();
+        }
+    }
+
+    match get_join_info(State(state), Path(code)).await {
+        Ok(json) => json.into_response(),
+        Err((status, message)) => (status, message).into_response(),
+    }
 }
