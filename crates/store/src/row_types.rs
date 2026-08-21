@@ -225,17 +225,6 @@ pub struct BotProfileRow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BotRow {
-    pub public_key: String,
-    pub display_name: String,
-    pub created_by: String,
-    pub token_hash: String,
-    pub webhook_url: Option<String>,
-    pub mini_app_url: Option<String>,
-    pub created_at: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BotCommandRow {
     pub pubkey: String,
     pub name: String,

@@ -1,60 +1,22 @@
 use std::sync::Arc;
 
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::Json;
 use uuid::Uuid;
 
 use crate::state::AppState;
 
-use super::models::{authenticate_bot, AckRequest, BotSendRequest, EventInfo, EventRow, PollQuery};
-
-/// PUT /bot/commands  — replace slash command list
-pub async fn bot_set_commands(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(req): Json<super::models::SetCommandsRequest>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    let bot = authenticate_bot(&state.db, &headers).await?;
-
-    // Replace atomically: delete all, insert new.
-    sqlx::query("DELETE FROM bot_slash_commands WHERE bot_pubkey = $1")
-        .bind(&bot.public_key)
-        .execute(&state.db)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
-
-    let now = crate::auth::handlers::unix_timestamp();
-    for cmd in &req.commands {
-        let cmd_word = cmd.command.trim().to_lowercase();
-        if cmd_word.is_empty() {
-            continue;
-        }
-        let id = Uuid::new_v4().to_string();
-        sqlx::query(
-            "INSERT INTO bot_slash_commands (id, bot_pubkey, command, description, created_at)
-             VALUES ($1, $2, $3, $4, $5)",
-        )
-        .bind(&id)
-        .bind(&bot.public_key)
-        .bind(&cmd_word)
-        .bind(cmd.description.trim())
-        .bind(now)
-        .execute(&state.db)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
-    }
-
-    Ok(StatusCode::OK)
-}
+use super::models::{bot_session, AckRequest, BotSendRequest, EventInfo, EventRow, PollQuery};
+use crate::auth::middleware::AuthUser;
 
 /// POST /bot/send  — post a message as the bot
 pub async fn bot_send_message(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    user: AuthUser,
     Json(req): Json<BotSendRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let bot = authenticate_bot(&state.db, &headers).await?;
+    let bot = bot_session(&state.db, &user).await?;
 
     // Verify channel exists.
     let exists: Option<String> = sqlx::query_scalar("SELECT id FROM channels WHERE id = $1")
@@ -120,10 +82,10 @@ pub async fn bot_send_message(
 /// GET /bot/poll  — poll undelivered events
 pub async fn bot_poll(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    user: AuthUser,
     Query(params): Query<PollQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let bot = authenticate_bot(&state.db, &headers).await?;
+    let bot = bot_session(&state.db, &user).await?;
 
     let rows = if let Some(since) = params.since {
         sqlx::query_as::<_, EventRow>(
@@ -163,10 +125,10 @@ pub async fn bot_poll(
 /// DELETE /bot/events  — acknowledge events as delivered
 pub async fn bot_ack_events(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    user: AuthUser,
     Json(req): Json<AckRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let bot = authenticate_bot(&state.db, &headers).await?;
+    let bot = bot_session(&state.db, &user).await?;
 
     for id in &req.ids {
         let _ = sqlx::query(

@@ -2,14 +2,15 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     Json,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
 
-use super::models::authenticate_bot;
+use super::models::bot_session;
+use crate::auth::middleware::AuthUser;
 
 #[derive(Deserialize)]
 pub struct VoiceJoinRequest {
@@ -36,10 +37,10 @@ pub struct VoiceJoinResponse {
 pub async fn bot_voice_join(
     Path(bot_id): Path<String>,
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    user: AuthUser,
     Json(req): Json<VoiceJoinRequest>,
 ) -> Result<Json<VoiceJoinResponse>, (StatusCode, String)> {
-    let bot = authenticate_bot(&state.db, &headers).await?;
+    let bot = bot_session(&state.db, &user).await?;
 
     // Caller must be the bot identified by the path parameter.
     if bot.public_key != bot_id {
@@ -61,21 +62,14 @@ pub async fn bot_voice_join(
         return Err((StatusCode::NOT_FOUND, "Channel not found".into()));
     }
 
-    // NOTE: this endpoint serves the pre-existing "self-service bot" system
-    // (`/admin/bots`, token-hash auth via `authenticate_bot`) and is
-    // deliberately left ungated here, unchanged from its original M3
-    // behavior. The `can_speak_voice` capability gate (soundboard.md §2)
-    // targets the external-bot system (`is_bot=true` users authenticating
-    // via the normal Ed25519 + session-token flow, capabilities in
-    // `bot_profiles`) -- self-service bots never populate `bot_profiles`, so
-    // gating this REST helper on that table would silently break the
-    // existing self-service voice-join flow for a system the capability
-    // model doesn't apply to.
-    //
-    // The `can_speak_voice` gate for external bots is enforced at
-    // `handle_voice_join` (`routes/ws/handlers/voice.rs`) — restored there
-    // per voice-transport-v2.md after the dedicated `/voice/ws` connection
-    // point (which used to enforce it) was deleted.
+    // No gate here on purpose, and now for a sound reason rather than a
+    // structural one: this endpoint hands back a URL, it does not admit the
+    // bot to the channel. `can_speak_voice` is enforced where the join
+    // actually happens, in `handle_voice_join`
+    // (`routes/ws/handlers/voice.rs`), and since every bot is an external
+    // bot it now covers all of them — the carve-out this comment used to
+    // describe (self-service bots never populated `bot_profiles`, so the
+    // gate silently skipped them) died with that system.
 
     // Return the path the bot should connect to: the main hub WS. The bot
     // already knows the hub base URL; it connects to /ws?token=<bot_token>
@@ -101,10 +95,10 @@ pub struct VoiceLeaveRequest {
 pub async fn bot_voice_leave(
     Path(bot_id): Path<String>,
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    user: AuthUser,
     Json(req): Json<VoiceLeaveRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let bot = authenticate_bot(&state.db, &headers).await?;
+    let bot = bot_session(&state.db, &user).await?;
 
     if bot.public_key != bot_id {
         return Err((

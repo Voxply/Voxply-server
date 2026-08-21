@@ -1,4 +1,4 @@
-use crate::{BotCommandRow, BotEventQueueRow, BotProfileRow, BotRow, BotStore, StoreError};
+use crate::{BotCommandRow, BotEventQueueRow, BotProfileRow, BotStore, StoreError};
 use async_trait::async_trait;
 use sqlx::Row;
 
@@ -259,75 +259,6 @@ impl BotStore for PostgresStore {
         .fetch_all(self.pool())
         .await
         .map_err(map_err)
-    }
-
-    async fn create_bot(&self, b: &BotRow) -> Result<(), StoreError> {
-        sqlx::query(
-            "INSERT INTO bots (public_key, display_name, created_by, token_hash, webhook_url, mini_app_url, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
-        )
-        .bind(&b.public_key)
-        .bind(&b.display_name)
-        .bind(&b.created_by)
-        .bind(&b.token_hash)
-        .bind(&b.webhook_url)
-        .bind(&b.mini_app_url)
-        .bind(b.created_at)
-        .execute(self.pool())
-        .await
-        .map_err(map_err)?;
-        Ok(())
-    }
-
-    async fn get_bot_by_pubkey(&self, pubkey: &str) -> Result<Option<BotRow>, StoreError> {
-        let row = sqlx::query(
-            "SELECT public_key, display_name, created_by, token_hash, webhook_url, mini_app_url, created_at
-             FROM bots WHERE public_key = $1",
-        )
-        .bind(pubkey)
-        .fetch_optional(self.pool())
-        .await
-        .map_err(map_err)?;
-        Ok(row.map(|r| BotRow {
-            public_key: r.get("public_key"),
-            display_name: r.get("display_name"),
-            created_by: r.get("created_by"),
-            token_hash: r.get("token_hash"),
-            webhook_url: r.get("webhook_url"),
-            mini_app_url: r.get("mini_app_url"),
-            created_at: r.get("created_at"),
-        }))
-    }
-
-    async fn list_bots(&self) -> Result<Vec<BotRow>, StoreError> {
-        let rows = sqlx::query(
-            "SELECT public_key, display_name, created_by, token_hash, webhook_url, mini_app_url, created_at
-             FROM bots ORDER BY created_at DESC",
-        )
-        .fetch_all(self.pool())
-        .await
-        .map_err(map_err)?;
-        Ok(rows
-            .into_iter()
-            .map(|r| BotRow {
-                public_key: r.get("public_key"),
-                display_name: r.get("display_name"),
-                created_by: r.get("created_by"),
-                token_hash: r.get("token_hash"),
-                webhook_url: r.get("webhook_url"),
-                mini_app_url: r.get("mini_app_url"),
-                created_at: r.get("created_at"),
-            })
-            .collect())
-    }
-
-    async fn delete_bot(&self, pubkey: &str) -> Result<(), StoreError> {
-        sqlx::query("DELETE FROM bots WHERE public_key = $1")
-            .bind(pubkey)
-            .execute(self.pool())
-            .await
-            .map_err(map_err)?;
-        Ok(())
     }
 
     async fn enqueue_bot_event(&self, e: &BotEventQueueRow) -> Result<(), StoreError> {

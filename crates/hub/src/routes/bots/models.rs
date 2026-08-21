@@ -1,7 +1,5 @@
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use uuid::Uuid;
 
 use crate::routes::bot_models::{BotCommandDef, BotMeta, BotSubscription};
 
@@ -39,61 +37,58 @@ pub struct AuditLogResponse {
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-pub fn hash_token(token: &str) -> String {
-    let mut h = Sha256::new();
-    h.update(token.as_bytes());
-    hex::encode(h.finalize())
+/// The authenticated bot behind a session token.
+pub struct BotSession {
+    pub public_key: String,
+    pub display_name: String,
 }
 
-pub fn generate_token() -> String {
-    hex::encode(Uuid::new_v4().as_bytes()) + &hex::encode(Uuid::new_v4().as_bytes())
-}
-
-/// Authenticate a bot request via `Authorization: Bearer <token>` and return
-/// the matching bot row.
-pub async fn authenticate_bot(
+/// Resolve an authenticated session to the bot that owns it.
+///
+/// Every bot is an external bot (decisions.md, "Every bot is an external
+/// bot"): it holds its own Ed25519 keypair and reaches this the same way a
+/// member does — challenge-response, then a session token — so there is no
+/// bot-specific auth path left. This only adds the `is_bot` check, which is
+/// what separates a bot session from a human one.
+///
+/// The display name prefers `bot_profiles.name` (what the bot calls itself)
+/// over `users.display_name` (what the inviting admin typed), so a bot that
+/// renames itself is not shown under a stale label.
+pub async fn bot_session(
     db: &sqlx::PgPool,
-    headers: &HeaderMap,
-) -> Result<BotRow, (StatusCode, String)> {
-    let raw = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .ok_or((StatusCode::UNAUTHORIZED, "Missing bot token".to_string()))?;
-
-    let hash = hash_token(raw);
-
-    sqlx::query_as::<_, BotRow>(
-        "SELECT public_key, display_name, created_by, created_at, webhook_url, mini_app_url, requires_camera
-         FROM bots WHERE token_hash = $1",
+    user: &crate::auth::middleware::AuthUser,
+) -> Result<BotSession, (StatusCode, String)> {
+    let row: Option<(bool, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT u.is_bot, p.name, u.display_name
+         FROM users u LEFT JOIN bot_profiles p ON p.pubkey = u.public_key
+         WHERE u.public_key = $1",
     )
-    .bind(&hash)
+    .bind(&user.public_key)
     .fetch_optional(db)
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?
-    .ok_or((StatusCode::UNAUTHORIZED, "Invalid bot token".to_string()))
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+
+    let (is_bot, profile_name, user_name) =
+        row.ok_or((StatusCode::UNAUTHORIZED, "Unknown identity".to_string()))?;
+
+    if !is_bot {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "This endpoint is for bots; the session belongs to a member".to_string(),
+        ));
+    }
+
+    Ok(BotSession {
+        public_key: user.public_key.clone(),
+        display_name: profile_name
+            .or(user_name)
+            .unwrap_or_else(|| "bot".to_string()),
+    })
 }
 
 // ---------------------------------------------------------------------------
 // DB row types
 // ---------------------------------------------------------------------------
-
-#[derive(sqlx::FromRow)]
-pub struct BotRow {
-    pub public_key: String,
-    pub display_name: String,
-    pub created_by: String,
-    pub created_at: i64,
-    pub webhook_url: Option<String>,
-    pub mini_app_url: Option<String>,
-    pub requires_camera: bool,
-}
-
-#[derive(sqlx::FromRow)]
-pub struct SlashCommandRow {
-    pub command: String,
-    pub description: String,
-}
 
 #[derive(sqlx::FromRow)]
 pub struct EventRow {
@@ -106,62 +101,6 @@ pub struct EventRow {
 // ---------------------------------------------------------------------------
 // Admin request / response types
 // ---------------------------------------------------------------------------
-
-#[derive(Deserialize)]
-pub struct CreateBotRequest {
-    pub display_name: String,
-    #[serde(default)]
-    pub mini_app_url: Option<String>,
-    #[serde(default)]
-    pub requires_camera: bool,
-}
-
-#[derive(Serialize)]
-pub struct BotAdminInfo {
-    pub public_key: String,
-    pub display_name: String,
-    pub created_by: String,
-    pub created_at: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub webhook_url: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct BotCreatedResponse {
-    pub public_key: String,
-    pub display_name: String,
-    pub created_by: String,
-    pub created_at: i64,
-    pub token: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mini_app_url: Option<String>,
-    pub requires_camera: bool,
-}
-
-#[derive(Serialize)]
-pub struct SlashCommandInfo {
-    pub command: String,
-    pub description: String,
-}
-
-#[derive(Serialize)]
-pub struct BotDetailResponse {
-    pub public_key: String,
-    pub display_name: String,
-    pub created_by: String,
-    pub created_at: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub webhook_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mini_app_url: Option<String>,
-    pub requires_camera: bool,
-    pub commands: Vec<SlashCommandInfo>,
-}
-
-#[derive(Deserialize)]
-pub struct SetWebhookRequest {
-    pub webhook_url: Option<String>,
-}
 
 #[derive(Deserialize)]
 pub struct SetCapabilitiesRequest {
@@ -179,8 +118,8 @@ pub struct CapabilitiesResponse {
 /// admin panel can render requested vs. granted vs. what's actually live.
 #[derive(Serialize)]
 pub struct CapabilitiesReadResponse {
-    /// Self-declared capabilities (external bots' `bot_profiles.capabilities`).
-    /// Empty for a self-service bot -- it has no self-declaration mechanism.
+    /// Self-declared capabilities (`bot_profiles.capabilities`). A bot that
+    /// has declared nothing has nothing effective, whatever it was granted.
     pub requested: Vec<String>,
     /// Admin-granted rows from `bot_capability_grants`.
     pub granted: Vec<String>,
@@ -191,17 +130,6 @@ pub struct CapabilitiesReadResponse {
 // ---------------------------------------------------------------------------
 // Bot API request / response types
 // ---------------------------------------------------------------------------
-
-#[derive(Deserialize)]
-pub struct SetCommandsRequest {
-    pub commands: Vec<CommandInput>,
-}
-
-#[derive(Deserialize)]
-pub struct CommandInput {
-    pub command: String,
-    pub description: String,
-}
 
 #[derive(Deserialize)]
 pub struct BotSendRequest {

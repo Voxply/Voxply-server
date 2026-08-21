@@ -27,17 +27,62 @@ mod common;
 // HTTP-only tests — admin/bots capabilities route (axum_test harness).
 // ---------------------------------------------------------------------------
 
+/// Invites `bot` by pubkey and authenticates it, declaring `capabilities` as
+/// the "requested" half of the gate. The invite needs MANAGE_ROLES or ADMIN,
+/// so `admin_token` must belong to someone who has it.
+async fn invite_and_auth_bot_axum(
+    server: &axum_test::TestServer,
+    admin_token: &str,
+    bot: &Identity,
+    capabilities: &[&str],
+) -> String {
+    let pub_key = bot.public_key_hex();
+
+    server
+        .post("/bots")
+        .authorization_bearer(admin_token)
+        .json(&json!({ "pubkey": pub_key }))
+        .await
+        .assert_status_success();
+
+    let challenge: serde_json::Value = server
+        .post("/auth/challenge")
+        .json(&json!({ "public_key": pub_key }))
+        .await
+        .json();
+    let challenge_bytes = hex::decode(challenge["challenge"].as_str().unwrap()).unwrap();
+    let signature = bot.sign(&challenge_bytes);
+
+    let verify: serde_json::Value = server
+        .post("/auth/verify")
+        .json(&json!({
+            "public_key": pub_key,
+            "challenge": challenge["challenge"],
+            "signature": hex::encode(signature.to_bytes()),
+            "is_bot": true,
+            "bot_meta": { "name": "CapBot", "capabilities": capabilities },
+        }))
+        .await
+        .json();
+    verify["token"].as_str().unwrap().to_string()
+}
+
 #[tokio::test]
 async fn admin_can_grant_capabilities_and_it_lands_in_the_audit_log() {
     let (server, owner_token) = common::setup_with_owner().await;
 
-    let bot: serde_json::Value = server
-        .post("/admin/bots")
-        .authorization_bearer(&owner_token)
-        .json(&json!({ "display_name": "CapBot" }))
-        .await
-        .json();
-    let bot_key = bot["public_key"].as_str().unwrap().to_string();
+    // Declares both capabilities so a grant can actually become effective:
+    // the resolver is requested ∩ granted with no fallback, so granting
+    // something the bot never asked for stays inert.
+    let bot = Identity::generate();
+    let bot_key = bot.public_key_hex();
+    invite_and_auth_bot_axum(
+        &server,
+        &owner_token,
+        &bot,
+        &["can_use_interactive_ui", "can_speak_voice"],
+    )
+    .await;
 
     let resp = server
         .put(&format!("/admin/bots/{bot_key}/capabilities"))
@@ -78,18 +123,15 @@ async fn admin_can_grant_capabilities_and_it_lands_in_the_audit_log() {
 #[tokio::test]
 async fn non_admin_cannot_grant_bot_capabilities() {
     let server = common::setup().await;
-    // First authenticator becomes Owner/admin; a second member is plain.
-    let _owner_token = common::authenticate(&server, &Identity::generate()).await;
-    let admin_token = common::authenticate(&server, &Identity::generate()).await;
+    // First authenticator becomes Owner/admin; the second member is plain.
+    // The owner has to do the inviting now — a plain member cannot, which is
+    // itself part of what this change fixed.
+    let owner_token = common::authenticate(&server, &Identity::generate()).await;
     let rando_token = common::authenticate(&server, &Identity::generate()).await;
 
-    let bot: serde_json::Value = server
-        .post("/admin/bots")
-        .authorization_bearer(&admin_token)
-        .json(&json!({ "display_name": "NoAdminBot" }))
-        .await
-        .json();
-    let bot_key = bot["public_key"].as_str().unwrap().to_string();
+    let bot = Identity::generate();
+    let bot_key = bot.public_key_hex();
+    invite_and_auth_bot_axum(&server, &owner_token, &bot, &["can_speak_voice"]).await;
 
     let resp = server
         .put(&format!("/admin/bots/{bot_key}/capabilities"))
@@ -103,20 +145,16 @@ async fn non_admin_cannot_grant_bot_capabilities() {
 async fn admin_can_read_capabilities_requested_granted_effective() {
     let (server, owner_token) = common::setup_with_owner().await;
 
-    let bot: serde_json::Value = server
-        .post("/admin/bots")
-        .authorization_bearer(&owner_token)
-        .json(&json!({ "display_name": "ReadBackBot" }))
-        .await
-        .json();
-    let bot_key = bot["public_key"].as_str().unwrap().to_string();
+    // The bot asks for one capability; the admin grants two. Effective is the
+    // intersection, so the extra grant is inert.
+    let bot = Identity::generate();
+    let bot_key = bot.public_key_hex();
+    invite_and_auth_bot_axum(&server, &owner_token, &bot, &["can_speak_voice"]).await;
 
-    // A self-service bot (created via POST /admin/bots) has no self-declared
-    // `bot_profiles` row, so `requested` starts empty and granted == effective.
     server
         .put(&format!("/admin/bots/{bot_key}/capabilities"))
         .authorization_bearer(&owner_token)
-        .json(&json!({ "capabilities": ["can_speak_voice"] }))
+        .json(&json!({ "capabilities": ["can_speak_voice", "can_use_interactive_ui"] }))
         .await
         .assert_status_success();
 
@@ -126,25 +164,57 @@ async fn admin_can_read_capabilities_requested_granted_effective() {
         .await;
     resp.assert_status_success();
     let body: serde_json::Value = resp.json();
+    assert_eq!(body["requested"].as_array().unwrap(), &["can_speak_voice"]);
+    assert_eq!(body["granted"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        body["effective"].as_array().unwrap(),
+        &["can_speak_voice"],
+        "effective must be requested ∩ granted, not everything granted"
+    );
+}
+
+/// The case that used to have an escape hatch: a bot that declared nothing
+/// got whatever it was granted, because a missing `bot_profiles` row meant
+/// "self-service bot, the admin's grant *is* the consent step". With one bot
+/// model there is no such row-less bot, and a grant alone is half a
+/// handshake.
+#[tokio::test]
+async fn a_grant_the_bot_never_requested_is_not_effective() {
+    let (server, owner_token) = common::setup_with_owner().await;
+
+    let bot = Identity::generate();
+    let bot_key = bot.public_key_hex();
+    invite_and_auth_bot_axum(&server, &owner_token, &bot, &[]).await;
+
+    server
+        .put(&format!("/admin/bots/{bot_key}/capabilities"))
+        .authorization_bearer(&owner_token)
+        .json(&json!({ "capabilities": ["can_speak_voice"] }))
+        .await
+        .assert_status_success();
+
+    let body: serde_json::Value = server
+        .get(&format!("/admin/bots/{bot_key}/capabilities"))
+        .authorization_bearer(&owner_token)
+        .await
+        .json();
     assert_eq!(body["requested"].as_array().unwrap().len(), 0);
     assert_eq!(body["granted"].as_array().unwrap(), &["can_speak_voice"]);
-    assert_eq!(body["effective"].as_array().unwrap(), &["can_speak_voice"]);
+    assert!(
+        body["effective"].as_array().unwrap().is_empty(),
+        "a capability the bot never declared must not become effective"
+    );
 }
 
 #[tokio::test]
 async fn non_admin_cannot_read_bot_capabilities() {
     let server = common::setup().await;
-    let _owner_token = common::authenticate(&server, &Identity::generate()).await;
-    let admin_token = common::authenticate(&server, &Identity::generate()).await;
+    let owner_token = common::authenticate(&server, &Identity::generate()).await;
     let rando_token = common::authenticate(&server, &Identity::generate()).await;
 
-    let bot: serde_json::Value = server
-        .post("/admin/bots")
-        .authorization_bearer(&admin_token)
-        .json(&json!({ "display_name": "NoReadBot" }))
-        .await
-        .json();
-    let bot_key = bot["public_key"].as_str().unwrap().to_string();
+    let bot = Identity::generate();
+    let bot_key = bot.public_key_hex();
+    invite_and_auth_bot_axum(&server, &owner_token, &bot, &[]).await;
 
     let resp = server
         .get(&format!("/admin/bots/{bot_key}/capabilities"))
@@ -372,22 +442,60 @@ async fn create_channel(base: &str, token: &str, name: &str) -> Value {
         .unwrap()
 }
 
-/// POST /admin/bots — registers a self-service bot with a `mini_app_url`,
-/// no capability grant.
+/// Invites a bot and has it self-declare a `mini_app_url` plus the
+/// `can_use_interactive_ui` capability, with no grant yet — the "requested"
+/// half of the gate. Returns its pubkey so the caller can grant or withhold.
 async fn create_mini_app_bot(base: &str, token: &str) -> String {
-    let resp = reqwest::Client::new()
-        .post(format!("{base}/admin/bots"))
+    let bot = Identity::generate();
+    let pub_key = bot.public_key_hex();
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/bots"))
         .bearer_auth(token)
-        .json(&json!({
-            "display_name": "GateBot",
-            "mini_app_url": "https://gate-bot.example.com/app",
-        }))
+        .json(&json!({ "pubkey": pub_key }))
         .send()
         .await
         .unwrap();
     assert!(resp.status().is_success());
-    let body: Value = resp.json().await.unwrap();
-    body["public_key"].as_str().unwrap().to_string()
+
+    let challenge: Value = client
+        .post(format!("{base}/auth/challenge"))
+        .json(&json!({ "public_key": pub_key }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let challenge_bytes = hex::decode(challenge["challenge"].as_str().unwrap()).unwrap();
+    let signature = bot.sign(&challenge_bytes);
+
+    let verify: Value = client
+        .post(format!("{base}/auth/verify"))
+        .json(&json!({
+            "public_key": pub_key,
+            "challenge": challenge["challenge"],
+            "signature": hex::encode(signature.to_bytes()),
+            "is_bot": true,
+            "bot_meta": {
+                "name": "GateBot",
+                "mini_app_url": "https://gate-bot.example.com/app",
+                "capabilities": ["can_use_interactive_ui"],
+            },
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        verify["token"].is_string(),
+        "bot auth should return a token"
+    );
+
+    pub_key
 }
 
 async fn grant_capabilities(

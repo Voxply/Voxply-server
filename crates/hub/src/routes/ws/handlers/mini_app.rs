@@ -74,16 +74,9 @@ pub(in crate::routes::ws) async fn handle_bot_app_join(
             .ok()
             .flatten();
 
-    let bot_row = match bot_row {
-        Some(r) if r.mini_app_url.is_some() => Some(r),
-        _ => sqlx::query_as("SELECT mini_app_url, requires_camera FROM bots WHERE public_key = $1")
-            .bind(&bot_id)
-            .fetch_optional(&state.db)
-            .await
-            .ok()
-            .flatten(),
-    };
-
+    // `bot_profiles` is the only source now — the second lookup that used to
+    // fall back to the self-service `bots` table went with that system
+    // (decisions.md, "Every bot is an external bot").
     let (mini_app_url, requires_camera) = match bot_row {
         Some(r) => match r.mini_app_url {
             Some(url) => (url, r.requires_camera),

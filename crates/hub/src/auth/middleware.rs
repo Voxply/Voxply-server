@@ -359,25 +359,17 @@ impl FromRequestParts<Arc<AppState>> for AuthUser {
                 scope = sess_scope;
                 (pk, status)
             } else {
-                // Try bot tokens.
-                let bot_key: Option<String> =
-                    sqlx::query_scalar("SELECT public_key FROM bot_tokens WHERE token = $1")
-                        .bind(token)
-                        .fetch_optional(&state.db)
-                        .await
-                        .map_err(|e| {
-                            (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}"))
-                        })?;
-
-                match bot_key {
-                    Some(k) => (k, "approved".to_string()),
-                    None => {
-                        return Err((
-                            StatusCode::UNAUTHORIZED,
-                            "Invalid or expired token".to_string(),
-                        ))
-                    }
-                }
+                // Sessions are the only token store. There used to be a
+                // `bot_tokens` fallback here, dead in both directions: no
+                // code path ever inserted a row, and bots authenticate
+                // through the normal session flow (decisions.md, "Every bot
+                // is an external bot"). A table that grants authentication
+                // and that nothing populates is auth surface with no
+                // purpose.
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    "Invalid or expired token".to_string(),
+                ));
             };
 
             // Reject revoked keys.

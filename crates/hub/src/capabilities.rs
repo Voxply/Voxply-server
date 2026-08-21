@@ -26,6 +26,11 @@
 /// Seeded with the cases where a newer client would otherwise call an
 /// endpoint an older hub does not have, or silently get a worse answer.
 pub const CAPABILITIES: &[&str] = &[
+    // One bot model: bots are invited by Ed25519 pubkey and authenticate on
+    // the normal session path. A client that does not see this string is
+    // talking to a hub that still has `POST /admin/bots`, so its admin panel
+    // must offer the hub-minted-token flow instead of an invite field.
+    "bots.external",
     // `GET /users`, `GET /conversations/{id}/messages` and `GET
     // /admin/reports` honour `limit` + a keyset `cursor`. Without this the
     // hub ignores both and returns one truncated page — a client that pages

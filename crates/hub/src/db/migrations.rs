@@ -707,16 +707,32 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     // Bots
     // =======================================================================
 
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS bot_tokens (
-            token      TEXT PRIMARY KEY,
-            public_key TEXT NOT NULL,
-            created_by TEXT NOT NULL,
-            created_at BIGINT NOT NULL
-        )",
-    )
-    .execute(pool)
-    .await?;
+    // Baseline reset, not an additive migration: the self-service bot system
+    // is gone (decisions.md, "Every bot is an external bot") and these three
+    // tables go with it rather than lingering as dead schema. `bots` and
+    // `bot_slash_commands` are superseded by `bot_profiles` and
+    // `bot_commands`; `bot_tokens` was already dead — read by two auth paths,
+    // written by none.
+    //
+    // Authorised explicitly for beta, where no bot is deployed anywhere.
+    // This is the one place in this file that drops anything: if you are
+    // reading it after the first supported upgrade, it should be gone, and
+    // the additive-only rule applies again without exception.
+    // Children first, and CASCADE because an already-migrated database still
+    // has `bot_event_queue`'s foreign key pointing at `bots`. That queue
+    // survives — it backs the HTTP polling transport — so it is dropped here
+    // only to be recreated below against `users`, which is where a bot's
+    // identity actually lives now.
+    for table in [
+        "bot_event_queue",
+        "bot_slash_commands",
+        "bots",
+        "bot_tokens",
+    ] {
+        sqlx::query(&format!("DROP TABLE IF EXISTS {table} CASCADE"))
+            .execute(pool)
+            .await?;
+    }
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS bot_profiles (
@@ -790,39 +806,14 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     .execute(pool)
     .await?;
 
-    // Self-service bots (token-authenticated, webhook delivery)
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS bots (
-            public_key      TEXT PRIMARY KEY,
-            display_name    TEXT NOT NULL,
-            created_by      TEXT NOT NULL,
-            token_hash      TEXT NOT NULL,
-            webhook_url     TEXT,
-            mini_app_url    TEXT,
-            requires_camera BOOLEAN NOT NULL DEFAULT FALSE,
-            created_at      BIGINT NOT NULL
-        )",
-    )
-    .execute(pool)
-    .await?;
-
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS bot_slash_commands (
-            id          TEXT PRIMARY KEY,
-            bot_pubkey  TEXT NOT NULL REFERENCES bots(public_key) ON DELETE CASCADE,
-            command     TEXT NOT NULL,
-            description TEXT NOT NULL,
-            created_at  BIGINT NOT NULL,
-            UNIQUE(bot_pubkey, command)
-        )",
-    )
-    .execute(pool)
-    .await?;
-
+    // Event queue behind the HTTP polling transport (`GET /bot/poll`), for
+    // bots that hold no persistent WebSocket. Keyed on `users` now that a bot
+    // is an ordinary identity row — the old FK pointed at the self-service
+    // `bots` table, which no longer exists.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS bot_event_queue (
             id         TEXT PRIMARY KEY,
-            bot_pubkey TEXT NOT NULL REFERENCES bots(public_key) ON DELETE CASCADE,
+            bot_pubkey TEXT NOT NULL REFERENCES users(public_key) ON DELETE CASCADE,
             event_type TEXT NOT NULL,
             payload    TEXT NOT NULL,
             created_at BIGINT NOT NULL,
@@ -1779,23 +1770,11 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     .execute(pool)
     .await;
 
-    // 2. Self-service bots (`bots` table, token-auth, bot-mini-apps.md):
-    //    this system has no self-declaration mechanism -- the admin who ran
-    //    `POST /admin/bots` and set `mini_app_url` already is the consent
-    //    step, so `effective_capabilities` treats a granted capability as
-    //    effective outright for pubkeys with no `bot_profiles` row (see
-    //    bots::capabilities doc comment). Backfilling `can_use_interactive_ui`
-    //    for every bot that already has a mini-app configured preserves
-    //    today's fully-open mini-app-launch behavior once the gate in
-    //    routes/ws/handlers/mini_app.rs ships.
-    let _ = sqlx::query(
-        "INSERT INTO bot_capability_grants (bot_pubkey, capability, granted_by, granted_at)
-         SELECT public_key, 'can_use_interactive_ui', 'system_backfill', created_at
-         FROM bots WHERE mini_app_url IS NOT NULL
-         ON CONFLICT (bot_pubkey, capability) DO NOTHING",
-    )
-    .execute(pool)
-    .await;
+    // A second backfill used to follow, granting `can_use_interactive_ui` to
+    // every row in the self-service `bots` table that had a `mini_app_url`.
+    // Both the table and the system are gone (decisions.md, "Every bot is an
+    // external bot"), and there is nothing to preserve: a bot that wants a
+    // mini-app now declares the capability and an admin grants it.
 
     tracing::info!("Database migrations complete");
 

@@ -832,45 +832,39 @@ pub async fn validate_ws_token(
             }
             (pk, status, scope, mini_app_channel_id)
         } else {
-            // Try bot tokens.
-            let bot_key: Option<String> =
-                sqlx::query_scalar("SELECT public_key FROM bot_tokens WHERE token = $1")
-                    .bind(token)
-                    .fetch_optional(db)
-                    .await
-                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
-
-            match bot_key {
-                Some(k) => (k, "approved".to_string(), "member".to_string(), None),
-                // Farm-issued token, verified against the farm pubkey exactly
-                // as the HTTP path does — one function, so the two cannot
-                // drift. This branch was missing entirely: on a farm-managed
-                // hub the client authenticates at the farm, so *every* socket
-                // it opened was refused while its HTTP calls worked. No
-                // messages, no presence, no voice signalling, and no error
-                // anywhere except a socket that never connected.
-                None if token.contains('.') => {
-                    let pk = crate::auth::middleware::resolve_farm_token(state, token).await?;
-                    let status: Option<String> = sqlx::query_scalar(
-                        "SELECT approval_status FROM users WHERE public_key = $1",
-                    )
-                    .bind(&pk)
-                    .fetch_optional(db)
-                    .await
-                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
-                    (
-                        pk,
-                        status.unwrap_or_else(|| "approved".to_string()),
-                        "member".to_string(),
-                        None,
-                    )
-                }
-                None => {
-                    return Err((
-                        StatusCode::UNAUTHORIZED,
-                        "Invalid or expired token".to_string(),
-                    ))
-                }
+            // A `bot_tokens` lookup used to sit here, ahead of the farm
+            // branch. It is gone: nothing ever wrote that table, and bots
+            // now arrive on the session path above like every other identity
+            // (decisions.md, "Every bot is an external bot").
+            //
+            // Farm-issued token, verified against the farm pubkey exactly
+            // as the HTTP path does — one function, so the two cannot
+            // drift. This branch was missing entirely: on a farm-managed
+            // hub the client authenticates at the farm, so *every* socket
+            // it opened was refused while its HTTP calls worked. No
+            // messages, no presence, no voice signalling, and no error
+            // anywhere except a socket that never connected.
+            if token.contains('.') {
+                let pk = crate::auth::middleware::resolve_farm_token(state, token).await?;
+                let status: Option<String> =
+                    sqlx::query_scalar("SELECT approval_status FROM users WHERE public_key = $1")
+                        .bind(&pk)
+                        .fetch_optional(db)
+                        .await
+                        .map_err(|e| {
+                            (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}"))
+                        })?;
+                (
+                    pk,
+                    status.unwrap_or_else(|| "approved".to_string()),
+                    "member".to_string(),
+                    None,
+                )
+            } else {
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    "Invalid or expired token".to_string(),
+                ));
             }
         };
 

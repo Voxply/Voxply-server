@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -12,7 +12,8 @@ use uuid::Uuid;
 use crate::routes::chat_models::{ChatEvent, WsServerMessage};
 use crate::state::{ActiveShare, AppState, ScreenStreamMeta};
 
-use super::models::authenticate_bot;
+use super::models::bot_session;
+use crate::auth::middleware::AuthUser;
 
 #[derive(Deserialize)]
 pub struct ScreenshareStartRequest {
@@ -49,10 +50,10 @@ pub struct ScreenshareStartResponse {
 pub async fn bot_screenshare_start(
     Path(bot_id): Path<String>,
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    user: AuthUser,
     Json(req): Json<ScreenshareStartRequest>,
 ) -> Result<Json<ScreenshareStartResponse>, (StatusCode, String)> {
-    let bot = authenticate_bot(&state.db, &headers).await?;
+    let bot = bot_session(&state.db, &user).await?;
 
     // Caller must be the bot identified by the path parameter.
     if bot.public_key != bot_id {
@@ -141,10 +142,10 @@ pub struct ScreenshareStopRequest {
 pub async fn bot_screenshare_stop(
     Path(bot_id): Path<String>,
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    user: AuthUser,
     Json(req): Json<ScreenshareStopRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let bot = authenticate_bot(&state.db, &headers).await?;
+    let bot = bot_session(&state.db, &user).await?;
 
     // Caller must be the bot identified by the path parameter.
     if bot.public_key != bot_id {

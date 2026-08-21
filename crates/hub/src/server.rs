@@ -283,26 +283,12 @@ pub fn create_router_full(
             "/admin/reports/{id}/review",
             post(routes::reports::review_report),
         )
-        // ---- Admin bot management (internal service accounts) ----
-        .route(
-            "/admin/bots",
-            get(routes::bots::admin_list_bots).post(routes::bots::admin_create_bot),
-        )
-        // ---- External bot admin view (bots.md §4) ----
-        // Registered before /admin/bots/{pubkey} for the same reason as
-        // /bots/me below -- keeps "external" from ever being treated as a
-        // pubkey path parameter.
+        // ---- Bot admin ----
+        // Registered before /admin/bots/{pubkey} so "external" is never
+        // treated as a pubkey path parameter -- same reason as /bots/me.
         .route(
             "/admin/bots/external",
             get(routes::bots::admin_list_external_bots),
-        )
-        .route(
-            "/admin/bots/{pubkey}",
-            get(routes::bots::admin_get_bot).delete(routes::bots::admin_delete_bot),
-        )
-        .route(
-            "/admin/bots/{pubkey}/webhook",
-            put(routes::bots::admin_set_webhook),
         )
         .route(
             "/admin/bots/{pubkey}/capabilities",
@@ -315,8 +301,9 @@ pub fn create_router_full(
                 .put(routes::bots::admin_set_bot_channel_scope),
         )
         .route("/admin/audit-log", get(routes::bots::admin_audit_log))
-        // ---- Bot API (token auth, internal service accounts) ----
-        .route("/bot/commands", put(routes::bots::bot_set_commands))
+        // ---- Bot HTTP transport (session auth, for bots with no
+        // persistent WebSocket). Slash commands live on
+        // PUT /bots/me/commands, not here. ----
         .route("/bot/send", post(routes::bots::bot_send_message))
         .route("/bot/poll", get(routes::bots::bot_poll))
         .route(

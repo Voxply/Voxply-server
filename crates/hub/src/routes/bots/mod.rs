@@ -7,11 +7,10 @@ pub mod voice;
 
 // Re-export all public items so server.rs paths remain unchanged.
 pub use admin::{
-    admin_audit_log, admin_create_bot, admin_delete_bot, admin_get_bot, admin_get_bot_capabilities,
-    admin_get_bot_channel_scope, admin_list_bots, admin_set_bot_capabilities,
-    admin_set_bot_channel_scope, admin_set_webhook,
+    admin_audit_log, admin_get_bot_capabilities, admin_get_bot_channel_scope,
+    admin_set_bot_capabilities, admin_set_bot_channel_scope,
 };
-pub use bot_api::{bot_ack_events, bot_poll, bot_send_message, bot_set_commands};
+pub use bot_api::{bot_ack_events, bot_poll, bot_send_message};
 pub use external::{
     admin_list_external_bots, ext_accept_invite, ext_bot_me, ext_invite_bot, ext_list_bots,
     ext_remove_bot, ext_update_bot_commands, ext_update_bot_profile, ext_update_bot_subscriptions,

@@ -1,5 +1,5 @@
 use crate::error::StoreError;
-use crate::row_types::{BotCommandRow, BotEventQueueRow, BotProfileRow, BotRow};
+use crate::row_types::{BotCommandRow, BotEventQueueRow, BotProfileRow};
 use async_trait::async_trait;
 
 #[async_trait]
@@ -62,16 +62,6 @@ pub trait BotStore: Send + Sync {
     ) -> Result<(), StoreError>;
 
     async fn bot_channel_scope(&self, bot_pubkey: &str) -> Result<Vec<String>, StoreError>;
-
-    // ---- Self-service bots ----
-
-    async fn create_bot(&self, b: &BotRow) -> Result<(), StoreError>;
-
-    async fn get_bot_by_pubkey(&self, pubkey: &str) -> Result<Option<BotRow>, StoreError>;
-
-    async fn list_bots(&self) -> Result<Vec<BotRow>, StoreError>;
-
-    async fn delete_bot(&self, pubkey: &str) -> Result<(), StoreError>;
 
     // ---- Bot event queue ----
 
