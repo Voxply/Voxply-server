@@ -589,3 +589,50 @@ async fn invisible_user_hidden_from_others_voice_participant_lists() {
         "invisible user must still see their own entry in /voice/participants"
     );
 }
+
+/// Two clients on the SAME identity (the multi-device case) each join a
+/// different voice channel. `voice_channels` is keyed by pubkey, so before the
+/// fix both entries survived and the user showed up in two rooms of the same
+/// hub at once. Latest join wins.
+#[tokio::test]
+async fn second_device_join_evicts_the_first_channel() {
+    let (base, state, _guard) = start_hub().await;
+
+    let user = Identity::generate();
+    let token = authenticate_http(&base, &user).await;
+    let a = create_channel(&base, &token, "room-a").await;
+    let b = create_channel(&base, &token, "room-b").await;
+    let pk = user.public_key_hex();
+
+    let (mut tx_a, mut rx_a) = connect_ws(&base, &token).await;
+    send_ws(
+        &mut tx_a,
+        json!({ "type": "voice_join", "channel_id": a.id }),
+    )
+    .await;
+    let _ = drain_until_voice_joined(&mut rx_a).await;
+
+    let (mut tx_b, mut rx_b) = connect_ws(&base, &token).await;
+    send_ws(
+        &mut tx_b,
+        json!({ "type": "voice_join", "channel_id": b.id }),
+    )
+    .await;
+    let _ = drain_until_voice_joined(&mut rx_b).await;
+
+    let rooms: Vec<String> = {
+        let vc = state.voice_channels.read().await;
+        vc.iter()
+            .filter(|(_, participants)| participants.contains_key(&pk))
+            .map(|(ch, _)| ch.clone())
+            .collect()
+    };
+    assert_eq!(
+        rooms,
+        vec![b.id.clone()],
+        "one identity must occupy exactly the last-joined voice channel"
+    );
+
+    let _ = tx_a.send(TsMessage::Close(None)).await;
+    let _ = tx_b.send(TsMessage::Close(None)).await;
+}

@@ -289,6 +289,25 @@ pub(in crate::routes::ws) async fn handle_voice_join(
         }
     }
 
+    // One voice session per identity. `voice_channels` and every pubkey-keyed
+    // side table (sender ids, whisper defs, relay slot, last-active stamp) assume
+    // a pubkey is in at most one room, but nothing enforced it: a second device
+    // -- or a re-join whose predecessor never sent `voice_leave` -- left the
+    // pubkey listed in both rooms at once. Latest join wins: tear down every
+    // prior membership through the shared leave path so the old room roster, WT
+    // session, zone positions, whisper session and staging grant all clear.
+    // Placed after every gate above so a rejected join never evicts.
+    let stale_channels: Vec<String> = {
+        let vc = state.voice_channels.read().await;
+        vc.iter()
+            .filter(|(_, participants)| participants.contains_key(&cs.public_key))
+            .map(|(ch, _)| ch.clone())
+            .collect()
+    };
+    for stale in stale_channels {
+        crate::routes::ws::connection::leave_voice(state, &cs.public_key, &stale).await;
+    }
+
     // --- Token-gated WebTransport session bind (voice-transport-v2.md) ---
     //
     // 1. Mint a 32-byte random single-use token.
