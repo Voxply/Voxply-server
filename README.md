@@ -60,11 +60,14 @@ canonical identity crate.
 ```bash
 git clone https://github.com/Wavvon/Wavvon-server
 cd Wavvon-server
+echo "WAVVON_DB_PASSWORD=$(openssl rand -hex 16)" > .env
 docker compose up -d
 ```
 
 The bundled `docker-compose.yml` starts the hub plus a PostgreSQL
-sidecar. Prefer a guided install? The interactive wizard generates a
+sidecar. It has no default database password — compose refuses to start
+until `WAVVON_DB_PASSWORD` is set, so no hub ever runs on a password
+that ships in a public repo. Prefer a guided install? The interactive wizard generates a
 tailored compose file and `.env` for you:
 
 ```bash
