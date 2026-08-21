@@ -292,3 +292,73 @@ async fn subscribe_to_readable_channel_still_delivers_events() {
     assert_eq!(frame["type"], "message");
     assert_eq!(frame["channel_id"], open.id);
 }
+
+// ---------------------------------------------------------------------------
+// ping / pong — the round-trip probe behind the client's latency readout
+// ---------------------------------------------------------------------------
+
+/// Echoed verbatim and with no hub-side state, so the client can time the
+/// round trip against its own clock. The nonce matters: a hub that replied
+/// with anything else would let a client pair a reply with the wrong probe and
+/// report a latency it never measured.
+#[tokio::test]
+async fn ping_is_answered_with_the_same_nonce() {
+    let (base, _state, _guard) = start_hub().await;
+    let member = Identity::generate();
+    let token = authenticate_http(&base, &member).await;
+    let (mut tx, mut rx) = connect_ws(&base, &token).await;
+
+    send_text(
+        &mut tx,
+        json!({ "type": "ping", "nonce": 1_787_000_000_123i64 }),
+    )
+    .await;
+
+    let frame = next_meaningful_frame(&mut rx, std::time::Duration::from_secs(5))
+        .await
+        .expect("a pong should arrive");
+    assert_eq!(frame["type"], "pong");
+    assert_eq!(frame["nonce"], 1_787_000_000_123i64);
+}
+
+/// Two probes in flight at once come back distinguishable and in order. A
+/// client sampling every couple of seconds on a slow link will have overlapping
+/// probes, and pairing them up is the whole point of carrying a nonce.
+#[tokio::test]
+async fn concurrent_pings_come_back_distinguishable() {
+    let (base, _state, _guard) = start_hub().await;
+    let member = Identity::generate();
+    let token = authenticate_http(&base, &member).await;
+    let (mut tx, mut rx) = connect_ws(&base, &token).await;
+
+    send_text(&mut tx, json!({ "type": "ping", "nonce": 11 })).await;
+    send_text(&mut tx, json!({ "type": "ping", "nonce": 22 })).await;
+
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let frame = next_meaningful_frame(&mut rx, std::time::Duration::from_secs(5))
+            .await
+            .expect("both pongs should arrive");
+        assert_eq!(frame["type"], "pong");
+        seen.push(frame["nonce"].as_i64().unwrap());
+    }
+    assert_eq!(seen, vec![11, 22]);
+}
+
+/// A negative nonce is still echoed rather than rejected or clamped: the hub
+/// treats it as opaque, which is what lets a client use whatever clock or
+/// counter it likes.
+#[tokio::test]
+async fn ping_nonce_is_opaque_to_the_hub() {
+    let (base, _state, _guard) = start_hub().await;
+    let member = Identity::generate();
+    let token = authenticate_http(&base, &member).await;
+    let (mut tx, mut rx) = connect_ws(&base, &token).await;
+
+    send_text(&mut tx, json!({ "type": "ping", "nonce": -7 })).await;
+
+    let frame = next_meaningful_frame(&mut rx, std::time::Duration::from_secs(5))
+        .await
+        .expect("a pong should arrive");
+    assert_eq!(frame["nonce"], -7);
+}

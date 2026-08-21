@@ -737,6 +737,13 @@ async fn dispatch_client_msg(
             cs.voice_channel = Some(channel_id);
             DispatchResult::Continue
         }
+        // Stateless echo: the client times the round trip itself, so the hub
+        // has nothing to remember and nothing to get wrong.
+        WsClientMessage::Ping { nonce } => {
+            let json = serde_json::to_string(&WsServerMessage::Pong { nonce }).unwrap();
+            let _ = ws_tx.send(Message::Text(json.into())).await;
+            DispatchResult::Continue
+        }
         WsClientMessage::VoiceUnwatch => {
             cs.voice_channel = None;
             DispatchResult::Continue

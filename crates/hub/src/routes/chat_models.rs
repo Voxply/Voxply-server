@@ -423,6 +423,11 @@ pub enum WsClientMessage {
     VoiceWatch { channel_id: String },
     #[serde(rename = "voice_unwatch")]
     VoiceUnwatch,
+    /// Round-trip probe. `nonce` is opaque to the hub and echoed verbatim in
+    /// the `pong`, so the client measures RTT against its own clock and the
+    /// hub keeps no state. Clients pick their send timestamp as the nonce.
+    #[serde(rename = "ping")]
+    Ping { nonce: i64 },
     #[serde(rename = "voice_leave")]
     VoiceLeave { channel_id: String },
     #[serde(rename = "voice_speaking")]
@@ -739,6 +744,10 @@ pub enum WsServerMessage {
         public_key: String,
         speaking: bool,
     },
+    /// Echo of a client `ping`. Carries the nonce back untouched — the hub
+    /// stores nothing and does no timing of its own.
+    #[serde(rename = "pong")]
+    Pong { nonce: i64 },
     #[serde(rename = "voice_roster_update")]
     VoiceRosterUpdate {
         channel_id: String,

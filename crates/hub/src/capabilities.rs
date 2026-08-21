@@ -55,6 +55,10 @@ pub const CAPABILITIES: &[&str] = &[
     // The raw-UDP and `/voice/ws` relays it replaced are gone, so a client
     // that does not see this string has no voice path to this hub at all.
     "voice.wt",
+    // The WS answers `ping` with `pong`, echoing the nonce. Without this a
+    // client measuring latency would wait for a reply that never comes and
+    // show a dead "—" forever, so the readout has to be gated on it.
+    "ws.ping",
 ];
 
 #[cfg(test)]
