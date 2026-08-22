@@ -1393,3 +1393,73 @@ async fn minting_for_your_own_channel_is_refused_as_local() {
     assert_eq!(resp.status(), 409);
     assert!(resp.text().await.unwrap().contains("channel_is_local"));
 }
+
+/// Two hubs with **default settings** must be able to form an alliance.
+///
+/// A fresh hub is `invite_only`, and the invite gate in `/auth/verify` exempted
+/// bots but not federating hubs — so hub B's federation client got "This hub
+/// requires an invite code" from hub A and the join failed with a 502 blaming
+/// the network. Every default hub pair, and nothing caught it: this harness
+/// builds `AppState` directly and never writes the `invite_only` setting, so
+/// `is_invite_only` answered false and federation auth sailed through. Found by
+/// driving two real hub binaries (`e2e-topology`), which is the only place the
+/// setting has its real default.
+///
+/// So this test sets it explicitly. A test that relies on a default it does not
+/// state is a test that stops covering the thing the day the default changes.
+#[tokio::test]
+async fn an_invite_only_hub_still_accepts_a_federating_peer() {
+    let (hub_a_url, hub_a_state, _ga) = start_hub("hub-a").await;
+    let (hub_b_url, _hub_b_state, _gb) = start_hub("hub-b").await;
+    let client = reqwest::Client::new();
+
+    let user_a = Identity::generate();
+    let token_a = authenticate_user(&hub_a_url, &user_a).await;
+    let user_b = Identity::generate();
+    let token_b = authenticate_user(&hub_b_url, &user_b).await;
+
+    // What a real hub looks like on first boot.
+    wavvon_hub::routes::hub::upsert_setting(&hub_a_state.db, "invite_only", "true")
+        .await
+        .unwrap();
+
+    let alliance: AllianceResponse = client
+        .post(format!("{hub_a_url}/alliances"))
+        .bearer_auth(&token_a)
+        .json(&json!({ "name": "Default Settings Pact" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let invite: AllianceInviteResponse = client
+        .post(format!("{hub_a_url}/alliances/{}/invite", alliance.id))
+        .bearer_auth(&token_a)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let resp = client
+        .post(format!("{hub_b_url}/alliances/join"))
+        .bearer_auth(&token_b)
+        .json(&json!({
+            "inviter_hub_url": hub_a_url,
+            "alliance_id": alliance.id,
+            "invite_token": invite.token,
+            "own_hub_url": hub_b_url,
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    assert_eq!(
+        status, 200,
+        "an invite_only hub must still let a peer hub federate; got {body}"
+    );
+}

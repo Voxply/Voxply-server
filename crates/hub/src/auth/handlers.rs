@@ -627,7 +627,20 @@ pub async fn verify(
     // per WelcomeScreen's join-by-code requirement) even after an admin had
     // already invited and capability-granted it — found live running the
     // ttt-bot demo end to end (bot-capability-layer.md §7).
-    if has_roles == 0 && req.is_bot != Some(true) {
+    // A federating peer hub (is_hub=true) is exempt for the same reason, and it
+    // is the same bug twice: it is not a person joining this community. It
+    // authenticates to deliver federation traffic, receives no human roles, and
+    // its token is tagged so `PeerHub` can tell it apart. An invite code is a
+    // thing a community gives a person; there is nobody here to give one to.
+    //
+    // Without this, two hubs with default settings could never form an
+    // alliance at all -- a fresh hub is invite_only, so hub B's federation
+    // client got "This hub requires an invite code" from hub A and the join
+    // failed with a 502 that blamed the network. Invisible to the integration
+    // suite, which builds `AppState` directly and never writes the
+    // `invite_only` setting, so `is_invite_only` answered false there. Found
+    // by driving two real hub binaries (e2e-topology).
+    if has_roles == 0 && req.is_bot != Some(true) && req.is_hub != Some(true) {
         // New user — check if hub requires an invite
         if crate::routes::invites::is_invite_only(&state.db).await? {
             match &req.invite_code {
