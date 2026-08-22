@@ -23,7 +23,7 @@ pub async fn send_to(
     channel_id: &str,
     to_pubkey: &str,
     payload: Value,
-) -> Result<(), WsError> {
+) -> Result<(), Box<WsError>> {
     let out = json!({
         "type": "mini_app_message",
         "bot_id": bot_id,
@@ -31,7 +31,11 @@ pub async fn send_to(
         "payload": payload.to_string(),
         "to_pubkey": to_pubkey,
     });
-    tx.send(WsMessage::Text(out.to_string())).await
+    // Boxed: `tungstenite::Error` is 136 bytes, past clippy's
+    // result_large_err threshold, and this is a cold path.
+    tx.send(WsMessage::Text(out.to_string()))
+        .await
+        .map_err(Box::new)
 }
 
 /// Sends a per-viewer payload (built by `per_viewer`) to every pubkey in
