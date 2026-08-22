@@ -53,6 +53,14 @@ Ed25519 key) and the Tantivy search index into the **current directory**. Run it
 from a dedicated data directory and stay consistent — starting it elsewhere
 generates a *new* hub identity, which reads as "all my accounts are gone".
 
+**A second hub in the same directory will not start.** It dies with
+`Failed to acquire Lockfile: LockBusy` — the Tantivy index takes a writer lock,
+and the identity file would be shared too. Give every hub its own directory,
+which matters most where it is least obvious: running two hubs to test
+federation, and running one from the monorepo root while another is already
+there. The failure is easy to misread, because a hub that dies on startup looks
+downstream like a wall of unrelated client timeouts.
+
 **`WAVVON_PUBLIC_URL` is not optional in practice.** Without it
 `/info.voice_wt_url` is null and clients cannot connect voice at all; invite
 links and passkeys degrade the same way. A farm-spawned hub derives its own and
