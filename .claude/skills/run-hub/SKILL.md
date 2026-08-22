@@ -58,6 +58,14 @@ generates a *new* hub identity, which reads as "all my accounts are gone".
 links and passkeys degrade the same way. A farm-spawned hub derives its own and
 doesn't need it set.
 
+**An empty `WAVVON_*` value means "unset".** That matters mainly in a
+container, where clearing a baked-in `ENV` is the only thing you *can* do: the
+official image sets `WAVVON_WEB_CLIENT_DIR=/web-client`, and
+`-e WAVVON_WEB_CLIENT_DIR=` is how you run API-only — which is what you want
+when a client dev server, or a Playwright run, is serving the client under test
+instead. Until 2026-08-22 that exited with `WAVVON_WEB_CLIENT_DIR '' does not
+exist`, so a hub older than that cannot do it.
+
 Never spell a `WAVVON_*` name as a string literal in code — the names live in the
 `hub-env` crate. See `CLAUDE.md`.
 
