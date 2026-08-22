@@ -79,7 +79,7 @@ Layout under `crates/hub/src/`:
 - `state.rs` — `AppState`
 - `permissions.rs` — role-based access control
 - `capabilities.rs` — the feature-string list served by `GET /info`
-- `db/migrations.rs` — schema (additive only)
+- `db/migrations.rs` — schema (destructive changes allowed until 1.0)
 - `db/version.rs` — minimum supported PostgreSQL server, checked before migrations
 
 ### `identity` — wire-format authority
@@ -132,10 +132,23 @@ reaches `Settings`.
 
 ## Non-obvious constraints
 
-**Migrations are additive only.** `crates/hub/src/db/migrations.rs` uses only
-`CREATE TABLE IF NOT EXISTS` and `ALTER TABLE ADD COLUMN`. Never `DROP`,
-`TRUNCATE`, or destructive schema changes. Wrap column additions so an "already
-exists" error is silently ignored.
+**Migrations: destructive changes are fine until 1.0.** This is beta. There is
+no database in the field whose upgrade path anyone has promised, so `DROP`,
+`ALTER ... TYPE`, renames and reshaping a table are all available — take them
+when they give the better schema instead of bending the design around a
+constraint that does not apply yet.
+
+**From 1.0.0 the additive-only rule starts, and it is absolute**: only
+`CREATE TABLE IF NOT EXISTS` and `ALTER TABLE ADD COLUMN`, with column
+additions wrapped so an "already exists" error is ignored. The reason to write
+that down now is that folding a destructive change into a `CREATE TABLE` after
+that point silently produces databases missing a column, with no error until a
+query touches it (see the `migrations.rs` header) — so the day the floor lands,
+this stops being a preference.
+
+Prefer the additive shape anyway when it costs nothing: a schema whose history
+is additive is one you can reason about. Just do not pay design debt for it
+before 1.0.
 
 **PostgreSQL: one backend, a declared floor, a configurable pool.** PostgreSQL is
 the only backend, and reopening that needs a new entry in the wiki's

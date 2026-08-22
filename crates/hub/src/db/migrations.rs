@@ -21,11 +21,20 @@
 // the field, a fold needs a schema-version marker and a refuse-to-start
 // check first (same shape as `db/version.rs`).
 //
-// Going forward from this baseline, the additive-only rule applies again:
-// new columns on existing tables must be `ALTER TABLE ... ADD COLUMN`,
-// wrapped in `let _ = ...` to ignore "already exists" errors; new tables
-// use `CREATE TABLE IF NOT EXISTS`. Never DROP or otherwise destructively
-// alter existing schema.
+// Going forward from this baseline, and **for as long as this is beta**,
+// destructive changes are allowed: DROP, ALTER ... TYPE, renames, reshaping a
+// table. No database in the field has a promised upgrade path yet, so the
+// better schema wins over the additive one.
+//
+// **The additive-only rule starts at 1.0.0**, and from there it is absolute:
+// new columns via `ALTER TABLE ... ADD COLUMN` wrapped in `let _ = ...` so
+// "already exists" is ignored, new tables via `CREATE TABLE IF NOT EXISTS`,
+// and nothing destructive ever. The paragraph above is why: a fold deletes the
+// statement that would upgrade an existing database, and
+// `CREATE TABLE IF NOT EXISTS` then skips it silently, so a database created
+// before the fold simply lacks the column with no error until a query touches
+// it. Before 1.0 that costs a `DROP DATABASE`; after it, it costs somebody
+// their hub.
 
 use anyhow::Result;
 use sqlx::PgPool;
@@ -714,10 +723,10 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     // `bot_commands`; `bot_tokens` was already dead — read by two auth paths,
     // written by none.
     //
-    // Authorised explicitly for beta, where no bot is deployed anywhere.
-    // This is the one place in this file that drops anything: if you are
-    // reading it after the first supported upgrade, it should be gone, and
-    // the additive-only rule applies again without exception.
+    // Authorised explicitly for beta, where no bot is deployed anywhere —
+    // which is the general rule here, not an exception carved out for this one
+    // statement (see the file header). If you are reading it after 1.0, it
+    // should be gone, and nothing new like it may be added.
     // Children first, and CASCADE because an already-migrated database still
     // has `bot_event_queue`'s foreign key pointing at `bots`. That queue
     // survives — it backs the HTTP polling transport — so it is dropped here
