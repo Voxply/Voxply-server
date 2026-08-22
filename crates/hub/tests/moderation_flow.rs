@@ -389,11 +389,7 @@ async fn ws_voice_join_and_recv(hub_url: &str, token: &str, channel_id: &str) ->
     let (mut tx, mut rx) = ws_stream.split();
 
     // Consume the `hello` frame the hub sends on connect.
-    let hello_frame = rx.next().await.unwrap().unwrap();
-    let WsMessage::Text(hello_text) = hello_frame else {
-        panic!("expected hello text frame")
-    };
-    let hello: serde_json::Value = serde_json::from_str(&hello_text).unwrap();
+    let hello: serde_json::Value = next_json(&mut rx).await;
     assert_eq!(hello["type"], "hello", "first frame should be hello");
 
     tx.send(WsMessage::Text(
@@ -401,15 +397,56 @@ async fn ws_voice_join_and_recv(hub_url: &str, token: &str, channel_id: &str) ->
     ))
     .await
     .unwrap();
+    // Wait for the answer to `voice_join` specifically, rather than skipping a
+    // denylist of frames that happen to be noisy today.
+    //
+    // This used to skip `member_online`/`member_offline` and return the next
+    // frame of any kind, which made all four callers fail intermittently under
+    // `--test-threads=4`: the hub pushes unsolicited frames on connect (roster,
+    // in-progress screen shares), and under load they land *after* the `hello`
+    // read instead of before it, so the test asserted on one of those. A
+    // denylist grows a hole every time the hub learns to push something new;
+    // an allowlist of the two frames a join can answer with does not.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
-        let frame = rx.next().await.unwrap().unwrap();
-        let WsMessage::Text(text) = frame else {
-            panic!("expected text frame, got {frame:?}")
-        };
-        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-        match v["type"].as_str() {
-            Some("member_online") | Some("member_offline") => continue,
-            _ => return v,
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no voice_joined or error frame within 20s of voice_join"
+        );
+        let v = next_json(&mut rx).await;
+        if matches!(v["type"].as_str(), Some("voice_joined") | Some("error")) {
+            return v;
+        }
+    }
+}
+
+/// The next *application* frame, as JSON.
+///
+/// Skips WebSocket control frames, which is the whole reason this exists: the
+/// hub sends keepalive `Ping`s (see `connection.rs`'s `KEEPALIVE_DEADLINE`), and
+/// every caller here used to panic with "expected text frame, got Ping([])" the
+/// moment one landed mid-wait. Harmless at low load and reliably fatal under
+/// `--test-threads=4`, which is exactly the shape of an intermittent failure
+/// nobody can reproduce on demand.
+async fn next_json<S>(rx: &mut S) -> serde_json::Value
+where
+    S: futures_util::Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
+        + Unpin,
+{
+    loop {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(20), rx.next())
+            .await
+            .expect("timed out waiting for a WebSocket frame")
+            .expect("WebSocket stream ended")
+            .expect("WebSocket error");
+        match frame {
+            WsMessage::Text(text) => {
+                return serde_json::from_str(&text)
+                    .unwrap_or_else(|e| panic!("frame was not JSON: {e}: {text}"))
+            }
+            // Ping/Pong/Close/Binary are protocol traffic, not answers.
+            WsMessage::Close(_) => panic!("hub closed the socket while we were waiting"),
+            _ => continue,
         }
     }
 }
