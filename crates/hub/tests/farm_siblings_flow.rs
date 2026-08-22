@@ -142,3 +142,25 @@ async fn no_siblings_writes_nothing() {
     assert!(sources(&db).await.is_empty());
     assert_eq!(setting(&db, "farm_siblings_seen").await, None);
 }
+
+/// The test that was missing, and its absence is why farm sibling trust never
+/// worked: every other test here reads `cert_trusted_issuers` back with its
+/// own `serde_json::from_str::<Vec<String>>`, so they all agreed with the
+/// writer and none of them agreed with the hub.
+///
+/// `load_trusted_issuers` is the only reader whose answer matters — it is what
+/// the auth gate consults in `cert_mode = "trusted"` — and it parsed a
+/// different shape, swallowed the mismatch in `unwrap_or_default()`, and
+/// returned an empty list. Go through it, not around it.
+#[tokio::test]
+async fn a_wired_sibling_is_trusted_by_the_reader_the_auth_gate_uses() {
+    let h = common::setup().await;
+
+    reconcile(&h.state().db, &[sibling("sibling-pubkey")]).await;
+
+    let trusted = wavvon_hub::routes::certs::load_trusted_issuers(h.state()).await;
+    assert!(
+        trusted.contains(&"sibling-pubkey".to_string()),
+        "the farm wired this sibling in, so the auth gate has to see it; got {trusted:?}"
+    );
+}

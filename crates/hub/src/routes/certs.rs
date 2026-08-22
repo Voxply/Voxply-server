@@ -672,8 +672,18 @@ pub async fn revoke_cert_for(
 // Cert verification (used by auth gate in handlers.rs — Task #21)
 // ---------------------------------------------------------------------------
 
-/// Load and parse the cert_trusted_issuers setting (array of {pubkey, url, label}).
-pub async fn load_trusted_issuers(state: &AppState) -> Vec<TrustedIssuer> {
+/// The issuer pubkeys this hub trusts to certify a member, as stored by
+/// `PATCH /admin/settings/certs` and by `farm_siblings::reconcile`.
+///
+/// A flat array of pubkey strings, and this used to be the only reader that
+/// said otherwise: it parsed `Vec<TrustedIssuer>` (`{pubkey, url, label}`)
+/// while every writer wrote strings, so the mismatch fell into
+/// `unwrap_or_default()` and this hub trusted nobody, silently. `url` and
+/// `label` were never read by anything -- the trust check compares pubkeys
+/// and nothing else -- so the shape that survives is the one the admin UI
+/// can actually produce. Add the object form back the day something reads
+/// a field of it.
+pub async fn load_trusted_issuers(state: &AppState) -> Vec<String> {
     let json_str: String = sqlx::query_scalar::<_, String>(
         "SELECT value FROM hub_settings WHERE key = 'cert_trusted_issuers'",
     )
@@ -711,14 +721,6 @@ pub async fn load_cert_mode(state: &AppState) -> String {
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
-pub struct TrustedIssuer {
-    pub pubkey: String,
-    pub url: String,
-    #[serde(default)]
-    pub label: String,
-}
-
-#[derive(Serialize, Deserialize, Clone, Default)]
 pub struct CertRequire {
     #[serde(default)]
     pub min_pow_level: Option<u8>,
@@ -742,7 +744,7 @@ pub async fn verify_certification(
     cert: &Certification,
     auth_master_pubkey: &str,
     cert_mode: &str,
-    trusted_issuers: &[TrustedIssuer],
+    trusted_issuers: &[String],
     cert_require: &CertRequire,
 ) -> bool {
     let now = unix_timestamp();
@@ -798,9 +800,7 @@ pub async fn verify_certification(
         "any" => true, // any valid cert satisfies
         "trusted" => {
             // issuer pubkey must be in the trusted list
-            trusted_issuers
-                .iter()
-                .any(|ti| ti.pubkey == payload.issuer_pubkey)
+            trusted_issuers.contains(&payload.issuer_pubkey)
         }
         _ => false,
     }
@@ -814,7 +814,7 @@ pub async fn verify_certification(
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CertRequirement {
     pub mode: String,
-    pub trusted_issuers: Vec<TrustedIssuer>,
+    pub trusted_issuers: Vec<String>,
     pub require: CertRequire,
 }
 

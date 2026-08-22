@@ -447,9 +447,7 @@ pub async fn verify(
             // trust check
             match cert_mode.as_str() {
                 "any" => true,
-                "trusted" => trusted_issuers
-                    .iter()
-                    .any(|ti| ti.pubkey == payload.issuer_pubkey),
+                "trusted" => trusted_issuers.contains(&payload.issuer_pubkey),
                 _ => false,
             }
         });
