@@ -379,6 +379,15 @@ pub struct AppState {
     /// `RwLock<HashSet>` to avoid adding a new crate dependency.
     pub voice_relay_active: RwLock<HashSet<String>>,
 
+    /// Per-sender outbound packet loss, seen from the relay: pubkey ->
+    /// counter-span tracker (voice_loss.rs). Reported back to that sender on
+    /// its own `pong`, which is the only client that may see it -- outbound
+    /// loss is a property of one participant's uplink and telling the channel
+    /// about it would be gossip, not diagnostics.
+    ///
+    /// Reset on voice join, so a figure never describes a previous session.
+    pub voice_outbound_loss: RwLock<HashMap<String, crate::voice_loss::SenderLoss>>,
+
     /// Voice-only presence grants (events.md §7.4): pubkey → set of
     /// channel_ids the pubkey may join voice on despite lacking effective
     /// `READ_MESSAGES` there.

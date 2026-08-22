@@ -306,6 +306,17 @@ async fn relay_datagram(state: &AppState, channel_id: &str, sender_pk: &str, pay
         return;
     }
 
+    // Outbound loss, measured here because only here can it be measured: the
+    // sender cannot know which of its own datagrams never arrived. `ctr` is in
+    // the cleartext header, so this reads a counter and still never touches the
+    // sealed payload. A datagram too short to carry one is forwarded untracked
+    // rather than dropped — the relay's job is forwarding, not validating.
+    if let Some(ctr) = crate::voice_loss::read_ctr(payload) {
+        let mut losses = state.voice_outbound_loss.write().await;
+        let next = crate::voice_loss::track(losses.get(sender_pk).copied(), ctr);
+        losses.insert(sender_pk.to_string(), next);
+    }
+
     let sender_id: u16 = state
         .voice_sender_ids
         .read()

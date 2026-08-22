@@ -783,10 +783,18 @@ async fn dispatch_client_msg(
             cs.voice_channel = Some(channel_id);
             DispatchResult::Continue
         }
-        // Stateless echo: the client times the round trip itself, so the hub
-        // has nothing to remember and nothing to get wrong.
+        // The client still times the round trip itself — the hub keeps no
+        // probe table. The loss figure is read from a map the relay maintains
+        // anyway, so replying costs one lock and no bookkeeping.
         WsClientMessage::Ping { nonce } => {
-            let json = serde_json::to_string(&WsServerMessage::Pong { nonce }).unwrap();
+            let outbound_loss_pct = crate::voice_loss::loss_percent(
+                state.voice_outbound_loss.read().await.get(&cs.public_key),
+            );
+            let json = serde_json::to_string(&WsServerMessage::Pong {
+                nonce,
+                outbound_loss_pct,
+            })
+            .unwrap();
             let _ = ws_tx.send(Message::Text(json.into())).await;
             DispatchResult::Continue
         }
@@ -1036,6 +1044,7 @@ pub async fn leave_voice(state: &AppState, public_key: &str, channel_id: &str) {
 
     // Revoke the voice relay slot.
     state.voice_relay_active.write().await.remove(public_key);
+    state.voice_outbound_loss.write().await.remove(public_key);
 
     // events.md §7.4: a voice-only presence grant for this exact
     // (pubkey, channel) pair evaporates on leave -- never persisted, never

@@ -364,6 +364,13 @@ pub(in crate::routes::ws) async fn handle_voice_join(
         .write()
         .await
         .insert(cs.public_key.clone());
+    // A fresh join starts a fresh loss measurement: carrying a counter span
+    // across sessions would report an old call's bad patch as this one's.
+    state
+        .voice_outbound_loss
+        .write()
+        .await
+        .remove(&cs.public_key);
 
     cs.voice_channel = Some(channel_id.clone());
 

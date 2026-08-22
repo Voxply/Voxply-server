@@ -59,6 +59,7 @@ async fn setup_with_cors(cors_origins: &str) -> common::TestHarness {
         whisper_target_defs: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         whisper_optouts: tokio::sync::RwLock::new(std::collections::HashSet::new()),
         voice_relay_active: tokio::sync::RwLock::new(std::collections::HashSet::new()),
+        voice_outbound_loss: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         staging_voice_grants: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         voice_pending_binds: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         ws_key_senders: tokio::sync::RwLock::new(std::collections::HashMap::new()),

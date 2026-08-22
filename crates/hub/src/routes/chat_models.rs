@@ -745,9 +745,20 @@ pub enum WsServerMessage {
         speaking: bool,
     },
     /// Echo of a client `ping`. Carries the nonce back untouched — the hub
-    /// stores nothing and does no timing of its own.
+    /// still does no timing of its own.
+    ///
+    /// `outbound_loss_pct` rides along because the client already probes every
+    /// two seconds and the connection panel already has somewhere to put the
+    /// number: a periodic stat frame of its own would have been a second
+    /// heartbeat at the same interval. Absent until the sender is in voice and
+    /// has sent enough packets to have a counter span — a fabricated 0.0% is
+    /// what the panel exists not to show.
     #[serde(rename = "pong")]
-    Pong { nonce: i64 },
+    Pong {
+        nonce: i64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        outbound_loss_pct: Option<f32>,
+    },
     #[serde(rename = "voice_roster_update")]
     VoiceRosterUpdate {
         channel_id: String,

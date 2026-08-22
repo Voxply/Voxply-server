@@ -51,6 +51,12 @@ pub const CAPABILITIES: &[&str] = &[
     // WebRTC screen-share v2 signalling (SDP/ICE relay). Mirrors the older
     // `screen_share_v2` boolean, which stays for clients that read it.
     "screenshare.v2",
+    // `pong` carries `outbound_loss_pct`: the relay counts gaps in the
+    // sender's own cleartext `ctr` sequence, which is the only place outbound
+    // loss can be measured at all. Gated because a client that cannot tell
+    // "this hub does not report it" from "loss is zero" would show a
+    // reassuring 0.0% against every older hub.
+    "voice.loss",
     // Voice over WebTransport/QUIC with E2E sender keys (voice-transport-v2).
     // The raw-UDP and `/voice/ws` relays it replaced are gone, so a client
     // that does not see this string has no voice path to this hub at all.
