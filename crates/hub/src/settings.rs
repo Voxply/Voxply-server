@@ -395,7 +395,14 @@ pub fn load() -> Result<Settings> {
         .set_default("lan_tls_mode", "self")?
         .set_default("lan_mdns", true)?
         .add_source(config::File::with_name("hub").required(false))
-        .add_source(config::Environment::with_prefix("WAVVON"))
+        // `ignore_empty` because in a container an empty value is the *only*
+        // way to clear a baked-in `ENV`. The hub image sets
+        // `WAVVON_WEB_CLIENT_DIR=/web-client` and its own Dockerfile documents
+        // `-e WAVVON_WEB_CLIENT_DIR=` as how to run API-only — which failed
+        // with `'' does not exist`, because without this an empty variable
+        // deserialises as `Some("")` rather than `None`. No setting here wants
+        // an empty string to mean something other than "unset".
+        .add_source(config::Environment::with_prefix("WAVVON").ignore_empty(true))
         .build()?
         .try_deserialize::<Settings>()?;
     Ok(settings)
@@ -564,6 +571,23 @@ mod tests {
         for key in wavvon_hub_env::SPAWNABLE {
             std::env::remove_var(key);
         }
+    }
+
+    /// An empty variable means "unset", because in a container that is the only
+    /// way to clear a baked-in `ENV`. The hub image ships
+    /// `WAVVON_WEB_CLIENT_DIR=/web-client` and its Dockerfile documents
+    /// `-e WAVVON_WEB_CLIENT_DIR=` as the API-only switch; that exited with
+    /// "WAVVON_WEB_CLIENT_DIR '' does not exist" instead, so the documented
+    /// escape hatch did not exist.
+    #[test]
+    fn load_treats_an_empty_env_var_as_unset() {
+        std::env::set_var("WAVVON_WEB_CLIENT_DIR", "");
+        let s = load().expect("an empty variable must not fail the load");
+        assert_eq!(
+            s.web_client_dir, None,
+            "empty WAVVON_WEB_CLIENT_DIR must mean API-only, not a path called ''"
+        );
+        std::env::remove_var("WAVVON_WEB_CLIENT_DIR");
     }
 
     /// `config::Environment::with_prefix("WAVVON")` maps `WAVVON_FOO_BAR` to
