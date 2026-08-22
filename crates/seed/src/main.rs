@@ -36,8 +36,18 @@ fn u32_from_env(var: &str, default: u32) -> Result<u32> {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let database_url =
-        std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_string());
+    // `WAVVON_SEED_DATABASE_URL` first, unprefixed `DATABASE_URL` after it.
+    //
+    // The other two variables here are `WAVVON_SEED_HTTP_PORT` and
+    // `WAVVON_SEED_DB_MAX_CONNECTIONS`, so an operator who has configured
+    // anything else in this project reaches for the prefix — and got the
+    // built-in default instead, silently, on whatever database happened to
+    // answer. The farm carries a comment about the same mistake costing it
+    // months, from the other direction: it documented `DATABASE_URL` while
+    // reading `WAVVON_DATABASE_URL`, so it needed both set to start.
+    let database_url = std::env::var("WAVVON_SEED_DATABASE_URL")
+        .or_else(|_| std::env::var("DATABASE_URL"))
+        .unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_string());
 
     // `wavvon-seed migrate` — run migrations and exit.
     let subcommand = std::env::args().nth(1);
