@@ -27,6 +27,10 @@ pub struct AuthUser {
     /// - `"mini_app"` (bot-mini-apps.md "Scoped session token") — minted by
     ///   `bot_app_join`; confined to `MINI_APP_ALLOWED_PATHS` (empty — REST
     ///   is fully off-limits, `/ws` is the only surface this scope reaches).
+    /// - `"alliance_voice"` (alliances.md "Voice in alliance channels") —
+    ///   minted at `/auth/verify` against an allied hub's signed grant, for a
+    ///   visitor with **no `users` row at all**. Confined to
+    ///   `ALLIANCE_VOICE_ALLOWED_PATHS`.
     pub scope: String,
 }
 
@@ -112,6 +116,32 @@ const LOBBY_ALLOWED_PATHS: &[&str] = &[
 /// session) used to allow. If a real mini-app REST need shows up later,
 /// add it here explicitly rather than falling back to the member default.
 const MINI_APP_ALLOWED_PATHS: &[&str] = &[];
+
+/// REST paths an `alliance_voice` session may reach (alliances.md "Scope
+/// enforcement — allowlist, not denylist").
+///
+/// An allowlist rather than a denylist, and the reasoning is the whole point: a
+/// denylist grows a hole every time someone adds a route. A visitor is a member
+/// of *another* hub who has been let in to talk in one shared voice room, and
+/// nothing here should ever let them read a message, see a roster, or learn who
+/// is on this hub.
+///
+/// - `/info` — the capability list, `voice_wt_url` and `voice_cert_hash`, which
+///   are what the client needs to dial the relay at all.
+/// - the two DH-key routes — E2E voice keys are wrapped static-static X25519, so
+///   the visitor must be able to publish its own key and read its peers'. Both
+///   directions are needed; with only one, a visitor can be heard or can hear,
+///   never both.
+///
+/// `/ws` is not a path here: it authenticates through `validate_ws_token` and
+/// is confined separately, per-message.
+const ALLIANCE_VOICE_ALLOWED_PATHS: &[&str] = &["/info", "/identity/me/dh-key"];
+
+/// Prefix-matched companion to the above, for `/identity/{pubkey}/dh-key`.
+/// Kept separate from the exact list so a prefix can never be mistaken for one.
+fn alliance_voice_prefix_allowed(path: &str) -> bool {
+    path.starts_with("/identity/") && path.ends_with("/dh-key")
+}
 
 /// Minimum seconds between farm pubkey re-fetch attempts (handles key rotation
 /// without hammering the farm on every bad-token request).
@@ -358,9 +388,23 @@ impl FromRequestParts<Arc<AppState>> for AuthUser {
                 }
                 scope = sess_scope;
                 (pk, status)
+            } else if let Some((visitor_pk, _channel)) =
+                crate::routes::alliances::resolve_visitor_token(&state.db, token).await
+            {
+                // Voice in alliance channels (alliances.md): a visitor holds no
+                // `sessions` row, because that table's `public_key` references
+                // `users` and a visitor has no user row by design. Their token
+                // lives on the visit itself, which also carries its expiry —
+                // `resolve_visitor_token` only returns live ones.
+                //
+                // Deliberately *after* the sessions lookup: a member who
+                // happens to also hold a visit somewhere never loses their
+                // member session to this branch.
+                scope = "alliance_voice".to_string();
+                (visitor_pk, "approved".to_string())
             } else {
-                // Sessions are the only token store. There used to be a
-                // `bot_tokens` fallback here, dead in both directions: no
+                // Sessions and visits are the only token stores. There used to
+                // be a `bot_tokens` fallback here, dead in both directions: no
                 // code path ever inserted a row, and bots authenticate
                 // through the normal session flow (decisions.md, "Every bot
                 // is an external bot"). A table that grants authentication
@@ -489,6 +533,18 @@ impl FromRequestParts<Arc<AppState>> for AuthUser {
             let path = parts.uri.path();
             if !MINI_APP_ALLOWED_PATHS.contains(&path) {
                 return Err((StatusCode::FORBIDDEN, "mini_app_scope_confined".to_string()));
+            }
+        }
+
+        // Alliance-voice confinement (alliances.md). A visitor is not a member
+        // of this hub, so "everything a member may do, minus a denylist" would
+        // be the wrong shape entirely — this is the small set of things a
+        // voice-only guest legitimately needs.
+        if scope == "alliance_voice" {
+            let path = parts.uri.path();
+            if !ALLIANCE_VOICE_ALLOWED_PATHS.contains(&path) && !alliance_voice_prefix_allowed(path)
+            {
+                return Err((StatusCode::FORBIDDEN, "alliance_voice_scope".to_string()));
             }
         }
 

@@ -30,7 +30,35 @@ use super::models::{EffectiveChannelRow, LocalMessageRow, MemberRow};
 /// whenever the real parent is not itself part of the effective set.
 /// Order is depth-first-ish (depth, then display_order) so categories tend
 /// to precede their children.
-async fn effective_shared_channels(
+/// A federation token for one alliance peer, from the cache or freshly
+/// obtained. `None` means the peer could not be authenticated to and the caller
+/// should move on to the next one — every caller here is walking members
+/// looking for the one that owns a channel, and one unreachable hub must not
+/// fail the whole walk.
+pub(super) async fn peer_token(state: &AppState, member: &MemberRow) -> Option<String> {
+    if let Some(t) = state
+        .peer_tokens
+        .read()
+        .await
+        .get(&member.hub_public_key)
+        .cloned()
+    {
+        return Some(t);
+    }
+    let t = state
+        .federation_client
+        .authenticate(&member.hub_url, &state.hub_identity)
+        .await
+        .ok()?;
+    state
+        .peer_tokens
+        .write()
+        .await
+        .insert(member.hub_public_key.clone(), t.clone());
+    Some(t)
+}
+
+pub(super) async fn effective_shared_channels(
     db: &sqlx::PgPool,
     alliance_id: &str,
 ) -> Result<Vec<EffectiveChannelRow>, sqlx::Error> {
@@ -1169,27 +1197,8 @@ pub async fn get_alliance_channel_messages(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
 
     for member in members {
-        let token = {
-            let map = state.peer_tokens.read().await;
-            map.get(&member.hub_public_key).cloned()
-        };
-        let token = match token {
-            Some(t) => t,
-            None => match state
-                .federation_client
-                .authenticate(&member.hub_url, &state.hub_identity)
-                .await
-            {
-                Ok(t) => {
-                    state
-                        .peer_tokens
-                        .write()
-                        .await
-                        .insert(member.hub_public_key.clone(), t.clone());
-                    t
-                }
-                Err(_) => continue,
-            },
+        let Some(token) = peer_token(&state, &member).await else {
+            continue;
         };
 
         // Check if this peer owns the channel by listing their shared channels.

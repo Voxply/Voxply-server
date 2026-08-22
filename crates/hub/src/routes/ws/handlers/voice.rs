@@ -41,6 +41,32 @@ pub(in crate::routes::ws) async fn handle_voice_join(
         return DispatchResult::Continue;
     }
 
+    // An alliance-voice visitor was admitted to *one* shared channel
+    // (alliances.md). The grant is a ticket to a room, not to the hub, so the
+    // channel it named is re-checked here rather than trusted from the join —
+    // otherwise a visitor could walk from the room they were invited into to
+    // any other channel on this hub.
+    if let Some(admitted) = cs.alliance_voice_channel.clone() {
+        // Checked against the id as requested, before any later rewrite of
+        // `channel_id` (temp/spawner rooms) can move the target.
+        if channel_id != admitted {
+            tracing::info!(
+                visitor = %&cs.public_key[..16.min(cs.public_key.len())],
+                requested = %channel_id,
+                admitted = %admitted,
+                "Alliance voice visitor tried to join a channel outside its grant"
+            );
+            let err = WsServerMessage::Error {
+                context: "voice_join".to_string(),
+                message: "This visit is scoped to one channel.".to_string(),
+            };
+            let _ = ws_tx
+                .send(Message::Text(serde_json::to_string(&err).unwrap().into()))
+                .await;
+            return DispatchResult::Continue;
+        }
+    }
+
     // Bot audio injection (soundboard.md §2) requires the effective
     // `can_speak_voice` capability grant — same gate the now-deleted
     // `/voice/ws` endpoint enforced for bot joins (voice-transport-v2.md).

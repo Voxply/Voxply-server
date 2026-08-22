@@ -63,6 +63,14 @@ pub struct VerifyRequest {
     /// cert_mode != 'none' (Task #21).
     #[serde(default)]
     pub certifications: Option<Vec<Certification>>,
+    /// Voice in alliance channels (alliances.md): an origin hub's signed
+    /// assertion that the caller is its member and the named channel is shared
+    /// with an alliance this hub is in. Admits a **visitor** — an
+    /// `alliance_voice`-scoped session with no `users` row — and is ignored
+    /// entirely for anyone who is already a member here, who has a better
+    /// session available.
+    #[serde(default)]
+    pub alliance_voice_grant: Option<crate::routes::alliances::AllianceVoiceGrant>,
 }
 
 #[derive(Serialize, Deserialize)]

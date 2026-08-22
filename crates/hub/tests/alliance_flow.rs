@@ -967,3 +967,429 @@ async fn share_banner_channel_lists_type_but_rejects_messages() {
         .unwrap();
     assert!(messages.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Voice in alliance channels (alliances.md "Voice in alliance channels")
+// ---------------------------------------------------------------------------
+
+/// Everything two hubs need before a visitor can be admitted: an alliance, one
+/// voice-capable channel shared by hub A, and a member on each side.
+///
+/// Returns `(alliance_id, hub_a_channel_id, token_b, visitor_pubkey)`.
+async fn alliance_with_shared_voice_channel(
+    hub_a_url: &str,
+    hub_b_url: &str,
+    user_a: &Identity,
+    user_b: &Identity,
+) -> (String, String, String, String) {
+    let client = reqwest::Client::new();
+    let token_a = authenticate_user(hub_a_url, user_a).await;
+    let token_b = authenticate_user(hub_b_url, user_b).await;
+
+    let alliance: AllianceResponse = client
+        .post(format!("{hub_a_url}/alliances"))
+        .bearer_auth(&token_a)
+        .json(&json!({ "name": "Voice Pact" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // A plain text channel: the hub has no separate voice type — every leaf
+    // text channel hosts a voice call alongside its text pane.
+    let channel: ChannelResponse = client
+        .post(format!("{hub_a_url}/channels"))
+        .bearer_auth(&token_a)
+        .json(&json!({ "name": "war-room" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let resp = client
+        .post(format!("{hub_a_url}/alliances/{}/channels", alliance.id))
+        .bearer_auth(&token_a)
+        .json(&json!({ "channel_id": channel.id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "share should succeed");
+
+    let invite: AllianceInviteResponse = client
+        .post(format!("{hub_a_url}/alliances/{}/invite", alliance.id))
+        .bearer_auth(&token_a)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let resp = client
+        .post(format!("{hub_b_url}/alliances/join"))
+        .bearer_auth(&token_b)
+        .json(&json!({
+            "inviter_hub_url": hub_a_url,
+            "alliance_id": alliance.id,
+            "invite_token": invite.token,
+            "own_hub_url": hub_b_url,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "hub B should join the alliance");
+
+    (alliance.id, channel.id, token_b, user_b.public_key_hex())
+}
+
+/// Redeem a grant at the owning hub: challenge, sign, verify with the grant
+/// attached. Returns the raw `/auth/verify` response so a test can assert on a
+/// refusal as easily as on a session.
+async fn redeem_grant(
+    hub_url: &str,
+    identity: &Identity,
+    grant: &serde_json::Value,
+) -> reqwest::Response {
+    let client = reqwest::Client::new();
+    let pub_key = identity.public_key_hex();
+    let challenge: ChallengeResponse = client
+        .post(format!("{hub_url}/auth/challenge"))
+        .json(&json!({ "public_key": pub_key }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let signature = identity.sign(&hex::decode(&challenge.challenge).unwrap());
+    client
+        .post(format!("{hub_url}/auth/verify"))
+        .json(&json!({
+            "public_key": pub_key,
+            "challenge": challenge.challenge,
+            "signature": hex::encode(signature.to_bytes()),
+            "alliance_voice_grant": grant,
+        }))
+        .send()
+        .await
+        .unwrap()
+}
+
+/// The whole point of the feature: a member of hub B ends up holding a session
+/// on hub A that can reach voice and nothing else, without becoming a member of
+/// hub A in any sense.
+#[tokio::test]
+async fn a_member_of_an_allied_hub_is_admitted_as_a_voice_visitor() {
+    let (hub_a_url, hub_a_state, _ga) = start_hub("hub-a").await;
+    let (hub_b_url, _hub_b_state, _gb) = start_hub("hub-b").await;
+    let client = reqwest::Client::new();
+
+    let user_a = Identity::generate();
+    let user_b = Identity::generate();
+    let (alliance_id, channel_id, token_b, visitor_pk) =
+        alliance_with_shared_voice_channel(&hub_a_url, &hub_b_url, &user_a, &user_b).await;
+
+    // Hub B mints. It has to discover that hub A owns the channel by asking,
+    // which is the same federation walk the alliance message read does.
+    let resp = client
+        .post(format!("{hub_b_url}/alliances/{alliance_id}/voice-grant"))
+        .bearer_auth(&token_b)
+        .json(&json!({ "channel_id": channel_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "hub B should mint a grant for A's channel"
+    );
+    let minted: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(minted["owner_hub_url"], hub_a_url.as_str());
+    assert_eq!(minted["channel_name"], "war-room");
+
+    // Hub A admits.
+    let resp = redeem_grant(&hub_a_url, &user_b, &minted["grant"]).await;
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    assert_eq!(status, 200, "hub A should admit the visitor, got {body}");
+    let session: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        session["scope"], "alliance_voice",
+        "a visitor must not get a member session"
+    );
+    let visitor_token = session["token"].as_str().unwrap().to_string();
+
+    // Not a member, in the way that matters: no row at all. Anything less than
+    // this and they would appear in rosters, role lists and approval queues.
+    let user_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE public_key = $1")
+        .bind(&visitor_pk)
+        .fetch_one(&hub_a_state.db)
+        .await
+        .unwrap();
+    assert_eq!(user_rows, 0, "admitting a visitor must not create a user");
+
+    let admitted: Option<String> = sqlx::query_scalar(
+        "SELECT channel_id FROM alliance_voice_visitors WHERE subject_pubkey = $1",
+    )
+    .bind(&visitor_pk)
+    .fetch_optional(&hub_a_state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        admitted.as_deref(),
+        Some(channel_id.as_str()),
+        "the visit records the one channel the grant was for"
+    );
+
+    // The session works where it must, and nowhere else. `/info` is what the
+    // client needs to dial the relay at all.
+    let info = client
+        .get(format!("{hub_a_url}/info"))
+        .bearer_auth(&visitor_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(info.status(), 200, "a visitor must be able to read /info");
+
+    for path in ["/users", "/channels", "/conversations", "/me"] {
+        let resp = client
+            .get(format!("{hub_a_url}{path}"))
+            .bearer_auth(&visitor_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            403,
+            "{path} must be closed to a voice visitor"
+        );
+    }
+}
+
+/// The allowlist is the security boundary, so it has to hold for a route nobody
+/// thought about when it was written. `/users` is the one that would leak this
+/// hub's whole membership to a guest from another hub.
+#[tokio::test]
+async fn a_visitor_token_cannot_read_this_hubs_members() {
+    let (hub_a_url, _hub_a_state, _ga) = start_hub("hub-a").await;
+    let (hub_b_url, _hub_b_state, _gb) = start_hub("hub-b").await;
+    let client = reqwest::Client::new();
+
+    let user_a = Identity::generate();
+    let user_b = Identity::generate();
+    let (alliance_id, channel_id, token_b, _pk) =
+        alliance_with_shared_voice_channel(&hub_a_url, &hub_b_url, &user_a, &user_b).await;
+
+    let minted: serde_json::Value = client
+        .post(format!("{hub_b_url}/alliances/{alliance_id}/voice-grant"))
+        .bearer_auth(&token_b)
+        .json(&json!({ "channel_id": channel_id }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = redeem_grant(&hub_a_url, &user_b, &minted["grant"])
+        .await
+        .json()
+        .await
+        .unwrap();
+    let visitor_token = session["token"].as_str().unwrap();
+
+    // The DH-key routes are on the allowlist because E2E voice keys are wrapped
+    // to each recipient — a visitor that cannot publish its own key can be
+    // heard by nobody, and one that cannot read others' hears nobody.
+    let put = client
+        .put(format!("{hub_a_url}/identity/me/dh-key"))
+        .bearer_auth(visitor_token)
+        .json(&json!({ "dh_public_key": "00".repeat(32) }))
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        put.status(),
+        403,
+        "publishing a DH key is what makes the visitor audible"
+    );
+}
+
+/// Hub A re-resolves the channel against its own shared set and never trusts
+/// the origin's claim, so a grant naming a channel A has not shared is refused
+/// even though its signature is perfectly valid.
+#[tokio::test]
+async fn a_grant_for_an_unshared_channel_is_refused() {
+    let (hub_a_url, hub_a_state, _ga) = start_hub("hub-a").await;
+    let (hub_b_url, _hub_b_state, _gb) = start_hub("hub-b").await;
+    let client = reqwest::Client::new();
+
+    let user_a = Identity::generate();
+    let user_b = Identity::generate();
+    let (alliance_id, channel_id, token_b, _pk) =
+        alliance_with_shared_voice_channel(&hub_a_url, &hub_b_url, &user_a, &user_b).await;
+
+    let minted: serde_json::Value = client
+        .post(format!("{hub_b_url}/alliances/{alliance_id}/voice-grant"))
+        .bearer_auth(&token_b)
+        .json(&json!({ "channel_id": channel_id }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // Hub A unshares between mint and redemption. The grant is still signed,
+    // still unexpired, and must still be worthless.
+    let resp = client
+        .delete(format!(
+            "{hub_a_url}/alliances/{alliance_id}/channels/{channel_id}"
+        ))
+        .bearer_auth(&authenticate_user(&hub_a_url, &user_a).await)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204, "unshare should succeed");
+
+    let resp = redeem_grant(&hub_a_url, &user_b, &minted["grant"]).await;
+    assert_eq!(resp.status(), 403);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("channel_not_shared"),
+        "unsharing must invalidate an outstanding grant, got {body}"
+    );
+
+    let visitors: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM alliance_voice_visitors")
+        .fetch_one(&hub_a_state.db)
+        .await
+        .unwrap();
+    assert_eq!(visitors, 0, "a refused grant must admit nobody");
+}
+
+/// The per-share policy: an owner can close its rooms to allied members without
+/// unsharing the channel or leaving the alliance.
+#[tokio::test]
+async fn voice_remote_join_none_refuses_the_visit() {
+    let (hub_a_url, hub_a_state, _ga) = start_hub("hub-a").await;
+    let (hub_b_url, _hub_b_state, _gb) = start_hub("hub-b").await;
+    let client = reqwest::Client::new();
+
+    let user_a = Identity::generate();
+    let user_b = Identity::generate();
+    let (alliance_id, channel_id, token_b, _pk) =
+        alliance_with_shared_voice_channel(&hub_a_url, &hub_b_url, &user_a, &user_b).await;
+
+    let minted: serde_json::Value = client
+        .post(format!("{hub_b_url}/alliances/{alliance_id}/voice-grant"))
+        .bearer_auth(&token_b)
+        .json(&json!({ "channel_id": channel_id }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    sqlx::query(
+        "UPDATE alliance_shared_channels SET voice_remote_join = 'none'
+         WHERE alliance_id = $1 AND channel_id = $2",
+    )
+    .bind(&alliance_id)
+    .bind(&channel_id)
+    .execute(&hub_a_state.db)
+    .await
+    .unwrap();
+
+    let resp = redeem_grant(&hub_a_url, &user_b, &minted["grant"]).await;
+    assert_eq!(resp.status(), 403);
+    assert!(resp
+        .text()
+        .await
+        .unwrap()
+        .contains("voice_remote_join_disabled"));
+}
+
+/// A grant vouches for membership, never for identity. Presenting someone
+/// else's grant fails even with a valid signature over it, because the subject
+/// has to be the identity the challenge-response just proved.
+#[tokio::test]
+async fn a_grant_cannot_be_presented_by_someone_else() {
+    let (hub_a_url, _hub_a_state, _ga) = start_hub("hub-a").await;
+    let (hub_b_url, _hub_b_state, _gb) = start_hub("hub-b").await;
+    let client = reqwest::Client::new();
+
+    let user_a = Identity::generate();
+    let user_b = Identity::generate();
+    let (alliance_id, channel_id, token_b, _pk) =
+        alliance_with_shared_voice_channel(&hub_a_url, &hub_b_url, &user_a, &user_b).await;
+
+    let minted: serde_json::Value = client
+        .post(format!("{hub_b_url}/alliances/{alliance_id}/voice-grant"))
+        .bearer_auth(&token_b)
+        .json(&json!({ "channel_id": channel_id }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // A different identity entirely, authenticating correctly as itself.
+    let thief = Identity::generate();
+    let resp = redeem_grant(&hub_a_url, &thief, &minted["grant"]).await;
+    assert_eq!(resp.status(), 403);
+    assert!(resp
+        .text()
+        .await
+        .unwrap()
+        .contains("grant_subject_mismatch"));
+}
+
+/// Minting for a channel the origin hub owns itself is a client mistake worth
+/// naming: the member should just join voice locally, where they have roles and
+/// history, rather than visit their own hub as a guest.
+#[tokio::test]
+async fn minting_for_your_own_channel_is_refused_as_local() {
+    let (hub_a_url, _hub_a_state, _ga) = start_hub("hub-a").await;
+    let (hub_b_url, _hub_b_state, _gb) = start_hub("hub-b").await;
+    let client = reqwest::Client::new();
+
+    let user_a = Identity::generate();
+    let user_b = Identity::generate();
+    let (alliance_id, _channel_id, token_b, _pk) =
+        alliance_with_shared_voice_channel(&hub_a_url, &hub_b_url, &user_a, &user_b).await;
+
+    // Hub B shares one of its own channels with the same alliance.
+    let b_channel: ChannelResponse = client
+        .post(format!("{hub_b_url}/channels"))
+        .bearer_auth(&token_b)
+        .json(&json!({ "name": "guild-hall" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let resp = client
+        .post(format!("{hub_b_url}/alliances/{alliance_id}/channels"))
+        .bearer_auth(&token_b)
+        .json(&json!({ "channel_id": b_channel.id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let resp = client
+        .post(format!("{hub_b_url}/alliances/{alliance_id}/voice-grant"))
+        .bearer_auth(&token_b)
+        .json(&json!({ "channel_id": b_channel.id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+    assert!(resp.text().await.unwrap().contains("channel_is_local"));
+}

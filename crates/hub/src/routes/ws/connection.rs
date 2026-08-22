@@ -25,6 +25,7 @@ pub(super) async fn handle_socket(
     state: Arc<AppState>,
     public_key: String,
     mini_app_channel_id: Option<String>,
+    alliance_voice_channel: Option<String>,
 ) {
     // ── Connection setup ─────────────────────────────────────────────────────
 
@@ -174,6 +175,7 @@ pub(super) async fn handle_socket(
         public_key.clone(),
         is_bot,
         is_mini_app,
+        alliance_voice_channel,
         session_id.clone(),
         subscribed,
         my_conversations,
@@ -757,6 +759,47 @@ pub(super) async fn handle_socket(
 
 // ── Per-message dispatch ─────────────────────────────────────────────────────
 
+/// The only WS messages an `alliance_voice` visitor may send
+/// (alliances.md). Everything a room genuinely needs and nothing else: join,
+/// leave, the speaking flag, the E2E key offer, and the latency probe.
+///
+/// The design also listed `voice_key_request`; there is no such client
+/// message. `VoiceKeyRequest` is server->client, part of `WsServerMessage` —
+/// the hub asks a sender to re-offer, the client answers with another
+/// `voice_key_offer`. Listing it would have been a no-op arm for a variant
+/// that cannot arrive.
+///
+/// Written as an explicit `matches!` over named variants rather than a wildcard
+/// so that adding a variant to `WsClientMessage` cannot quietly grant it to
+/// visitors.
+fn visitor_may_send(msg: &WsClientMessage) -> bool {
+    matches!(
+        msg,
+        WsClientMessage::VoiceJoin { .. }
+            | WsClientMessage::VoiceLeave { .. }
+            | WsClientMessage::VoiceSpeaking { .. }
+            | WsClientMessage::VoiceKeyOffer { .. }
+            | WsClientMessage::Ping { .. }
+    )
+}
+
+/// A short name for the log line above. Only used for diagnostics, so it does
+/// not have to be exhaustive — but it does have to say *something*, which is
+/// the whole difference from a silent drop.
+fn msg_kind(msg: &WsClientMessage) -> &'static str {
+    match msg {
+        WsClientMessage::Subscribe { .. } => "subscribe",
+        WsClientMessage::Unsubscribe { .. } => "unsubscribe",
+        WsClientMessage::Typing { .. } => "typing",
+        WsClientMessage::SetStatus { .. } => "set_status",
+        WsClientMessage::DmTyping { .. } => "dm_typing",
+        WsClientMessage::ComponentInteraction { .. } => "component_interaction",
+        WsClientMessage::VoiceWatch { .. } => "voice_watch",
+        WsClientMessage::VoiceUnwatch => "voice_unwatch",
+        _ => "other",
+    }
+}
+
 async fn dispatch_client_msg(
     cs: &mut ConnState,
     state: &Arc<AppState>,
@@ -764,6 +807,23 @@ async fn dispatch_client_msg(
     bot_tx: &mpsc::Sender<String>,
     msg: WsClientMessage,
 ) -> DispatchResult {
+    // Alliance-voice visitor confinement (alliances.md "Scope enforcement —
+    // allowlist, not denylist").
+    //
+    // An allowlist, so a route added tomorrow is closed by default rather than
+    // open by omission. And the refused case *logs* instead of falling into a
+    // silent no-op: an `Other => {}` arm on this very enum is how four hub
+    // features were absent for months with no symptom, and the server
+    // CLAUDE.md names it as the bug class to watch for here.
+    if cs.alliance_voice_channel.is_some() && !visitor_may_send(&msg) {
+        tracing::info!(
+            visitor = %&cs.public_key[..16.min(cs.public_key.len())],
+            message = msg_kind(&msg),
+            "Dropped WS message outside the alliance_voice allowlist"
+        );
+        return DispatchResult::Continue;
+    }
+
     match msg {
         // ── Subscriptions ──────────────────────────────────────────────────
         WsClientMessage::Subscribe { .. } => screen::handle_subscribe(cs, state, ws_tx, msg).await,

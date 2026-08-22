@@ -148,6 +148,50 @@ pub async fn verify(
     let (canonical_pubkey, master_pubkey) =
         resolve_canonical_identity(&state.db, &req.public_key, req.subkey_cert.as_ref()).await?;
 
+    // Voice in alliance channels (alliances.md): a member of an allied hub
+    // redeeming a grant to join one of our shared voice rooms.
+    //
+    // Handled here, before every gate below it, because a visitor is not a
+    // member and none of those gates are about them: no invite, no PoW, no
+    // cert admission, no approval queue, no roles, and above all **no `users`
+    // row**. Falling through would either create one or refuse them.
+    //
+    // Skipped entirely if they already have a row here. A member holds a
+    // strictly better session than a visitor one, and silently downgrading
+    // someone to a voice-only scope because their client sent a grant would be
+    // a confusing way to lose your own hub.
+    if let Some(grant) = req.alliance_voice_grant.as_ref() {
+        let already_member: Option<i32> =
+            sqlx::query_scalar("SELECT 1 FROM users WHERE public_key = $1")
+                .bind(&canonical_pubkey)
+                .fetch_optional(&state.db)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+
+        if already_member.is_none() {
+            let visitor =
+                crate::routes::alliances::verify_grant(&state, grant, &canonical_pubkey).await?;
+            // The visit row *is* the session — `sessions.public_key` references
+            // `users`, and a visitor has no user row, so there is nothing to
+            // insert there. The token and its expiry live on the visit.
+            let token =
+                crate::routes::alliances::record_visit(&state, &canonical_pubkey, &visitor).await?;
+
+            tracing::info!(
+                subject = %canonical_pubkey,
+                origin = %visitor.origin_hub_pubkey,
+                channel = %visitor.channel_id,
+                "Admitted alliance voice visitor"
+            );
+
+            return Ok(Json(VerifyResponse {
+                token,
+                scope: "alliance_voice".to_string(),
+                canonical_pubkey,
+            }));
+        }
+    }
+
     // External bot gate: when is_bot=true the hub requires a pre-existing
     // users row with approval_status='bot_pending' or 'approved'. Bots cannot
     // self-register — the invite flow creates the row first.
@@ -759,9 +803,9 @@ pub async fn verify(
 /// Result of a successful [`validate_ws_token`] call.
 pub struct WsAuth {
     pub public_key: String,
-    /// Session scope: `"member"`, `"mini_app"`, or (bot tokens / legacy rows)
-    /// effectively `"member"`. Never `"lobby"` — that scope is rejected
-    /// before this is constructed.
+    /// Session scope: `"member"`, `"mini_app"`, `"alliance_voice"`, or (bot
+    /// tokens / legacy rows) effectively `"member"`. Never `"lobby"` — that
+    /// scope is rejected before this is constructed.
     pub scope: String,
     /// Set only when `scope == "mini_app"`: the single channel this
     /// mini-app session (bot-mini-apps.md "Scoped session token") is bound
@@ -842,7 +886,20 @@ pub async fn validate_ws_token(
             // it opened was refused while its HTTP calls worked. No
             // messages, no presence, no voice signalling, and no error
             // anywhere except a socket that never connected.
-            if token.contains('.') {
+            if let Some((visitor_pk, _channel)) =
+                crate::routes::alliances::resolve_visitor_token(db, token).await
+            {
+                // An alliance-voice visitor (alliances.md). The socket is the
+                // only thing they are really here for — `voice_join`, the E2E
+                // key offer, the speaking flag — and `dispatch_client_msg`
+                // confines it to exactly that set.
+                (
+                    visitor_pk,
+                    "approved".to_string(),
+                    "alliance_voice".to_string(),
+                    None,
+                )
+            } else if token.contains('.') {
                 let pk = crate::auth::middleware::resolve_farm_token(state, token).await?;
                 let status: Option<String> =
                     sqlx::query_scalar("SELECT approval_status FROM users WHERE public_key = $1")
@@ -877,7 +934,8 @@ pub async fn validate_ws_token(
         return Err((StatusCode::UNAUTHORIZED, "Key has been revoked".to_string()));
     }
 
-    // Approval gate.
+    // Approval gate. A visitor never reaches this as "pending": they have no
+    // `users` row, so nothing about them is awaiting approval.
     if approval_status == "pending" {
         return Err((
             StatusCode::FORBIDDEN,

@@ -630,6 +630,10 @@ pub fn create_router_full(
             get(routes::alliances::list_shared_channels).post(routes::alliances::share_channel),
         )
         .route(
+            "/alliances/{alliance_id}/voice-grant",
+            post(routes::alliances::mint_voice_grant),
+        )
+        .route(
             "/alliances/{alliance_id}/channels/{channel_id}",
             axum::routing::delete(routes::alliances::unshare_channel),
         )

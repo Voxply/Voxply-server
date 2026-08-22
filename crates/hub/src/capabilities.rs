@@ -51,6 +51,12 @@ pub const CAPABILITIES: &[&str] = &[
     // WebRTC screen-share v2 signalling (SDP/ICE relay). Mirrors the older
     // `screen_share_v2` boolean, which stays for clients that read it.
     "screenshare.v2",
+    // A member of an allied hub can join voice in a channel this hub shares
+    // with that alliance: the mint route on their hub, the grant field on
+    // `/auth/verify` here, and the visitor scope behind it (alliances.md).
+    // Gated because a client that cannot see this string must not offer a
+    // voice affordance on an alliance channel it would then fail to join.
+    "voice.alliance",
     // `pong` carries `outbound_loss_pct`: the relay counts gaps in the
     // sender's own cleartext `ctr` sequence, which is the only place outbound
     // loss can be measured at all. Gated because a client that cannot tell

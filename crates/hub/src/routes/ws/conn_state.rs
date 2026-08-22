@@ -13,6 +13,11 @@ pub(super) struct ConnState {
     /// "Scoped session token") — bound to one channel, no voice access
     /// (voice-transport-v2.md: same block the deleted `/voice/ws` enforced).
     pub is_mini_app: bool,
+    /// Set only for an `alliance_voice` visitor (alliances.md): the single
+    /// shared channel their grant admitted them to. `Some` *is* the marker for
+    /// "this connection is a visitor" — there is no separate bool, so the two
+    /// can never disagree about whether to confine.
+    pub alliance_voice_channel: Option<String>,
     /// Unique id for this WS session (UUID v4). Stored here so handler
     /// functions (e.g. screen share start) can tag resources they create
     /// without an extra parameter, enabling session-scoped cleanup on
@@ -45,6 +50,7 @@ impl ConnState {
         public_key: String,
         is_bot: bool,
         is_mini_app: bool,
+        alliance_voice_channel: Option<String>,
         session_id: String,
         subscribed: HashSet<String>,
         my_conversations: HashSet<String>,
@@ -53,6 +59,7 @@ impl ConnState {
             public_key,
             is_bot,
             is_mini_app,
+            alliance_voice_channel,
             session_id,
             voice_channel: None,
             pending_chunk: None,

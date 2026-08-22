@@ -31,12 +31,28 @@ pub async fn ws_handler(
     let auth = crate::auth::handlers::validate_ws_token(&state, &params.token).await?;
     let public_key = auth.public_key;
 
+    // An alliance-voice visitor is confined to the one channel their grant
+    // admitted them to. Resolved here, once, rather than per message: an
+    // expired visit then reads as "not a visitor and not a member", which the
+    // dispatch confinement turns into a socket that can do nothing.
+    let alliance_voice_channel = if auth.scope == "alliance_voice" {
+        crate::routes::alliances::admitted_channel(&state, &public_key).await
+    } else {
+        None
+    };
+
     tracing::info!(
         "WebSocket connected: {}",
         &public_key[..16.min(public_key.len())]
     );
 
     Ok(ws.on_upgrade(move |socket| {
-        connection::handle_socket(socket, state, public_key, auth.mini_app_channel_id)
+        connection::handle_socket(
+            socket,
+            state,
+            public_key,
+            auth.mini_app_channel_id,
+            alliance_voice_channel,
+        )
     }))
 }

@@ -1734,6 +1734,48 @@ pub async fn run(pool: &PgPool) -> Result<()> {
         .execute(pool)
         .await;
 
+    // Voice in alliance channels (alliances.md). Who is currently admitted to
+    // one of this hub's shared voice rooms as a *visitor* — a member of an
+    // allied hub, holding an `alliance_voice`-scoped session and no `users`
+    // row at all. Deliberately not a user: no roles, no approval queue, no
+    // presence in `/users`, nothing that could be mistaken for membership.
+    //
+    // `channel_id` is what makes a grant a ticket to one room rather than to
+    // the hub: `voice_join` checks against it, so a visitor admitted for one
+    // shared channel cannot walk into another.
+    // The visit *is* the session, and that is not a shortcut — `sessions` has
+    // `public_key REFERENCES users(public_key)`, so a row there for someone with
+    // no `users` row is impossible, and the additive-only rule rightly forbids
+    // dropping the constraint. Keeping visitor tokens here instead leaves
+    // `sessions` meaning exactly what it has always meant (a member's session)
+    // and makes "a visitor is not a member" structural rather than something a
+    // loosened join has to remember.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS alliance_voice_visitors (
+            subject_pubkey    TEXT PRIMARY KEY,
+            token             TEXT NOT NULL UNIQUE,
+            origin_hub_pubkey TEXT NOT NULL,
+            origin_hub_url    TEXT NOT NULL,
+            display_name      TEXT,
+            channel_id        TEXT NOT NULL,
+            admitted_at       BIGINT NOT NULL,
+            expires_at        BIGINT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    // Per-share moderation policy, mirroring `forum_remote_write`: whether
+    // members of allied hubs may join voice in this shared channel at all.
+    // 'allowed' | 'none'. The owning hub stays sovereign over its own rooms
+    // without having to leave the alliance or unshare the channel.
+    let _ = sqlx::query(
+        "ALTER TABLE alliance_shared_channels
+         ADD COLUMN voice_remote_join TEXT NOT NULL DEFAULT 'allowed'",
+    )
+    .execute(pool)
+    .await;
+
     // =======================================================================
     // One-time data cleanup
     // =======================================================================
