@@ -737,3 +737,72 @@ async fn public_info_exposes_farm_public_key() {
         "public_key must match farm keypair"
     );
 }
+
+/// A farm with no admin is unusable, and used to be unavoidable.
+///
+/// `farms.admin_pubkey` starts NULL, `creation_policy` defaults to
+/// `admin_only`, and **nothing in the codebase ever wrote the column** — so a
+/// freshly deployed farm refused every hub creation with `admin_only` and had
+/// no route to appoint the admin who could change that. farm-impl.md had always
+/// specified `admin_pubkey TEXT (set on first start)`; it was simply never
+/// built. `WAVVON_FARM_ADMIN_PUBKEY` is the farm's counterpart to the hub's
+/// `WAVVON_OWNER_PUBKEY`, and this pins the two properties that make it safe.
+#[tokio::test]
+async fn the_admin_seed_fills_a_null_and_never_overwrites() {
+    let (db, _guard) = common::create_test_db().await;
+    db::migrations::run(&db).await.unwrap();
+
+    let now = 1i64;
+    sqlx::query("INSERT INTO farms (id, public_key, created_at) VALUES (1, 'farmpk', $1)")
+        .bind(now)
+        .execute(&db)
+        .await
+        .unwrap();
+
+    // Exactly the statement `main.rs` runs at startup.
+    let seed = |key: &'static str| {
+        let db = db.clone();
+        async move {
+            sqlx::query("UPDATE farms SET admin_pubkey = $1 WHERE id = 1 AND admin_pubkey IS NULL")
+                .bind(key)
+                .execute(&db)
+                .await
+                .unwrap()
+                .rows_affected()
+        }
+    };
+
+    let first = "a".repeat(64);
+    assert_eq!(
+        seed(Box::leak(first.clone().into_boxed_str())).await,
+        1,
+        "the first start must appoint the admin"
+    );
+
+    let stored: Option<String> =
+        sqlx::query_scalar::<_, Option<String>>("SELECT admin_pubkey FROM farms WHERE id = 1")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(stored.as_deref(), Some(first.as_str()));
+
+    // The property that stops this being a takeover: restarting with a
+    // different key must change nothing.
+    let second = "b".repeat(64);
+    assert_eq!(
+        seed(Box::leak(second.into_boxed_str())).await,
+        0,
+        "an existing admin must never be replaced by a restart"
+    );
+
+    let stored: Option<String> =
+        sqlx::query_scalar::<_, Option<String>>("SELECT admin_pubkey FROM farms WHERE id = 1")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(
+        stored.as_deref(),
+        Some(first.as_str()),
+        "the original admin must still be the admin"
+    );
+}
