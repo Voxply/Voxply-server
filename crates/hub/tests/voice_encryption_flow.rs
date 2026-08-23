@@ -345,8 +345,18 @@ async fn key_offer_unknown_recipient_is_silently_dropped() {
 
     // The connection must remain alive — we can still receive voice_joined
     // (already consumed) so we just verify no error arrives within 1 s.
+    // `while let Some(Ok(TsMessage::Text(_)))` used to bound this loop, which
+    // made a WebSocket **control** frame end it: the pattern fails to match, the
+    // async block completes, and the timeout below never fires, so the test
+    // reports "the hub sent something" when what arrived was the hub's own
+    // keepalive Ping. Passed locally and failed in CI, where the ping lands
+    // inside the 500 ms window. Same shape as the `moderation_flow` flake.
     let no_error = tokio::time::timeout(std::time::Duration::from_millis(500), async {
-        while let Some(Ok(TsMessage::Text(raw))) = rx_a.next().await {
+        while let Some(Ok(frame)) = rx_a.next().await {
+            let TsMessage::Text(raw) = frame else {
+                // Ping/Pong/Binary are protocol traffic, not an answer.
+                continue;
+            };
             let v: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
             if v.get("type").and_then(|t| t.as_str()) == Some("error") {
                 panic!("unexpected error from hub: {v}");
