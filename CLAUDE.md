@@ -30,7 +30,7 @@ Commit to **`develop`**. See `CONTRIBUTING.md`.
 ```bash
 cargo check --workspace
 cargo check --all-targets --workspace    # `check` alone does NOT compile tests
-cargo clippy --all-targets --workspace
+cargo clippy --all-targets --workspace   # NOTE: CI tracks `stable`, which may be AHEAD of yours
 cargo fmt --all                          # required before every commit; CI gates on --check
 cargo test --workspace -- --test-threads=4   # bounded: the default saturates Postgres
                                              # max_connections and flakes with PoolTimedOut
@@ -131,6 +131,15 @@ reaches `Settings`.
 ---
 
 ## Non-obvious constraints
+
+**CI's clippy can be newer than yours, and it fails the build.** `build.yml`
+uses `dtolnay/rust-toolchain@…  # stable`, so it picks up new lints the day
+they land. A local toolchain a few weeks old gives a clean
+`cargo clippy --workspace -- -D warnings` and a red pipeline — which has now
+happened twice in a row, on `result_large_err` and then `result_unit_err`,
+the second only reachable because fixing the first let clippy get past it.
+`rustup update stable` before trusting a green local clippy run, and expect
+the fix to be a real one: these lints have been right both times.
 
 **Migrations: destructive changes are fine until 1.0.** This is beta. There is
 no database in the field whose upgrade path anyone has promised, so `DROP`,
