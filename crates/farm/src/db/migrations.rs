@@ -29,14 +29,6 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     .execute(pool)
     .await?;
 
-    // Dropped with the seed registry and `/farm/public-info`: the flag gated
-    // publishing a farm to a cross-farm directory, and there is no such
-    // directory to publish to. Pre-1.0, so the column goes rather than
-    // lingering on every dev database.
-    sqlx::query("ALTER TABLE farms DROP COLUMN IF EXISTS allow_discovery_listing")
-        .execute(pool)
-        .await?;
-
     // Canonical per-farm user identity.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS farm_users (
