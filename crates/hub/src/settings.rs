@@ -79,16 +79,10 @@ pub const ENV_VAR_HELP: &[(&str, &str, &str)] = &[
         "Bootstrap template URL applied on first boot when the channels table is empty",
     ),
     (
-        "WAVVON_BOOTSTRAP_TOKEN",
-        "(unset)",
-        "Bootstrap token redeemed from the discovery service to fetch a template",
-    ),
-    (
         "WAVVON_TEMPLATE_FILE",
         "(unset)",
         "Path to a local bootstrap template JSON file, applied on first boot when the \
-         channels table is empty. Third in precedence, behind WAVVON_BOOTSTRAP_TOKEN and \
-         WAVVON_TEMPLATE_URL. No signature verification — local files are already trusted \
+         channels table is empty. Second in precedence, behind \n         WAVVON_TEMPLATE_URL. No signature verification — local files are already trusted \
          by the operator who placed them on disk.",
     ),
     (
@@ -261,11 +255,8 @@ pub struct Settings {
     /// Bootstrap template URL applied on first boot when channels table is empty.
     /// Env: WAVVON_TEMPLATE_URL
     pub template_url: Option<String>,
-    /// Bootstrap token redeemed from the discovery service to fetch a template.
-    /// Env: WAVVON_BOOTSTRAP_TOKEN
-    pub bootstrap_token: Option<String>,
     /// Path to a local bootstrap template JSON file applied on first boot.
-    /// Third in precedence, behind bootstrap_token and template_url.
+    /// Second in precedence, behind template_url.
     /// Env: WAVVON_TEMPLATE_FILE
     pub template_file: Option<String>,
     /// Built-in bootstrap template preset: "gaming", "community", or "minimal".

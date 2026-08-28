@@ -13,8 +13,6 @@ use wavvon_hub::bootstrap::{maybe_bootstrap, BootstrapConfig};
 fn no_config() -> BootstrapConfig {
     BootstrapConfig {
         template_url: None,
-        bootstrap_token: None,
-        discovery_url: "https://discovery.wavvon.io".into(),
         template_file: None,
         preset: None,
     }
@@ -23,8 +21,6 @@ fn no_config() -> BootstrapConfig {
 fn config_with_template(template_url: &str) -> BootstrapConfig {
     BootstrapConfig {
         template_url: Some(template_url.into()),
-        bootstrap_token: None,
-        discovery_url: "https://discovery.wavvon.io".into(),
         template_file: None,
         preset: None,
     }

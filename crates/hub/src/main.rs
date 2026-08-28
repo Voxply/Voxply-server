@@ -885,8 +885,6 @@ async fn main() -> Result<()> {
             &bootstrap_client,
             &wavvon_hub::bootstrap::BootstrapConfig {
                 template_url: settings.template_url.clone(),
-                bootstrap_token: settings.bootstrap_token.clone(),
-                discovery_url: settings.discovery_url.clone(),
                 template_file: settings.template_file.clone(),
                 preset: settings.template.clone(),
             },
