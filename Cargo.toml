@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "crates/hub",
     "crates/hub-env",
-    "crates/seed",
     "crates/identity",
     "crates/farm",
     "crates/agent",

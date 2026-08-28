@@ -50,7 +50,7 @@ Hub CLI (binary at `target/release/wavvon-hub`):
 ./target/release/wavvon-hub rotate-key
 ```
 
-Farm and seed have equivalent `migrate` subcommands. All binaries are configured
+The farm has an equivalent `migrate` subcommand. All binaries are configured
 via `WAVVON_*` environment variables or a config file — see the
 [hub operator guide](https://github.com/Wavvon/Wavvon-docs/blob/main/docs/hub-operator-guide.md).
 To get a hub running locally, use the **`run-hub`** skill in `.claude/skills/`.
@@ -124,7 +124,6 @@ reaches `Settings`.
 
 - **`farm`** — fleet control plane: hub lifecycle (spawn, monitor, stop), server registration, reverse-proxy to hub processes, farm-level SSO. Partially implemented; see the wiki's `farm-model.md` and `farm-impl.md`.
 - **`agent`** — fleet worker node. Reverse-connects to farm over WebSocket, spawns and monitors local hub processes on its behalf. No HTTP surface.
-- **`seed`** — cross-farm registry. A farm registers itself (`POST /farms/register`, after opting in via `allow_discovery_listing`) and the seed verifies by calling the farm back at `/farm/public-info` rather than trusting the caller; `GET /farms` lists them. **Nothing consumes it yet** — this line used to say the discovery site queries it for the global hub catalog, and discovery has no reference to the seed at all: it keeps its own farm table, populated by farms POSTing to its own `/api/farms`. Two registries, one with no reader. Covered end to end by `e2e-topology/` (monorepo root) since 2026-08-23.
 - **`demo-seed`** — populates a running hub with realistic demo data for screenshots.
 - **`bot-kit`, `ttt-bot`, `discord-import`** — bot SDK, example bot, importer.
 

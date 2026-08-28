@@ -659,7 +659,7 @@ pub struct PublicInfoResponse {
     pub region: Option<String>,
     pub languages: serde_json::Value,
     pub tags: serde_json::Value,
-    /// Farm Ed25519 public key (hex). Required by the seed node to verify farm identity.
+    /// Farm Ed25519 public key (hex) — how a farm proves it is the one it claims.
     pub public_key: String,
 }
 
