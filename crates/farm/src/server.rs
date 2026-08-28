@@ -94,7 +94,6 @@ pub fn create_router(state: Arc<FarmState>) -> Router {
             post(routes::admin::revoke_user_sessions),
         )
         // Phase 3 — public discovery probe (unauthenticated).
-        .route("/farm/public-info", get(routes::admin::public_info))
         // Hub heartbeat — pushed by each hub every 60 s.
         .route(
             "/farm/heartbeat",
