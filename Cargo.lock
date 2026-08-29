@@ -5567,12 +5567,15 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "rand 0.8.6",
+ "rcgen",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "sqlx",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite 0.26.2",
  "totp-rs",
  "tower-http",
@@ -5583,6 +5586,7 @@ dependencies = [
  "uuid",
  "wavvon-hub-env",
  "wavvon-identity",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

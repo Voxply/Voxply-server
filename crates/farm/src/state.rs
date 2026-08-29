@@ -28,6 +28,11 @@ pub struct FarmState {
     /// Map server_id → bounded sender for the agent's WebSocket write half.
     /// Only present while the agent is connected.
     pub agent_senders: Arc<RwLock<HashMap<String, tokio::sync::mpsc::Sender<String>>>>,
+    /// One HTTP client per remote node, keyed by address and TLS settings.
+    /// A pinned node needs a client whose verifier trusts that certificate and
+    /// no other, so the shared client above cannot serve them; building one per
+    /// request would mean a handshake and a fresh pool on every call.
+    pub node_clients: Arc<RwLock<HashMap<String, reqwest::Client>>>,
 }
 
 /// The agent that hosts a server could not be handed a command.
@@ -64,6 +69,7 @@ impl FarmState {
             http_client: reqwest::Client::new(),
             hubs_dir,
             agent_senders: Arc::new(RwLock::new(HashMap::new())),
+            node_clients: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 

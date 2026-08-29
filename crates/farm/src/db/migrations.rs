@@ -232,6 +232,31 @@ pub async fn run(pool: &PgPool) -> Result<()> {
         .execute(pool)
         .await;
 
+    // Where a node actually is, and how to trust it (farm-model.md,
+    // "Multi-node data plane"). Before these the control plane was multi-node
+    // and the data plane was not: the proxy dialed `127.0.0.1:<port>` for
+    // every hub, so a hub the farm had spawned on another machine was
+    // unreachable through the farm's own domain.
+    //
+    // All nullable or defaulted: a row with no host is a hub on this machine,
+    // which is every row that exists today.
+    for sql in [
+        "ALTER TABLE servers ADD COLUMN host TEXT",
+        // `ca` — ordinary certificate validation, for a node that already
+        // terminates TLS. `pin` — the agent advertises its self-signed cert's
+        // SHA-256 and the farm refuses anything else, the same primitive voice
+        // uses for its relay certificate.
+        "ALTER TABLE servers ADD COLUMN tls_mode TEXT NOT NULL DEFAULT 'ca'
+             CHECK (tls_mode IN ('ca', 'pin'))",
+        "ALTER TABLE servers ADD COLUMN cert_sha256 TEXT",
+        // The farm never holds a node's database credentials: it holds a
+        // template, and the agent substitutes the per-hub database name where
+        // the data actually lives.
+        "ALTER TABLE servers ADD COLUMN db_url_template TEXT",
+    ] {
+        let _ = sqlx::query(sql).execute(pool).await;
+    }
+
     // How hubs' data is separated: `database` (one each, needs CREATEDB) or
     // `schema` (one each inside the farm's own database). See db/provision.rs.
     //
