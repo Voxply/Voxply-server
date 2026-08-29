@@ -1313,6 +1313,178 @@ async fn voice_remote_join_none_refuses_the_visit() {
         .contains("voice_remote_join_disabled"));
 }
 
+/// The policy is settable over the API, not just in the database: the share
+/// route carries it, the shared-channel list reports it back, and flipping it
+/// decides whether a grant can be redeemed at all. Without the route half, the
+/// admin UI has no way to close a room short of unsharing it.
+#[tokio::test]
+async fn the_share_route_sets_and_reports_the_voice_policy() {
+    let (hub_a_url, _hub_a_state, _ga) = start_hub("hub-a").await;
+    let (hub_b_url, _hub_b_state, _gb) = start_hub("hub-b").await;
+    let client = reqwest::Client::new();
+
+    let user_a = Identity::generate();
+    let user_b = Identity::generate();
+    let (alliance_id, channel_id, token_b, _pk) =
+        alliance_with_shared_voice_channel(&hub_a_url, &hub_b_url, &user_a, &user_b).await;
+    let token_a = authenticate_user(&hub_a_url, &user_a).await;
+
+    // Default, from the migration: shared means joinable.
+    let shared: serde_json::Value = client
+        .get(format!(
+            "{hub_a_url}/alliances/{alliance_id}/channels?local_only=true"
+        ))
+        .bearer_auth(&token_a)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entry = shared
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["channel_id"] == channel_id.as_str())
+        .expect("the shared channel is listed");
+    assert_eq!(entry["voice_remote_join"], "allowed");
+
+    let resp = client
+        .post(format!("{hub_a_url}/alliances/{alliance_id}/channels"))
+        .bearer_auth(&token_a)
+        .json(&json!({ "channel_id": channel_id, "voice_remote_join": "none" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "re-sharing with a policy should succeed"
+    );
+
+    let shared: serde_json::Value = client
+        .get(format!(
+            "{hub_a_url}/alliances/{alliance_id}/channels?local_only=true"
+        ))
+        .bearer_auth(&token_a)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entry = shared
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["channel_id"] == channel_id.as_str())
+        .unwrap();
+    assert_eq!(entry["voice_remote_join"], "none");
+
+    let minted: serde_json::Value = client
+        .post(format!("{hub_b_url}/alliances/{alliance_id}/voice-grant"))
+        .bearer_auth(&token_b)
+        .json(&json!({ "channel_id": channel_id }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let resp = redeem_grant(&hub_a_url, &user_b, &minted["grant"]).await;
+    assert_eq!(
+        resp.status(),
+        403,
+        "a policy set over the API must bind the same as one set in SQL"
+    );
+
+    // And back: the room reopens without re-sharing anything.
+    let resp = client
+        .post(format!("{hub_a_url}/alliances/{alliance_id}/channels"))
+        .bearer_auth(&token_a)
+        .json(&json!({ "channel_id": channel_id, "voice_remote_join": "allowed" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let minted: serde_json::Value = client
+        .post(format!("{hub_b_url}/alliances/{alliance_id}/voice-grant"))
+        .bearer_auth(&token_b)
+        .json(&json!({ "channel_id": channel_id }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let resp = redeem_grant(&hub_a_url, &user_b, &minted["grant"]).await;
+    assert_eq!(resp.status(), 200, "reopening must admit the visitor again");
+
+    // An unknown value is refused rather than stored: the column is read back
+    // as a policy, and a typo would read as "not 'none'", i.e. wide open.
+    let resp = client
+        .post(format!("{hub_a_url}/alliances/{alliance_id}/channels"))
+        .bearer_auth(&token_a)
+        .json(&json!({ "channel_id": channel_id, "voice_remote_join": "sometimes" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+/// A visitor has no `users` row here by design, so the plain roster lookup
+/// finds nothing and they used to render as a bare key. They are named by the
+/// hub that vouched for them instead — and that hub travels with the name,
+/// because the name itself is asserted rather than proven.
+#[tokio::test]
+async fn a_visitor_is_named_by_the_hub_that_vouched_for_them() {
+    let (hub_a_url, hub_a_state, _ga) = start_hub("hub-a").await;
+    let (hub_b_url, _hub_b_state, _gb) = start_hub("hub-b").await;
+
+    let user_a = Identity::generate();
+    let user_b = Identity::generate();
+    let (alliance_id, channel_id, token_b, visitor_pk) =
+        alliance_with_shared_voice_channel(&hub_a_url, &hub_b_url, &user_a, &user_b).await;
+
+    let client = reqwest::Client::new();
+    let minted: serde_json::Value = client
+        .post(format!("{hub_b_url}/alliances/{alliance_id}/voice-grant"))
+        .bearer_auth(&token_b)
+        .json(&json!({ "channel_id": channel_id }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let resp = redeem_grant(&hub_a_url, &user_b, &minted["grant"]).await;
+    assert_eq!(resp.status(), 200, "the visitor should be admitted");
+
+    let (display_name, is_bot, visiting_from) =
+        wavvon_hub::routes::ws::voice_identity(&hub_a_state, &visitor_pk).await;
+    assert!(!is_bot);
+    assert_eq!(
+        visiting_from.as_deref(),
+        Some("hub-b"),
+        "the vouching hub must reach the roster, or a hub-asserted name renders as a local one"
+    );
+    // Whatever hub B asserted, it is the visitor's own row that carries it —
+    // never a `users` row here.
+    let _ = display_name;
+    let member_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE public_key = $1")
+        .bind(&visitor_pk)
+        .fetch_one(&hub_a_state.db)
+        .await
+        .unwrap();
+    assert_eq!(member_rows, 0, "a visit must never create a member");
+
+    // A local member keeps the plain shape: no vouching hub at all.
+    let (_, _, owner_visiting_from) =
+        wavvon_hub::routes::ws::voice_identity(&hub_a_state, &user_a.public_key_hex()).await;
+    assert_eq!(owner_visiting_from, None);
+}
+
 /// A grant vouches for membership, never for identity. Presenting someone
 /// else's grant fails even with a valid signature over it, because the subject
 /// has to be the identity the challenge-response just proved.

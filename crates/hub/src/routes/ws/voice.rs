@@ -40,6 +40,48 @@ pub(super) fn send_whisper_notification(
     let _ = state.chat_tx.send((ev, json));
 }
 
+/// How one pubkey in a voice room is named to everyone else: display name,
+/// bot flag, and — for an alliance-voice visitor — the hub that vouched for
+/// them (alliances.md).
+///
+/// A visitor has no `users` row here by design, so the plain lookup returns
+/// nothing and, before this, they appeared as a bare key. Their name is
+/// hub-asserted rather than proven, which is why it never travels without the
+/// hub that asserted it: a client renders "name · HubName", never a name that
+/// could pass for a local member's.
+pub async fn voice_identity(
+    state: &AppState,
+    pubkey: &str,
+) -> (Option<String>, bool, Option<String>) {
+    let member: Option<(Option<String>, bool)> =
+        sqlx::query_as("SELECT display_name, is_bot FROM users WHERE public_key = $1")
+            .bind(pubkey)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten();
+    if let Some((display_name, is_bot)) = member {
+        return (display_name, is_bot, None);
+    }
+
+    let visitor: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT v.display_name, m.hub_name
+         FROM alliance_voice_visitors v
+         LEFT JOIN alliance_members m ON m.hub_public_key = v.origin_hub_pubkey
+         WHERE v.subject_pubkey = $1",
+    )
+    .bind(pubkey)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten();
+
+    match visitor {
+        Some((display_name, hub_name)) => (display_name, false, hub_name),
+        None => (None, false, None),
+    }
+}
+
 /// Builds the participant list for `channel_id` as seen by `viewer`:
 /// invisible members are omitted (decisions.md 2026-07-12 — invisible users
 /// are shown offline to everyone else; the voice list was the known gap),
@@ -70,24 +112,14 @@ pub async fn get_voice_participants(
         .iter()
         .filter(|pk| Some(pk.as_str()) == viewer || !invisible.contains(*pk))
     {
-        let row: Option<(Option<String>, bool)> =
-            sqlx::query_as("SELECT display_name, is_bot FROM users WHERE public_key = $1")
-                .bind(pk)
-                .fetch_optional(&state.db)
-                .await
-                .ok()
-                .flatten();
-
-        let (display_name, is_bot) = match row {
-            Some((dn, b)) => (dn, b),
-            None => (None, false),
-        };
+        let (display_name, is_bot, visiting_from) = voice_identity(state, pk).await;
 
         result.push(VoiceParticipantInfo {
             public_key: pk.clone(),
             display_name,
             is_bot,
             sender_id: sender_ids.get(pk).copied(),
+            visiting_from,
         });
     }
     result

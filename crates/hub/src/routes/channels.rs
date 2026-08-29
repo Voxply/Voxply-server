@@ -77,27 +77,24 @@ pub async fn voice_channel_participants(
     struct UserInfo {
         display_name: Option<String>,
         is_bot: bool,
+        visiting_from: Option<String>,
     }
     let mut info_by_key: HashMap<String, UserInfo> = HashMap::new();
     if !all_keys.is_empty() {
         // sqlx doesn't have great IN-clause helpers; this loop is cheap and
         // bounded by hub size. The lookup itself is one indexed PK fetch.
         for key in &all_keys {
-            let row: Option<(Option<String>, bool)> =
-                sqlx::query_as("SELECT display_name, is_bot FROM users WHERE public_key = $1")
-                    .bind(key)
-                    .fetch_optional(&state.db)
-                    .await
-                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
-            let (display_name, is_bot) = match row {
-                Some((dn, b)) => (dn, b),
-                None => (None, false),
-            };
+            // Same resolution as the WS roster, visitors included — a client
+            // that refetches the roster must not lose the hub a visitor is
+            // vouched by (alliances.md).
+            let (display_name, is_bot, visiting_from) =
+                crate::routes::ws::voice_identity(&state, key).await;
             info_by_key.insert(
                 key.clone(),
                 UserInfo {
                     display_name,
                     is_bot,
+                    visiting_from,
                 },
             );
         }
@@ -114,6 +111,7 @@ pub async fn voice_channel_participants(
                     public_key: pk.clone(),
                     display_name: info.and_then(|i| i.display_name.clone()),
                     is_bot: info.map(|i| i.is_bot).unwrap_or(false),
+                    visiting_from: info.and_then(|i| i.visiting_from.clone()),
                 }
             })
             .collect();
@@ -129,6 +127,9 @@ pub struct VoiceParticipantInfo {
     pub public_key: String,
     pub display_name: Option<String>,
     pub is_bot: bool,
+    /// The hub vouching for an alliance-voice visitor; absent for members.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visiting_from: Option<String>,
 }
 
 /// Returns the set of public keys currently in any voice channel on this

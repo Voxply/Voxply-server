@@ -46,6 +46,11 @@ pub struct ShareChannelRequest {
     /// share) rather than forcing every caller to always restate it.
     #[serde(default)]
     pub forum_remote_write: Option<String>,
+    /// Whether members of allied hubs may join voice in this share
+    /// (alliances.md "Moderation"): `"allowed"` | `"none"`. Same
+    /// leave-it-alone semantics as `forum_remote_write`.
+    #[serde(default)]
+    pub voice_remote_join: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -72,6 +77,11 @@ pub struct SharedChannelResponse {
     /// still parse under the same default the migration applies.
     #[serde(default = "default_forum_remote_write")]
     pub forum_remote_write: String,
+    /// Remote-voice-join policy in effect for this share (alliances.md):
+    /// `"allowed"` | `"none"`. Defaults to `"allowed"`, matching the
+    /// migration, so a peer that has not upgraded still parses.
+    #[serde(default = "default_voice_remote_join")]
+    pub voice_remote_join: String,
 }
 
 fn default_channel_type() -> String {
@@ -80,6 +90,10 @@ fn default_channel_type() -> String {
 
 fn default_forum_remote_write() -> String {
     "replies_only".to_string()
+}
+
+fn default_voice_remote_join() -> String {
+    "allowed".to_string()
 }
 
 #[derive(Serialize, Deserialize)]

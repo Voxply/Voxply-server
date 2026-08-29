@@ -1161,6 +1161,13 @@ pub struct VoiceParticipantInfo {
     /// must be present there (voice-transport-v2.md).
     #[serde(default)]
     pub sender_id: Option<u16>,
+    /// Set only for an alliance-voice visitor: the name of the hub that
+    /// vouched for them (alliances.md). Their `display_name` is hub-asserted,
+    /// not proven, so a client must render it as mediated — "name · HubName",
+    /// the way federated forum authorship is rendered — and never as a local
+    /// member. Absent for everyone with a `users` row here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visiting_from: Option<String>,
 }
 
 #[derive(Serialize, Clone)]

@@ -135,14 +135,8 @@ pub(in crate::routes::ws) async fn handle_set_status(
                     },
                 ));
             } else {
-                let row: Option<(Option<String>, bool)> =
-                    sqlx::query_as("SELECT display_name, is_bot FROM users WHERE public_key = $1")
-                        .bind(&cs.public_key)
-                        .fetch_optional(&state.db)
-                        .await
-                        .ok()
-                        .flatten();
-                let (display_name, is_bot) = row.unwrap_or((None, false));
+                let (display_name, is_bot, visiting_from) =
+                    crate::routes::ws::voice_identity(state, &cs.public_key).await;
                 let _ = state.voice_event_tx.send((
                     ch.clone(),
                     WsServerMessage::VoiceParticipantJoined {
@@ -158,6 +152,7 @@ pub(in crate::routes::ws) async fn handle_set_status(
                                 .get(&ch)
                                 .and_then(|m| m.get(&cs.public_key))
                                 .copied(),
+                            visiting_from,
                         },
                     },
                 ));

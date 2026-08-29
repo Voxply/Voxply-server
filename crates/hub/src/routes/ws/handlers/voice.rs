@@ -434,19 +434,8 @@ pub(in crate::routes::ws) async fn handle_voice_join(
     let json = serde_json::to_string(&reply).unwrap();
     let _ = ws_tx.send(Message::Text(json.into())).await;
 
-    let (display_name, is_bot): (Option<String>, bool) = {
-        let row: Option<(Option<String>, bool)> =
-            sqlx::query_as("SELECT display_name, is_bot FROM users WHERE public_key = $1")
-                .bind(&cs.public_key)
-                .fetch_optional(&state.db)
-                .await
-                .ok()
-                .flatten();
-        match row {
-            Some((dn, b)) => (dn, b),
-            None => (None, false),
-        }
-    };
+    let (display_name, is_bot, visiting_from) =
+        crate::routes::ws::voice_identity(state, &cs.public_key).await;
 
     // An invisible joiner is announced to no one (decisions.md 2026-07-12:
     // shown offline to everyone else). Their own client already got the
@@ -461,6 +450,7 @@ pub(in crate::routes::ws) async fn handle_voice_join(
                     display_name: display_name.clone(),
                     is_bot,
                     sender_id: Some(sender_id),
+                    visiting_from,
                 },
             },
         ));

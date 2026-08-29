@@ -143,6 +143,15 @@ pub async fn share_channel(
         }
     }
 
+    if let Some(policy) = &req.voice_remote_join {
+        if !matches!(policy.as_str(), "allowed" | "none") {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "voice_remote_join must be 'allowed' or 'none'".to_string(),
+            ));
+        }
+    }
+
     let now = crate::auth::handlers::unix_timestamp();
 
     // `forum_remote_write` is COALESCEd on both branches: an insert with no
@@ -151,17 +160,19 @@ pub async fn share_channel(
     // that omits the field leaves the existing policy untouched rather than
     // clobbering it back to the default.
     sqlx::query(
-        "INSERT INTO alliance_shared_channels (alliance_id, channel_id, shared_at, include_descendants, forum_remote_write)
-         VALUES ($1, $2, $3, $4, COALESCE($5, 'replies_only'))
+        "INSERT INTO alliance_shared_channels (alliance_id, channel_id, shared_at, include_descendants, forum_remote_write, voice_remote_join)
+         VALUES ($1, $2, $3, $4, COALESCE($5, 'replies_only'), COALESCE($6, 'allowed'))
          ON CONFLICT (alliance_id, channel_id)
          DO UPDATE SET include_descendants = EXCLUDED.include_descendants,
-                       forum_remote_write = COALESCE($5, alliance_shared_channels.forum_remote_write)",
+                       forum_remote_write = COALESCE($5, alliance_shared_channels.forum_remote_write),
+                       voice_remote_join = COALESCE($6, alliance_shared_channels.voice_remote_join)",
     )
     .bind(&alliance_id)
     .bind(&req.channel_id)
     .bind(now)
     .bind(req.include_descendants)
     .bind(&req.forum_remote_write)
+    .bind(&req.voice_remote_join)
     .execute(&state.db)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
@@ -218,14 +229,17 @@ pub async fn list_shared_channels(
     // forum_remote_write only lives on the *direct* share row (see
     // `forum_write_policy` in routes/posts.rs); descendant-inherited entries
     // fall back to the same default the migration applies.
-    let policy_rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT channel_id, forum_remote_write FROM alliance_shared_channels WHERE alliance_id = $1",
+    let policy_rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT channel_id, forum_remote_write, voice_remote_join FROM alliance_shared_channels WHERE alliance_id = $1",
     )
     .bind(&alliance_id)
     .fetch_all(&state.db)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
-    let policy_map: std::collections::HashMap<String, String> = policy_rows.into_iter().collect();
+    let policy_map: std::collections::HashMap<String, (String, String)> = policy_rows
+        .into_iter()
+        .map(|(id, forum, voice)| (id, (forum, voice)))
+        .collect();
 
     let local_hub_name = crate::routes::hub::current_hub_name(&state).await;
     let mut out: Vec<SharedChannelResponse> = rows
@@ -233,8 +247,12 @@ pub async fn list_shared_channels(
         .map(|r| SharedChannelResponse {
             forum_remote_write: policy_map
                 .get(&r.id)
-                .cloned()
+                .map(|(forum, _)| forum.clone())
                 .unwrap_or_else(|| "replies_only".to_string()),
+            voice_remote_join: policy_map
+                .get(&r.id)
+                .map(|(_, voice)| voice.clone())
+                .unwrap_or_else(|| "allowed".to_string()),
             channel_id: r.id,
             channel_name: r.name,
             hub_public_key: hub_key.clone(),
