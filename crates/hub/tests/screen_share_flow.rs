@@ -29,6 +29,7 @@ async fn start_hub() -> (String, Arc<AppState>, common::TestDbGuard) {
         db_read: None,
         store,
         pending_challenges: RwLock::new(HashMap::new()),
+        cert_portfolio_cache: RwLock::new(HashMap::new()),
         chat_tx,
         federation_client: FederationClient::new(),
         peer_tokens: RwLock::new(HashMap::new()),

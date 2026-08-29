@@ -170,6 +170,7 @@ pub async fn run(pool: &PgPool) -> Result<()> {
         ("cert_min_pow_level", "0"),
         ("cert_mode", "none"),
         ("cert_trusted_issuers", "[]"),
+        ("cert_issuer_urls", "{}"),
         ("cert_require", "{}"),
         ("hub_tags", "[]"),
         ("hub_nsfw", "false"),

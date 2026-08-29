@@ -238,6 +238,10 @@ pub struct AuthChallenge {
     pub passkeys: Vec<webauthn_rs::prelude::Passkey>,
 }
 
+/// `(issuer_pubkey, master_pubkey)` → `(fetched_at, portfolio)`.
+pub type CertPortfolioCache =
+    HashMap<(String, String), (i64, Vec<crate::routes::certs::Certification>)>;
+
 pub struct AppState {
     pub hub_name: String,
     pub hub_identity: Identity,
@@ -254,6 +258,12 @@ pub struct AppState {
     /// other's challenge — e.g. two simultaneous federated DM deliveries to
     /// the same peer hub.
     pub pending_challenges: RwLock<HashMap<String, PendingChallenge>>,
+    /// `(issuer_pubkey, master_pubkey)` → `(fetched_at, portfolio)` for certs
+    /// this hub pulled from a trusted issuer during admission
+    /// (hub-certifications.md §11). Short-lived on purpose: a sibling that
+    /// revokes is honoured within one TTL, and within a farm the fetch it
+    /// saves is a loopback call anyway.
+    pub cert_portfolio_cache: RwLock<CertPortfolioCache>,
     pub chat_tx: broadcast::Sender<(ChatEvent, Arc<str>)>,
     pub federation_client: FederationClient,
     pub peer_tokens: RwLock<HashMap<String, String>>,

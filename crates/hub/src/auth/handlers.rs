@@ -434,67 +434,52 @@ pub async fn verify(
             .map(|c| c.master_pubkey.clone())
             .unwrap_or_else(|| req.public_key.clone());
 
-        let certs = req.certifications.as_deref().unwrap_or(&[]);
-
-        let satisfied = certs.iter().any(|cert| {
-            // Run sync-safe verification; async only needed for /info lookup which we skip
-            // in v1 (we trust the signature; issuer /info is advisory for display/trust list).
-            let payload = &cert.payload;
-
-            let now_ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
-
-            if payload.subject_pubkey != master_pk {
-                return false;
-            }
-            if now_ts > payload.expires_at {
-                return false;
-            }
-            if payload.standing != "good" {
-                return false;
-            }
-
-            let sig_bytes = match hex::decode(&cert.signature) {
-                Ok(b) => b,
-                Err(_) => return false,
-            };
-            let payload_json = match serde_json::to_string(payload) {
-                Ok(s) => s,
-                Err(_) => return false,
-            };
-            if wavvon_identity::verify_signature(
-                &payload.issuer_pubkey,
-                payload_json.as_bytes(),
-                &sig_bytes,
+        // One predicate, applied to pushed and pulled certs alike. It used to
+        // be re-implemented inline here, beside the copy in certs.rs — two
+        // admission rules that had to be kept in step by hand.
+        let mut satisfied = false;
+        for cert in req.certifications.as_deref().unwrap_or(&[]) {
+            if crate::routes::certs::verify_certification(
+                &state,
+                cert,
+                &master_pk,
+                &cert_mode,
+                &trusted_issuers,
+                &cert_require,
             )
-            .is_err()
+            .await
             {
-                return false;
+                satisfied = true;
+                break;
             }
+        }
 
-            // cert_require property rules
-            if let Some(min_pow) = cert_require.min_pow_level {
-                match payload.pow_level {
-                    Some(lvl) if lvl >= min_pow => {}
-                    _ => return false,
+        // Nothing presented, or nothing presented that passes: fetch the
+        // candidate's portfolio from the issuers we trust and try again
+        // (hub-certifications.md §11). This is the path that makes the feature
+        // work at all — no client sends the `certifications` array, so before
+        // it a hub with `cert_mode != none` refused everyone with
+        // `cert_required`. Costs at most a handful of short, cached, usually
+        // loopback requests, and only on the miss.
+        if !satisfied {
+            for cert in
+                crate::routes::certs::pull_portfolios(&state, &trusted_issuers, &master_pk).await
+            {
+                if crate::routes::certs::verify_certification(
+                    &state,
+                    &cert,
+                    &master_pk,
+                    &cert_mode,
+                    &trusted_issuers,
+                    &cert_require,
+                )
+                .await
+                {
+                    satisfied = true;
+                    break;
                 }
             }
-            if let Some(min_days) = cert_require.min_member_since_days {
-                let required_since = now_ts - (min_days as i64) * 86400;
-                if payload.member_since > required_since {
-                    return false;
-                }
-            }
-
-            // trust check
-            match cert_mode.as_str() {
-                "any" => true,
-                "trusted" => trusted_issuers.contains(&payload.issuer_pubkey),
-                _ => false,
-            }
-        });
+        }
 
         if !satisfied {
             return Err((StatusCode::FORBIDDEN, "cert_required".to_string()));

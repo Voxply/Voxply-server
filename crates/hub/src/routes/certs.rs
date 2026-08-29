@@ -293,6 +293,10 @@ pub struct CertSettingsResponse {
     pub cert_min_age_days: i64,
     pub cert_validity_days: i64,
     pub cert_trusted_issuers: Vec<String>,
+    /// issuer pubkey → base URL, for the issuers this hub can *pull* a
+    /// portfolio from (§11). Sparse: trust does not require an address, and an
+    /// issuer without one still has its pushed certs honoured.
+    pub cert_issuer_urls: std::collections::HashMap<String, String>,
 }
 
 pub async fn get_cert_settings(
@@ -336,6 +340,7 @@ pub async fn get_cert_settings(
         cert_min_age_days,
         cert_validity_days,
         cert_trusted_issuers,
+        cert_issuer_urls: load_issuer_urls(&state).await,
     }))
 }
 
@@ -343,15 +348,38 @@ pub async fn get_cert_settings(
 // Admin: PATCH /admin/settings/certs
 // ---------------------------------------------------------------------------
 
+/// `hub_settings` stores text, and this endpoint used to demand text from the
+/// caller too — so the admin screen, which PATCHes back the object it
+/// rendered, sent `cert_auto_issue: false` and got **422 for the whole
+/// request**. Every save from that screen failed, which is also why nobody
+/// noticed `cert_mode` was a lockout: nobody could turn it on from the UI.
+///
+/// Scalars are accepted in whatever JSON type they arrive as and stringified
+/// here. Strings still work, so the callers that were written around the old
+/// shape are unaffected.
+fn setting_text(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct CertSettingsPatch {
-    pub cert_auto_issue: Option<String>,
-    pub cert_standing_days: Option<String>,
-    pub cert_validity_days: Option<String>,
+    pub cert_auto_issue: Option<serde_json::Value>,
+    pub cert_standing_days: Option<serde_json::Value>,
+    /// What `GET` calls the same setting, and therefore what the admin screen
+    /// sends back. Without this the "member for N days" field silently never
+    /// saved.
+    pub cert_min_age_days: Option<serde_json::Value>,
+    pub cert_validity_days: Option<serde_json::Value>,
     pub cert_mode: Option<String>,
     pub cert_trusted_issuers: Option<serde_json::Value>,
+    /// `{ issuer_pubkey: url }`. Replaces the map wholesale, like the trust
+    /// list it accompanies.
+    pub cert_issuer_urls: Option<serde_json::Value>,
     pub cert_require: Option<serde_json::Value>,
-    pub cert_min_pow_level: Option<String>,
+    pub cert_min_pow_level: Option<serde_json::Value>,
 }
 
 pub async fn patch_cert_settings(
@@ -375,22 +403,39 @@ pub async fn patch_cert_settings(
     let mut kvs: Vec<(&'static str, String)> = Vec::new();
 
     if let Some(v) = body.cert_auto_issue {
-        kvs.push(("cert_auto_issue", v));
+        kvs.push(("cert_auto_issue", setting_text(&v)));
+    }
+    // `cert_min_age_days` is the same setting under the name `GET` uses; an
+    // explicit `cert_standing_days` wins if a caller sends both.
+    if let Some(v) = body.cert_min_age_days {
+        kvs.push(("cert_standing_days", setting_text(&v)));
     }
     if let Some(v) = body.cert_standing_days {
-        kvs.push(("cert_standing_days", v));
+        kvs.push(("cert_standing_days", setting_text(&v)));
     }
     if let Some(v) = body.cert_validity_days {
-        kvs.push(("cert_validity_days", v));
+        kvs.push(("cert_validity_days", setting_text(&v)));
     }
     if let Some(v) = body.cert_mode {
         kvs.push(("cert_mode", v));
     }
     if let Some(v) = body.cert_min_pow_level {
-        kvs.push(("cert_min_pow_level", v));
+        kvs.push(("cert_min_pow_level", setting_text(&v)));
     }
     if let Some(v) = body.cert_trusted_issuers {
         kvs.push(("cert_trusted_issuers", v.to_string()));
+    }
+    if let Some(v) = body.cert_issuer_urls {
+        // Refused rather than stored on the wrong shape: this setting exists
+        // because the trust list once held a shape only one reader agreed
+        // with, and nobody found out for months.
+        if serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()).is_err() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "cert_issuer_urls must be an object of issuer pubkey → URL".to_string(),
+            ));
+        }
+        kvs.push(("cert_issuer_urls", v.to_string()));
     }
     if let Some(v) = body.cert_require {
         kvs.push(("cert_require", v.to_string()));
@@ -804,6 +849,131 @@ pub async fn verify_certification(
         }
         _ => false,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pull: fetching a candidate's portfolio from trusted issuers (§11)
+// ---------------------------------------------------------------------------
+
+/// How long a pulled portfolio is reused. A sibling that revokes is honoured
+/// within one TTL — the right answer for what is usually a loopback call.
+const PORTFOLIO_CACHE_TTL_SECS: i64 = 600;
+
+/// Cap on issuers contacted for one admission attempt. An admin can trust more
+/// than this; the pull path just stops there, and the pushed-cert path is
+/// unaffected.
+const MAX_PULL_ISSUERS: usize = 8;
+
+const PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Where each trusted issuer can be reached, keyed by issuer pubkey.
+///
+/// Deliberately a *second* setting rather than a field on
+/// `cert_trusted_issuers`: that list is the trust decision, it is read on
+/// every gated auth, and it once spent months silently empty because one
+/// reader expected objects while every writer wrote strings. Trust stays a
+/// flat array of pubkeys; an address is a separate, optional fact about an
+/// issuer. An issuer with no URL is simply not pullable — its pushed certs
+/// still work — which is a better failure than a trust list that fails to
+/// parse.
+pub async fn load_issuer_urls(state: &AppState) -> std::collections::HashMap<String, String> {
+    let json_str: String = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM hub_settings WHERE key = 'cert_issuer_urls'",
+    )
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| "{}".to_string());
+
+    serde_json::from_str(&json_str).unwrap_or_default()
+}
+
+/// One issuer's answer for one subject: `GET {issuer_url}/identity/{pk}/certs`.
+///
+/// A failure is a miss, never an error — the caller falls through to the
+/// pushed certs and then to `cert_required`, so a downed sibling costs an
+/// admission attempt, not the hub.
+async fn fetch_portfolio(
+    state: &AppState,
+    issuer_pubkey: &str,
+    issuer_url: &str,
+    master_pubkey: &str,
+) -> Vec<Certification> {
+    let now = unix_timestamp();
+    let key = (issuer_pubkey.to_string(), master_pubkey.to_string());
+
+    if let Some((fetched_at, cached)) = state.cert_portfolio_cache.read().await.get(&key) {
+        if now - fetched_at < PORTFOLIO_CACHE_TTL_SECS {
+            return cached.clone();
+        }
+    }
+
+    let url = format!(
+        "{}/identity/{}/certs",
+        issuer_url.trim_end_matches('/'),
+        master_pubkey
+    );
+    let fetched: Vec<Certification> = match state
+        .http_client
+        .get(&url)
+        .timeout(PULL_TIMEOUT)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => resp.json().await.unwrap_or_default(),
+        Ok(resp) => {
+            tracing::debug!(issuer = %issuer_pubkey, status = %resp.status(), "Cert portfolio pull refused");
+            Vec::new()
+        }
+        Err(e) => {
+            tracing::debug!(issuer = %issuer_pubkey, error = %e, "Cert portfolio pull failed");
+            Vec::new()
+        }
+    };
+
+    // An empty answer is cached too: "this issuer has nothing for them" is the
+    // common case and the one worth not re-asking for every retry.
+    state
+        .cert_portfolio_cache
+        .write()
+        .await
+        .insert(key, (now, fetched.clone()));
+    fetched
+}
+
+/// Every cert the trusted issuers hold for `master_pubkey`, fetched
+/// concurrently (hub-certifications.md §11).
+///
+/// The receiving hub pulls because nothing pushes: no client sends the
+/// `certifications` array `/auth/verify` accepts, so before this a hub with
+/// `cert_mode != none` refused everyone. Certs come back unverified — the
+/// caller runs the same `verify_certification` predicate over them as over a
+/// pushed cert, so a lying issuer gains nothing by answering.
+pub async fn pull_portfolios(
+    state: &AppState,
+    trusted_issuers: &[String],
+    master_pubkey: &str,
+) -> Vec<Certification> {
+    let urls = load_issuer_urls(state).await;
+    let targets: Vec<(&String, &String)> = trusted_issuers
+        .iter()
+        .filter_map(|pk| urls.get(pk).map(|url| (pk, url)))
+        .take(MAX_PULL_ISSUERS)
+        .collect();
+    if targets.is_empty() {
+        return Vec::new();
+    }
+
+    let fetches = targets
+        .into_iter()
+        .map(|(pk, url)| fetch_portfolio(state, pk, url, master_pubkey));
+
+    futures_util::future::join_all(fetches)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

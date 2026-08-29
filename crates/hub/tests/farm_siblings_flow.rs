@@ -164,3 +164,53 @@ async fn a_wired_sibling_is_trusted_by_the_reader_the_auth_gate_uses() {
         "the farm wired this sibling in, so the auth gate has to see it; got {trusted:?}"
     );
 }
+
+/// Trusting a sibling is useless if the hub cannot reach it: the admission
+/// gate pulls a candidate's portfolio from `{issuer_url}/identity/{pk}/certs`
+/// (hub-certifications.md §11), and until this the address the farm already
+/// reports was thrown away.
+#[tokio::test]
+async fn a_wired_sibling_records_the_address_it_can_be_pulled_from() {
+    let (db, _guard) = common::create_test_db().await;
+
+    reconcile(&db, &[sibling("aaa")]).await;
+
+    let urls: std::collections::HashMap<String, String> =
+        serde_json::from_str(&setting(&db, "cert_issuer_urls").await.unwrap()).unwrap();
+    assert_eq!(
+        urls.get("aaa").map(String::as_str),
+        Some("https://farm.test/hub/aaa"),
+        "the sibling's own hub_url is what the pull dereferences"
+    );
+}
+
+/// An address the owner corrected by hand outlives the next heartbeat — the
+/// same promise the trust list itself makes, for the same reason.
+#[tokio::test]
+async fn an_address_the_owner_set_is_not_overwritten() {
+    let (db, _guard) = common::create_test_db().await;
+
+    sqlx::query(
+        "INSERT INTO hub_settings (key, value) VALUES ('cert_issuer_urls', $1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(r#"{"aaa":"https://direct.example"}"#)
+    .execute(&db)
+    .await
+    .unwrap();
+
+    reconcile(&db, &[sibling("aaa"), sibling("bbb")]).await;
+
+    let urls: std::collections::HashMap<String, String> =
+        serde_json::from_str(&setting(&db, "cert_issuer_urls").await.unwrap()).unwrap();
+    assert_eq!(
+        urls.get("aaa").map(String::as_str),
+        Some("https://direct.example"),
+        "a farm heartbeat must not silently re-point an issuer the owner set"
+    );
+    assert_eq!(
+        urls.get("bbb").map(String::as_str),
+        Some("https://farm.test/hub/bbb"),
+        "and the new sibling is still recorded"
+    );
+}
