@@ -245,6 +245,20 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     .execute(pool)
     .await;
 
+    // Orthogonal to the layout above, and for the threat the layout does not
+    // address: a database or a schema each stops hubs colliding, not one hub
+    // reading another's data, because every hub connects as the farm's own
+    // role. `per_hub` gives each hub a login role granted only its own space.
+    // Default `shared` — it needs CREATEROLE, which the managed plans `schema`
+    // exists for do not hand out, and a farm that cannot start is worse than
+    // one whose hubs it already owns.
+    let _ = sqlx::query(
+        "ALTER TABLE farms ADD COLUMN hub_db_role TEXT NOT NULL DEFAULT 'shared'
+             CHECK (hub_db_role IN ('shared', 'per_hub'))",
+    )
+    .execute(pool)
+    .await;
+
     // Human-readable hub addresses. See `slug.rs` for why a slug is an alias
     // and never the identity.
     //
