@@ -452,10 +452,24 @@ pub async fn create_hub(
         };
         let port = state.hub_manager.allocate_port(&state.db).await;
         let voice_port = state.hub_manager.allocate_voice_port(&state.db).await;
+        // The node may hold its own PostgreSQL (farm-model.md, "per-node
+        // PostgreSQL"), in which case `db_url` — provisioned on the farm's
+        // server — is the wrong machine. Send the database *name* and this
+        // server's template alongside it and let the agent decide: its own
+        // template first, so a node's credentials never have to reach us.
+        let db_url_template: Option<String> =
+            sqlx::query_scalar("SELECT db_url_template FROM servers WHERE id = $1")
+                .bind(&server_id)
+                .fetch_optional(&state.db)
+                .await
+                .ok()
+                .flatten();
         let cmd = serde_json::json!({
             "type": "spawn_hub",
             "hub_id": hub_id,
             "db_url": db_url,
+            "db_name": crate::db::provision::database_name(&hub_id),
+            "db_url_template": db_url_template,
             "port": port,
             "voice_port": voice_port,
             "owner_pubkey": payload.sub,
