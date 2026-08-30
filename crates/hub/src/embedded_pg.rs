@@ -74,7 +74,7 @@ impl EmbeddedPostgres {
     /// backup has to be pointed at them, or the one install story that needs
     /// bundled binaries is the one where backup fails.
     pub fn bin_dir(&self) -> PathBuf {
-        self.postgres.settings().installation_dir.join("bin")
+        resolve_bin_dir(&self.postgres.settings().installation_dir)
     }
 
     pub async fn stop(&self) -> Result<()> {
@@ -82,6 +82,23 @@ impl EmbeddedPostgres {
             .stop()
             .await
             .context("stopping embedded PostgreSQL")
+    }
+
+    /// Create another database inside this server and return its URL.
+    ///
+    /// The hub itself needs exactly one, but a `db move` has two ends, and
+    /// pointing both at the bundled server is what lets that path be tested on
+    /// a machine with no PostgreSQL installed — with the client tools and the
+    /// server guaranteed to be the same version, which is the one thing a
+    /// dump/restore is most sensitive to.
+    pub async fn create_database(&self, name: &str) -> Result<String> {
+        if !self.postgres.database_exists(name).await? {
+            self.postgres
+                .create_database(name)
+                .await
+                .with_context(|| format!("creating database {name}"))?;
+        }
+        Ok(self.postgres.settings().url(name))
     }
 }
 
@@ -141,6 +158,28 @@ pub fn compatibility(data_major: Option<u64>, bundled_major: Option<u64>) -> Com
         },
         _ => Compatibility::Start,
     }
+}
+
+/// The `bin` directory under an installation root.
+///
+/// Which of two shapes it is depends on when you ask. On a first run the
+/// crate's `installation_dir` is still the root we handed it and the archive
+/// lands in a version-named directory beneath; on later runs it has resolved
+/// to that directory itself. Guessing one of the two is how `pg_dump` comes
+/// out "not found" on a machine that is carrying it.
+fn resolve_bin_dir(installation_dir: &Path) -> PathBuf {
+    let direct = installation_dir.join("bin");
+    if direct.is_dir() {
+        return direct;
+    }
+    std::fs::read_dir(installation_dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path().join("bin"))
+        .find(|candidate| candidate.is_dir())
+        .unwrap_or(direct)
 }
 
 fn read_persisted(path: &Path) -> Option<Persisted> {
@@ -311,7 +350,7 @@ pub async fn start(data_root: &Path) -> Result<EmbeddedPostgres> {
     // cannot find its tool on the one setup that needs bundled ones would be
     // exactly backwards. An operator who set it themselves is left alone.
     if std::env::var_os(crate::db::dump::PG_BIN_DIR_ENV).is_none() {
-        let bin = postgres.settings().installation_dir.join("bin");
+        let bin = resolve_bin_dir(&postgres.settings().installation_dir);
         // SAFETY-ish: single-threaded startup, before any worker is spawned.
         std::env::set_var(crate::db::dump::PG_BIN_DIR_ENV, &bin);
     }

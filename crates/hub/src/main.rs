@@ -32,6 +32,10 @@ fn print_help() {
     println!("  restore FILE [--force]");
     println!("                   Restore a backup archive. Refuses a non-empty");
     println!("                   destination unless --force.");
+    println!("  db move --to URL | --from URL [--force]");
+    println!("                   Copy this hub's database to (or from) another");
+    println!("                   PostgreSQL. Copies only: it does not switch");
+    println!("                   modes, and leaves the source untouched.");
     println!("  rotate-key       Generate a new hub keypair and sign a rotation payload");
     println!("  update [--check] Self-update binary from GitHub releases (Linux x86_64 only)");
     println!("  admin <cmd>      Admin CLI (stats|users|channels|tokens|backup|restore)\n");
@@ -519,6 +523,46 @@ async fn main() -> Result<()> {
             pg.stop().await?;
         }
         println!("Restore complete. Restart the hub to apply.");
+        return Ok(());
+    }
+
+    if subcommand.as_deref() == Some("db") && std::env::args().nth(2).as_deref() == Some("move") {
+        let args: Vec<String> = std::env::args().collect();
+        let value_after = |flag: &str| {
+            args.iter()
+                .position(|a| a == flag)
+                .and_then(|i| args.get(i + 1))
+                .filter(|v| !v.starts_with("--"))
+                .cloned()
+        };
+        let to = value_after("--to");
+        let from = value_after("--from");
+        let force = args.iter().any(|a| a == "--force");
+
+        // One direction per invocation. "Both" has no meaning and "neither"
+        // would silently do nothing, so both are refused rather than guessed.
+        let (source_label, target_label, other) = match (&to, &from) {
+            (Some(url), None) => ("this hub", "the other database", url.clone()),
+            (None, Some(url)) => ("the other database", "this hub", url.clone()),
+            _ => anyhow::bail!(
+                "Usage: wavvon-hub db move --to <url> | --from <url> [--force]\n\
+                 Exactly one direction, and the URL is the *other* database — this hub's own \
+                 comes from {} (or the built-in PostgreSQL when that is unset).",
+                wavvon_hub_env::DATABASE_URL
+            ),
+        };
+
+        let (mine, started) = cli_database_url().await;
+        let (source_url, target_url) = if to.is_some() {
+            (mine, other)
+        } else {
+            (other, mine)
+        };
+
+        db_move(&source_url, &target_url, source_label, target_label, force).await?;
+        if let Some(pg) = started {
+            pg.stop().await?;
+        }
         return Ok(());
     }
 
@@ -1726,6 +1770,28 @@ async fn backup(out_path: &str, db_url: &str) -> anyhow::Result<()> {
 /// empty, and its major must be at least the source's. `--force` waives only
 /// the emptiness check — the version rule is not the operator's to overrule,
 /// because past it `pg_restore` simply cannot parse the archive.
+/// Printing wrapper over [`db::dump::move_database`] — the mechanism lives in
+/// the library so it can be tested against two real databases.
+async fn db_move(
+    source_url: &str,
+    target_url: &str,
+    source_label: &str,
+    target_label: &str,
+    force: bool,
+) -> anyhow::Result<()> {
+    println!("Moving from {source_label} to {target_label}…");
+    let report = db::dump::move_database(source_url, target_url, force).await?;
+    println!(
+        "Moved {} rows across {} tables. {source_label} is untouched.",
+        report.rows, report.tables
+    );
+    println!(
+        "Nothing has switched over: set (or unset) {} and restart the hub when you are ready.",
+        wavvon_hub_env::DATABASE_URL
+    );
+    Ok(())
+}
+
 async fn restore(src_path: &str, db_url: &str, force: bool) -> anyhow::Result<()> {
     let file = std::fs::File::open(src_path)
         .with_context(|| format!("Cannot open backup archive {src_path}"))?;

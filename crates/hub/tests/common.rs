@@ -177,6 +177,44 @@ pub async fn create_test_db() -> (PgPool, TestDbGuard) {
     (pool, guard)
 }
 
+/// A test database with **no schema at all**, plus its URL.
+///
+/// `create_test_db` migrates, which is what almost every test wants and
+/// exactly what a `db move` destination must not be: the point of that
+/// command's emptiness check is that writing into somebody else's hub merges
+/// two communities, so a test needs a genuinely empty database to prove the
+/// happy path and a migrated one to prove the refusal.
+#[allow(dead_code)]
+pub async fn create_bare_test_db() -> (PgPool, TestDbGuard, String) {
+    let base_url = base_db_url();
+    let admin_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&format!("{base_url}/postgres"))
+        .await
+        .expect("Failed to connect to PostgreSQL (admin)");
+
+    let db_name = format!("wavvon_test_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+        .execute(&admin_pool)
+        .await
+        .expect("Failed to create test database");
+
+    let guard = TestDbGuard(Arc::new(TestDbGuardInner {
+        db_name: db_name.clone(),
+        base_url: base_url.clone(),
+    }));
+
+    let url = format!("{base_url}/{db_name}");
+    let pool = PgPoolOptions::new()
+        .max_connections(3)
+        .acquire_timeout(std::time::Duration::from_secs(60))
+        .connect(&url)
+        .await
+        .expect("Failed to connect to test database");
+
+    (pool, guard, url)
+}
+
 /// One-shot maintenance helper: drops every leftover `wavvon_test_*`
 /// database on the target Postgres server. Safe to run at any time — each
 /// test run uses a fresh UUID-derived name, so a backlog left behind by
