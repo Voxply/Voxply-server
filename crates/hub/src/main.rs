@@ -256,10 +256,53 @@ async fn run_doctor() -> bool {
     // `--doctor` before the hub's first real launch is enough to get the
     // link — it's safe to call repeatedly and a no-op once a user exists.
     println!();
-    let db_url = settings
-        .database_url
-        .clone()
-        .unwrap_or_else(|| wavvon_hub::settings::DEFAULT_DATABASE_URL.to_string());
+    // Which database this hub would use, in the words an operator needs: the
+    // embedded one is invisible otherwise — no port they chose, no directory
+    // they named — and "where is my data" is the first question a backup
+    // raises.
+    let embedded_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let db_url = match settings.database_url.clone() {
+        Some(url) => {
+            println!(
+                "INFO  database: external, from {}",
+                wavvon_hub_env::DATABASE_URL
+            );
+            url
+        }
+        None => {
+            let data_dir = embedded_root.join("pgdata");
+            match wavvon_hub::embedded_pg::bundled_major() {
+                Some(major) => println!(
+                    "INFO  database: built-in PostgreSQL {major}, data in {}",
+                    data_dir.display()
+                ),
+                None => println!(
+                    "INFO  database: built-in PostgreSQL, data in {}",
+                    data_dir.display()
+                ),
+            }
+            match wavvon_hub::embedded_pg::compatibility(
+                wavvon_hub::embedded_pg::data_dir_major(&data_dir),
+                wavvon_hub::embedded_pg::bundled_major(),
+            ) {
+                wavvon_hub::embedded_pg::Compatibility::Start => {}
+                wavvon_hub::embedded_pg::Compatibility::NeedsUpgrade { from, to } => println!(
+                    "WARN  the data directory was written by PostgreSQL {from} and this hub \
+                     carries {to} — back up with the previous binary and restore with this one"
+                ),
+                wavvon_hub::embedded_pg::Compatibility::Downgraded { from, to } => println!(
+                    "FAIL  the data directory was written by PostgreSQL {from} and this hub \
+                     carries {to} — an older server cannot read it; run the newer hub"
+                ),
+            }
+            // doctor does not start a server: it reports. Whatever is already
+            // running answers the connection below; a hub that has never
+            // booted has nothing to connect to yet, which is reported as INFO
+            // like every other pre-first-boot state here.
+            wavvon_hub::embedded_pg::running_url(&embedded_root)
+                .unwrap_or_else(|| wavvon_hub::settings::DEFAULT_DATABASE_URL.to_string())
+        }
+    };
     match PgPoolOptions::new()
         .max_connections(1)
         .connect(&db_url)
@@ -428,7 +471,7 @@ async fn main() -> Result<()> {
     // are handled above before settings are loaded.
     let subcommand = std::env::args().nth(1);
     if subcommand.as_deref() == Some("migrate") {
-        let db_url = cli_database_url();
+        let (db_url, started) = cli_database_url().await;
         let db = PgPoolOptions::new()
             .max_connections(1)
             .connect(&db_url)
@@ -438,6 +481,10 @@ async fn main() -> Result<()> {
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         db::migrations::run(&db).await?;
         println!("Migrations applied");
+        db.close().await;
+        if let Some(pg) = started {
+            pg.stop().await?;
+        }
         return Ok(());
     }
 
@@ -449,8 +496,12 @@ async fn main() -> Result<()> {
                 .as_secs();
             format!("hub-backup-{ts}.tar.gz")
         });
-        backup(&out_path, &cli_database_url()).await?;
+        let (db_url, started) = cli_database_url().await;
+        backup(&out_path, &db_url).await?;
         println!("Backup written to {out_path}");
+        if let Some(pg) = started {
+            pg.stop().await?;
+        }
         return Ok(());
     }
 
@@ -462,7 +513,11 @@ async fn main() -> Result<()> {
                 anyhow::anyhow!("Usage: wavvon-hub restore <backup.tar.gz> [--force]")
             })?;
         let force = std::env::args().any(|a| a == "--force");
-        restore(&src, &cli_database_url(), force).await?;
+        let (db_url, started) = cli_database_url().await;
+        restore(&src, &db_url, force).await?;
+        if let Some(pg) = started {
+            pg.stop().await?;
+        }
         println!("Restore complete. Restart the hub to apply.");
         return Ok(());
     }
@@ -486,7 +541,7 @@ async fn main() -> Result<()> {
 
     if subcommand.as_deref() == Some("admin") {
         let admin_cmd = std::env::args().nth(2).unwrap_or_default();
-        let db_url = cli_database_url();
+        let (db_url, _started) = cli_database_url().await;
         let db = PgPoolOptions::new()
             .max_connections(1)
             .connect(&db_url)
@@ -827,21 +882,49 @@ async fn main() -> Result<()> {
         );
     }
 
-    let db_url = settings.database_url.as_deref().unwrap_or_else(|| {
-        // Provisional: an unset URL is going to mean "start the embedded
-        // PostgreSQL" (decisions.md). Until then, say which database we
-        // guessed rather than connecting to localhost silently.
-        eprintln!(
-            "WARN  {} is not set — using the built-in default {}",
-            wavvon_hub_env::DATABASE_URL,
-            wavvon_hub::settings::DEFAULT_DATABASE_URL,
-        );
-        wavvon_hub::settings::DEFAULT_DATABASE_URL
-    });
+    // Mode is chosen by the absence of configuration (decisions.md, "The hub
+    // bundles PostgreSQL, and never touches one it did not create"): no URL
+    // means the hub starts and supervises its own server, a URL means it is a
+    // plain client that runs migrations and manages nothing.
+    //
+    // Held for the life of the process: dropping the handle does not stop the
+    // server, but keeping it is what lets shutdown stop it deliberately.
+    let embedded = match settings.database_url.as_deref() {
+        Some(_) => None,
+        None => {
+            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            match wavvon_hub::embedded_pg::start(&root).await {
+                Ok(pg) => {
+                    tracing::info!(
+                        "database: embedded PostgreSQL, data in {}",
+                        pg.data_dir().display()
+                    );
+                    Some(pg)
+                }
+                Err(e) => {
+                    // Never a fallback to the old localhost guess: connecting
+                    // to whatever answers on 5432 is how a hub came to operate
+                    // on a database nobody meant.
+                    eprintln!("FATAL could not start the built-in PostgreSQL: {e:#}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    };
+    let db_url = match (&embedded, settings.database_url.as_deref()) {
+        (Some(pg), _) => pg.url().to_string(),
+        (None, Some(url)) => {
+            tracing::info!("database: external, as configured");
+            url.to_string()
+        }
+        // Unreachable: no URL took the embedded branch above, which either
+        // produced a handle or exited.
+        (None, None) => unreachable!("no database URL and no embedded server"),
+    };
 
     let write_pool = PgPoolOptions::new()
         .max_connections(settings.db_max_connections)
-        .connect(db_url)
+        .connect(&db_url)
         .await
         .expect("Failed to connect to database");
 
@@ -1524,18 +1607,33 @@ async fn run_self_update(check_only: bool) -> anyhow::Result<()> {
 /// Falling back to the built-in default is *announced*. These subcommands
 /// mutate ownership and schema, and "it said OK" against a database the
 /// operator did not mean is the failure this whole function exists to stop.
-fn cli_database_url() -> String {
-    std::env::var(wavvon_hub_env::DATABASE_URL)
-        .or_else(|_| std::env::var("DATABASE_URL"))
-        .unwrap_or_else(|_| {
-            eprintln!(
-                "WARN  {} is not set — using the built-in default {}. \
-                 Set it explicitly to be sure which database you are operating on.",
-                wavvon_hub_env::DATABASE_URL,
-                wavvon_hub::settings::DEFAULT_DATABASE_URL,
-            );
-            wavvon_hub::settings::DEFAULT_DATABASE_URL.to_string()
-        })
+async fn cli_database_url() -> (String, Option<wavvon_hub::embedded_pg::EmbeddedPostgres>) {
+    if let Ok(url) =
+        std::env::var(wavvon_hub_env::DATABASE_URL).or_else(|_| std::env::var("DATABASE_URL"))
+    {
+        return (url, None);
+    }
+
+    // No URL means the hub's own PostgreSQL (decisions.md), and a CLI command
+    // has to reach the same one the server would — `backup` against a
+    // different database is a backup of nothing, reported as success.
+    let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    if let Some(url) = wavvon_hub::embedded_pg::running_url(&root) {
+        return (url, None);
+    }
+    // Not running: start it for the length of this command. It is the hub's
+    // own server in the hub's own directory, so this is not "managing a
+    // database we did not create" — it is opening the one we did.
+    match wavvon_hub::embedded_pg::start(&root).await {
+        Ok(pg) => {
+            let url = pg.url().to_string();
+            (url, Some(pg))
+        }
+        Err(e) => {
+            eprintln!("FATAL could not open the hub's built-in PostgreSQL: {e:#}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Everything a hub is, in one file: the database, the identity key, and the

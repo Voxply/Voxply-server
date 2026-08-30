@@ -1,0 +1,375 @@
+//! The PostgreSQL the hub carries with it.
+//!
+//! `WAVVON_DATABASE_URL` unset means *"start and manage your own PostgreSQL"*
+//! — download a binary, run it, you have a hub (decisions.md, "The hub bundles
+//! PostgreSQL, and never touches one it did not create"). Set, and the hub is
+//! a plain client: it runs migrations and touches nothing else, because a
+//! database the operator built is theirs.
+//!
+//! The archive is compiled in, not fetched at runtime, so first start works on
+//! a machine with no network and no package manager.
+//!
+//! **Layout, and why it is shaped this way.** SQL does not change between
+//! PostgreSQL majors; the *on-disk data directory* does, and a newer server
+//! refuses to read an older one by design. Reading the old directory at all
+//! needs that major's own binaries, so installations are version-scoped and the
+//! previous one is never deleted:
+//!
+//! ```text
+//! <data_root>/pg/18.4.0/   binaries (kept — they are what can read old data)
+//! <data_root>/pg/19.1.0/   binaries (new)
+//! <data_root>/pgdata/      data, carrying its own PG_VERSION
+//! <data_root>/pg/embedded.json  the port and password this hub chose
+//! ```
+//!
+//! On a major mismatch the hub **refuses with instructions** rather than
+//! starting. Half-migrating a data directory is unrecoverable, and guessing is
+//! how it happens.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{bail, Context, Result};
+use postgresql_embedded::{PostgreSQL, Settings};
+use serde::{Deserialize, Serialize};
+
+/// The database the hub uses inside its own server.
+const DATABASE_NAME: &str = "wavvon";
+
+/// What survives a restart: the port this instance listens on and the password
+/// it was initialised with.
+///
+/// Regenerating either would strand the data directory — initdb set that
+/// password once — so they are written down the first time and read every time
+/// after. The file sits beside the data it belongs to, not in a user's home:
+/// two hubs in two directories are two hubs.
+#[derive(Serialize, Deserialize)]
+struct Persisted {
+    port: u16,
+    password: String,
+}
+
+pub struct EmbeddedPostgres {
+    /// Held for the lifetime of the process. Dropping it does not stop the
+    /// server (it is not a temporary instance) — `stop` is explicit.
+    postgres: PostgreSQL,
+    url: String,
+    data_dir: PathBuf,
+}
+
+impl EmbeddedPostgres {
+    /// The connection URL for the hub's own database.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Where the data lives, for anything that has to tell an operator.
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    /// The `bin` directory of the PostgreSQL this hub is running.
+    ///
+    /// `pg_dump` and `pg_restore` live here and nowhere else on a machine
+    /// whose whole selling point is that PostgreSQL was never installed — so
+    /// backup has to be pointed at them, or the one install story that needs
+    /// bundled binaries is the one where backup fails.
+    pub fn bin_dir(&self) -> PathBuf {
+        self.postgres.settings().installation_dir.join("bin")
+    }
+
+    pub async fn stop(&self) -> Result<()> {
+        self.postgres
+            .stop()
+            .await
+            .context("stopping embedded PostgreSQL")
+    }
+}
+
+/// The major version of the PostgreSQL compiled into this binary.
+pub fn bundled_major() -> Option<u64> {
+    major_of_requirement(&Settings::default().version.to_string())
+}
+
+/// Pull the major out of a version requirement like `=18.4.0`.
+fn major_of_requirement(req: &str) -> Option<u64> {
+    req.trim()
+        .trim_start_matches(['=', '^', '~', '>', '<', ' '])
+        .split('.')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// The major a data directory was created by, or `None` when there is no data
+/// directory yet.
+pub fn data_dir_major(data_dir: &Path) -> Option<u64> {
+    std::fs::read_to_string(data_dir.join("PG_VERSION"))
+        .ok()?
+        .trim()
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// What to do about an existing data directory, given what this binary carries.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Compatibility {
+    /// No data yet, or the same major: start normally.
+    Start,
+    /// The data was written by an older major. It cannot be read by this
+    /// server, and the fix is a dump with the old binaries and a restore into
+    /// the new ones — never an in-place guess.
+    NeedsUpgrade { from: u64, to: u64 },
+    /// The data was written by a *newer* major than this binary carries, which
+    /// means someone downgraded the hub. Refusing is the only safe answer:
+    /// there is no way to read it here, and trying would be the half-migration
+    /// this design exists to avoid.
+    Downgraded { from: u64, to: u64 },
+}
+
+pub fn compatibility(data_major: Option<u64>, bundled_major: Option<u64>) -> Compatibility {
+    match (data_major, bundled_major) {
+        (Some(data), Some(bundled)) if data < bundled => Compatibility::NeedsUpgrade {
+            from: data,
+            to: bundled,
+        },
+        (Some(data), Some(bundled)) if data > bundled => Compatibility::Downgraded {
+            from: data,
+            to: bundled,
+        },
+        _ => Compatibility::Start,
+    }
+}
+
+fn read_persisted(path: &Path) -> Option<Persisted> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+fn write_persisted(path: &Path, state: &Persisted) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, serde_json::to_string(state)?)
+        .with_context(|| format!("writing {}", path.display()))?;
+    // The password is in here. On Unix the file is the only thing standing
+    // between another local user and the hub's database.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+/// Find a free TCP port for the first start.
+///
+/// Recorded afterwards rather than re-picked: a hub that moved port on every
+/// restart would leave `pg_dump` and every other tool pointed at the wrong one.
+fn pick_port() -> Result<u16> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .context("no free local port for the embedded PostgreSQL")?;
+    Ok(listener.local_addr()?.port())
+}
+
+fn random_password() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 24];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The URL of an embedded server that is **already** running under
+/// `data_root`, without starting anything.
+///
+/// For the paths that report rather than act — `doctor`, and any CLI that
+/// wants to talk to a live hub's database. Starting a second postmaster on the
+/// same directory is not a thing to do by accident, so this returns `None`
+/// rather than falling back to starting one.
+pub fn running_url(data_root: &Path) -> Option<String> {
+    let state = read_persisted(&data_root.join("pg").join("embedded.json"))?;
+    if !data_root.join("pgdata").join("postmaster.pid").exists() {
+        return None;
+    }
+    Some(format!(
+        "postgres://postgres:{}@127.0.0.1:{}/{DATABASE_NAME}",
+        state.password, state.port
+    ))
+}
+
+/// Start (or adopt) the hub's own PostgreSQL under `data_root`, and return a
+/// handle carrying the URL to connect to.
+pub async fn start(data_root: &Path) -> Result<EmbeddedPostgres> {
+    let install_root = data_root.join("pg");
+    let data_dir = data_root.join("pgdata");
+    let state_file = install_root.join("embedded.json");
+
+    let bundled = bundled_major();
+    match compatibility(data_dir_major(&data_dir), bundled) {
+        Compatibility::Start => {}
+        Compatibility::NeedsUpgrade { from, to } => bail!(
+            "the data in {} was written by PostgreSQL {from}, and this hub carries {to}.\n\
+             PostgreSQL cannot read an older data directory, so this is a migration, not a \
+             restart — and it is one command:\n\
+             \n    wavvon-hub backup before-pg{to}.wavvon-backup   (with the previous hub binary)\n\
+             \n    wavvon-hub restore before-pg{to}.wavvon-backup   (with this one, after moving \
+             {} aside)\n\n\
+             Nothing here has been changed.",
+            data_dir.display(),
+            data_dir.display(),
+        ),
+        Compatibility::Downgraded { from, to } => bail!(
+            "the data in {} was written by PostgreSQL {from} and this hub carries {to} — an older \
+             server cannot read a newer data directory.\n\
+             This is a downgraded hub binary, not a broken database: run the newer hub again, or \
+             restore a backup taken with it. Nothing here has been changed.",
+            data_dir.display(),
+        ),
+    }
+
+    let (port, password, first_run) = match read_persisted(&state_file) {
+        Some(state) => (state.port, state.password, false),
+        None => (pick_port()?, random_password(), true),
+    };
+
+    let mut settings = Settings {
+        // Version-scoped, and the previous major's binaries stay: they are the
+        // only thing that can read the data they wrote.
+        installation_dir: install_root.clone(),
+        data_dir: data_dir.clone(),
+        password_file: install_root.join(".pgpass"),
+        port,
+        username: "postgres".to_string(),
+        password: password.clone(),
+        // Not temporary: the whole point is that the data outlives the process.
+        temporary: false,
+        // The crate's default deadline covers starting a server, not the
+        // first run — which extracts a whole PostgreSQL and runs initdb, and
+        // on a cold filesystem took longer than that here. A hub that times
+        // out on its very first boot is the worst possible first impression
+        // of "download a binary and run it".
+        timeout: Some(std::time::Duration::from_secs(300)),
+        ..Settings::default()
+    };
+    // musl's locale support is minimal, and initdb inherits whatever the
+    // environment claims. `C` is available everywhere and is what a server
+    // wants anyway — collation that depends on the host's locale is how two
+    // machines disagree about ORDER BY.
+    settings
+        .configuration
+        .insert("lc_messages".to_string(), "C".to_string());
+
+    let mut postgres = PostgreSQL::new(settings);
+
+    // Adopt a server that is already up rather than starting a second one.
+    // A hub that was killed leaves its postmaster running, and `pg_ctl start`
+    // against a live data directory fails — so without this, one crash means
+    // the hub cannot restart until somebody finds and kills a process they did
+    // not know existed.
+    let already_running = match running_url(data_root) {
+        Some(url) => sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect(&url)
+            .await
+            .map(|pool| {
+                drop(pool);
+                true
+            })
+            .unwrap_or(false),
+        None => false,
+    };
+
+    if !already_running {
+        postgres
+            .setup()
+            .await
+            .context("installing or initialising the embedded PostgreSQL")?;
+        postgres
+            .start()
+            .await
+            .context("starting the embedded PostgreSQL")?;
+    } else {
+        tracing::info!("Adopted the embedded PostgreSQL already running on port {port}");
+    }
+
+    if first_run {
+        write_persisted(&state_file, &Persisted { port, password })?;
+    }
+
+    if !postgres.database_exists(DATABASE_NAME).await? {
+        postgres
+            .create_database(DATABASE_NAME)
+            .await
+            .with_context(|| format!("creating the {DATABASE_NAME} database"))?;
+    }
+
+    // Point backup/restore at the binaries we are actually running. On the
+    // install story this exists for, PostgreSQL was never installed, so
+    // `pg_dump` is not on PATH and never will be — and a backup command that
+    // cannot find its tool on the one setup that needs bundled ones would be
+    // exactly backwards. An operator who set it themselves is left alone.
+    if std::env::var_os(crate::db::dump::PG_BIN_DIR_ENV).is_none() {
+        let bin = postgres.settings().installation_dir.join("bin");
+        // SAFETY-ish: single-threaded startup, before any worker is spawned.
+        std::env::set_var(crate::db::dump::PG_BIN_DIR_ENV, &bin);
+    }
+
+    let url = postgres.settings().url(DATABASE_NAME);
+    Ok(EmbeddedPostgres {
+        postgres,
+        url,
+        data_dir,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_version_requirement_yields_its_major() {
+        assert_eq!(major_of_requirement("=18.4.0"), Some(18));
+        assert_eq!(major_of_requirement("^17.2.1"), Some(17));
+        assert_eq!(major_of_requirement("19"), Some(19));
+        assert_eq!(major_of_requirement("not a version"), None);
+    }
+
+    /// The whole reason the layout is version-scoped: what the hub does about
+    /// an existing data directory is decided *before* anything is touched.
+    #[test]
+    fn compatibility_is_decided_by_the_major_alone() {
+        assert_eq!(compatibility(None, Some(18)), Compatibility::Start);
+        assert_eq!(compatibility(Some(18), Some(18)), Compatibility::Start);
+        assert_eq!(
+            compatibility(Some(17), Some(18)),
+            Compatibility::NeedsUpgrade { from: 17, to: 18 }
+        );
+        // A downgraded binary must refuse rather than "try": there is no
+        // reading a newer data directory with an older server.
+        assert_eq!(
+            compatibility(Some(19), Some(18)),
+            Compatibility::Downgraded { from: 19, to: 18 }
+        );
+    }
+
+    /// A minor difference is not a migration — 18.4 and 18.7 share a data
+    /// directory format, and refusing there would turn a routine upgrade into
+    /// an outage.
+    #[test]
+    fn a_minor_upgrade_just_starts() {
+        assert_eq!(data_dir_major(Path::new("nonexistent")), None);
+        assert_eq!(compatibility(Some(18), Some(18)), Compatibility::Start);
+    }
+
+    #[test]
+    fn the_bundled_archive_reports_a_major() {
+        // If this ever returns None the version-compat check silently degrades
+        // to "always start", which is the half-migration this guards against.
+        assert!(
+            bundled_major().is_some(),
+            "the bundled archive must name its version"
+        );
+    }
+}

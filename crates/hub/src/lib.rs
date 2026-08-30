@@ -8,6 +8,7 @@ pub mod cert_revocation_worker;
 pub mod cert_worker;
 pub mod db;
 pub mod dm_worker;
+pub mod embedded_pg;
 pub mod farm_siblings;
 pub mod federation;
 pub mod lan;
