@@ -11,8 +11,20 @@
 //! binary and run it" is a claim only an execution can make.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
+use tokio::sync::Mutex;
 use wavvon_hub::embedded_pg;
+
+/// Starting an instance sets `WAVVON_PG_BIN_DIR`, which is process-wide, so two
+/// of these alive at once means the value names whichever started last — and the
+/// backup test asserts it names *its* binaries. That is how it failed on a
+/// 4-thread runner while passing locally. One instance at a time; each test
+/// takes the guard first so it drops last.
+fn pg_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 /// A directory of its own per test, removed afterwards. Not a tempdir crate
 /// call: PostgreSQL is still holding this directory open on Windows when the
@@ -39,6 +51,7 @@ fn scratch(name: &str) -> Scratch {
 
 #[tokio::test]
 async fn the_bundled_postgres_starts_and_takes_the_hub_schema() {
+    let _pg_lock = pg_lock().lock().await;
     let root = scratch("start");
 
     let pg = embedded_pg::start(&root.0)
@@ -85,6 +98,7 @@ async fn the_bundled_postgres_starts_and_takes_the_hub_schema() {
 /// and a regenerated one would strand the directory it belongs to.
 #[tokio::test]
 async fn a_second_start_reuses_the_same_data_and_credentials() {
+    let _pg_lock = pg_lock().lock().await;
     let root = scratch("restart");
 
     let first = embedded_pg::start(&root.0).await.expect("first start");
@@ -130,6 +144,7 @@ async fn a_second_start_reuses_the_same_data_and_credentials() {
 /// named. Never a half-migration, and never a guess.
 #[tokio::test]
 async fn data_from_another_major_is_refused_rather_than_touched() {
+    let _pg_lock = pg_lock().lock().await;
     let root = scratch("major");
     let data_dir = root.0.join("pgdata");
     std::fs::create_dir_all(&data_dir).unwrap();
@@ -156,6 +171,7 @@ async fn data_from_another_major_is_refused_rather_than_touched() {
 /// install story whose whole promise is that there is nothing to administer.
 #[tokio::test]
 async fn a_server_left_running_is_adopted_rather_than_restarted() {
+    let _pg_lock = pg_lock().lock().await;
     let root = scratch("adopt");
 
     let first = embedded_pg::start(&root.0).await.expect("first start");
@@ -187,6 +203,7 @@ async fn a_server_left_running_is_adopted_rather_than_restarted() {
 /// with a backup command that cannot work.
 #[tokio::test]
 async fn backup_and_restore_work_against_the_bundled_server() {
+    let _pg_lock = pg_lock().lock().await;
     let root = scratch("backup");
     // A previous test in this file may have set it; the value belongs to
     // whichever instance is running now.
