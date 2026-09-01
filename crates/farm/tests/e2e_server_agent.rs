@@ -258,10 +258,31 @@ async fn server_agent_connects_and_receives_hub_spawn() {
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::type_complexity)]
+/// Waits for the farm to have written what `hub_spawned` carries. A fixed
+/// sleep here is what made the force-restart test 409 on a runner: the route
+/// refuses a hub whose `process_port` is NULL, and 50ms is a guess about how
+/// fast the farm got to the write, not a fact about it.
+async fn await_hub_port(db: &sqlx::PgPool, hub_id: &str) {
+    for _ in 0..100 {
+        let port: Option<Option<i32>> =
+            sqlx::query_scalar("SELECT process_port FROM hubs WHERE id = $1")
+                .bind(hub_id)
+                .fetch_optional(db)
+                .await
+                .unwrap();
+        if matches!(port, Some(Some(_))) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the farm never recorded a process_port for {hub_id}");
+}
+
 async fn create_hub_via_agent(
     client: &Client,
     base: &str,
     token: &str,
+    db: &sqlx::PgPool,
 ) -> (
     futures_util::stream::SplitSink<
         tokio_tungstenite::WebSocketStream<
@@ -345,7 +366,7 @@ async fn create_hub_via_agent(
         .await
         .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    await_hub_port(db, &hub_id).await;
 
     (ws_write, ws_read, hub_id, server_id)
 }
@@ -368,7 +389,7 @@ async fn force_restart_agent_hosted_hub_delegates_to_agent() {
         .unwrap();
 
     let (mut ws_write, mut ws_read, hub_id, server_id) =
-        create_hub_via_agent(&client, &base, &token).await;
+        create_hub_via_agent(&client, &base, &token, &state.db).await;
 
     // Simulate a few prior failed auto-restart attempts, so we can prove the
     // force-restart route resets the counter.
@@ -452,7 +473,7 @@ async fn force_restart_agent_hosted_hub_offline_agent_returns_503() {
         .unwrap();
 
     let (ws_write, ws_read, hub_id, _server_id) =
-        create_hub_via_agent(&client, &base, &token).await;
+        create_hub_via_agent(&client, &base, &token, &state.db).await;
 
     // Drop the mock agent's WebSocket connection to simulate it going offline.
     drop(ws_write);
