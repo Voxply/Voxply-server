@@ -12,6 +12,9 @@
 //! counts that must match on the far side or the move was partial.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
+
+use tokio::sync::{Mutex, MutexGuard};
 
 use wavvon_hub::db::{dump, migrations};
 use wavvon_hub::embedded_pg::{self, EmbeddedPostgres};
@@ -26,8 +29,21 @@ impl Drop for Scratch {
     }
 }
 
-/// One bundled server per test, with its own data directory.
-async fn embedded() -> (EmbeddedPostgres, Scratch) {
+/// `WAVVON_PG_BIN_DIR` is process-wide and each instance installs its client
+/// tools inside its own scratch directory, which the test then deletes — so two
+/// of these alive at once means one test can be pointed at the other's
+/// `pg_dump`, and at a deleted directory once that test finishes. Two of the
+/// three tests here failed exactly that way on a 4-thread runner while passing
+/// locally. One instance at a time, and the hint always names the live one.
+fn pg_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// One bundled server per test, with its own data directory. The guard comes
+/// back first so it outlives the instance and its scratch directory.
+async fn embedded() -> (MutexGuard<'static, ()>, EmbeddedPostgres, Scratch) {
+    let guard = pg_lock().lock().await;
     let dir = std::env::temp_dir().join(format!(
         "wavvon-dbmove-{}",
         std::time::SystemTime::now()
@@ -41,7 +57,7 @@ async fn embedded() -> (EmbeddedPostgres, Scratch) {
     // test takes its directory with it — so the process-wide hint the hub sets
     // once at startup has to be re-pointed at whichever server is alive now.
     std::env::set_var("WAVVON_PG_BIN_DIR", pg.bin_dir());
-    (pg, Scratch(dir))
+    (guard, pg, Scratch(dir))
 }
 
 async fn connect(url: &str) -> sqlx::PgPool {
@@ -70,7 +86,7 @@ async fn seeded_hub(pool: &sqlx::PgPool) {
 
 #[tokio::test]
 async fn a_move_copies_the_data_and_leaves_the_source_alone() {
-    let (pg, _scratch) = embedded().await;
+    let (_pg_lock, pg, _scratch) = embedded().await;
     let source_url = pg.create_database("move_source").await.expect("source db");
     let target_url = pg.create_database("move_target").await.expect("target db");
 
@@ -106,7 +122,7 @@ async fn a_move_copies_the_data_and_leaves_the_source_alone() {
 /// communities into one, and there is no undo for that.
 #[tokio::test]
 async fn a_destination_that_already_holds_a_hub_is_refused() {
-    let (pg, _scratch) = embedded().await;
+    let (_pg_lock, pg, _scratch) = embedded().await;
     let source_url = pg
         .create_database("refuse_source")
         .await
@@ -141,7 +157,7 @@ async fn a_destination_that_already_holds_a_hub_is_refused() {
 /// would run `pg_restore` over the database it is dumping.
 #[tokio::test]
 async fn moving_a_database_onto_itself_is_refused() {
-    let (pg, _scratch) = embedded().await;
+    let (_pg_lock, pg, _scratch) = embedded().await;
     let url = pg.create_database("self_move").await.expect("db");
     assert!(dump::move_database(&url, &url, true).await.is_err());
     pg.stop().await.expect("stop");
