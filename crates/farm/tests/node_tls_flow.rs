@@ -23,10 +23,19 @@ async fn start_pinned_node() -> (u16, String) {
     let digest = hex::encode(Sha256::digest(cert_der.as_ref()));
     let key = PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap();
 
-    let mut config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key)
-        .unwrap();
+    // Naming the provider rather than taking the process default: this binary
+    // links both rustls backends (tokio-tungstenite pulls aws-lc-rs in, the
+    // farm asks for ring), and rustls refuses to guess between them. Same
+    // provider `node::client_config` uses, so the handshake has one backend on
+    // both ends.
+    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(vec![cert_der], key)
+    .unwrap();
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
