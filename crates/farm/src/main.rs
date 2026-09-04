@@ -253,7 +253,7 @@ async fn main() -> Result<()> {
 
     wavvon_farm::monitor::spawn(state.clone());
 
-    let app = server::create_router(state);
+    let app = server::create_router_with_cors(state, &cfg.cors_origins);
     let addr: std::net::SocketAddr = format!("0.0.0.0:{http_port}").parse()?;
     tracing::info!(
         "Farm server listening on http://0.0.0.0:{http_port} (set WAVVON_FARM_URL for the external URL)"

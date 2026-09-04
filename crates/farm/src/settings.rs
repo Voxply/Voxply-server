@@ -47,6 +47,14 @@ pub struct Settings {
     /// Ignored once an admin exists, so setting it cannot take a farm over.
     /// Env: WAVVON_FARM_ADMIN_PUBKEY
     pub farm_admin_pubkey: Option<String>,
+    /// Browser origins allowed to call the farm's own routes. `"*"` (the
+    /// default) allows any; anything else is a comma-separated list of exact
+    /// origins. Same name and same meaning as the hub's setting, because a
+    /// browser talking to a farm-hosted hub talks to *both*: the hub answers
+    /// through the proxy, and `/auth/*` is answered by the farm itself
+    /// (`/info.farm_url` is what tells the client so).
+    /// Env: WAVVON_CORS_ORIGINS
+    pub cors_origins: String,
     /// Logging format: "text" (default) or "json". Env: WAVVON_LOG_FORMAT
     pub log_format: String,
     /// OpenTelemetry OTLP collector endpoint. Leave empty to disable.
@@ -72,6 +80,7 @@ pub fn load() -> Result<Settings> {
         .set_default("http_port", 4000)?
         .set_default("hub_base_port", 9100)?
         .set_default("hubs_dir", "hubs")?
+        .set_default("cors_origins", "*")?
         .set_default("log_format", "text")?
         .set_default("db_max_connections", 5u32)?
         .add_source(config::File::with_name("farm").required(false))

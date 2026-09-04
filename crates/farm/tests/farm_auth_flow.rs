@@ -448,3 +448,56 @@ async fn heartbeat_rejects_missing_hub_pubkey() {
         .await;
     resp.assert_status_bad_request();
 }
+
+// ---------------------------------------------------------------------------
+// CORS
+// ---------------------------------------------------------------------------
+
+// A browser talking to a farm-hosted hub talks to the farm too: `/info` says
+// `farm_url`, and the client routes `/auth/*` there (health.rs documents it).
+// The farm had no CORS layer at all, so the preflight got no
+// Access-Control-Allow-Origin and every browser join of a farm-hosted hub
+// failed as a CORS error — found by driving the real web client against a
+// farm-hosted hub in the topology harness.
+#[tokio::test]
+async fn auth_preflight_answers_a_browser() {
+    let (server, _, _guard) = setup().await;
+
+    let resp = server
+        .method(axum::http::Method::OPTIONS, "/auth/challenge")
+        .add_header("origin", "http://localhost:1421")
+        .add_header("access-control-request-method", "POST")
+        .add_header("access-control-request-headers", "content-type")
+        .await;
+
+    resp.assert_status_ok();
+    let allow = resp.headers().get("access-control-allow-origin");
+    assert!(
+        allow.is_some(),
+        "the preflight must carry Access-Control-Allow-Origin, got {:?}",
+        resp.headers()
+    );
+}
+
+#[tokio::test]
+async fn auth_post_carries_exactly_one_allow_origin() {
+    let (server, _, _guard) = setup().await;
+
+    let resp = server
+        .post("/auth/challenge")
+        .add_header("origin", "http://localhost:1421")
+        .json(&json!({ "public_key": "aa".repeat(32) }))
+        .await;
+
+    // Two of this header is not "more allowed" — a browser rejects a response
+    // carrying it twice, which is why the proxy route is outside the layer.
+    let count = resp
+        .headers()
+        .get_all("access-control-allow-origin")
+        .iter()
+        .count();
+    assert_eq!(
+        count, 1,
+        "expected one Access-Control-Allow-Origin, got {count}"
+    );
+}
