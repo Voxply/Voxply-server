@@ -212,6 +212,35 @@ fn pick_port() -> Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
+/// Say what a dynamic-link failure from the bundled binaries actually means.
+///
+/// The archive is chosen by build target, and the **musl** one is the odd one
+/// out: measured 2026-09-05, its `initdb` declares `libicuuc.so.74` as a
+/// dynamic dependency (the glibc build links ICU statically and needs nothing
+/// but libc), and no current Alpine ships that soname — 3.24 has ICU 78, so
+/// even `apk add icu-libs` does not satisfy it. `libpq.so.5` there also wants
+/// `libgssapi_krb5.so.2`.
+///
+/// Left alone, the operator gets a wall of `symbol not found` relocations from
+/// a program they never ran, on the one path advertised as needing no
+/// prerequisites. This turns that into a sentence and a way out.
+fn explain_dynamic_link_failure(e: impl std::fmt::Display) -> anyhow::Error {
+    let message = e.to_string();
+    let looks_dynamic = message.contains("Error loading shared library")
+        || message.contains("Error relocating")
+        || message.contains("cannot open shared object file");
+    if !looks_dynamic {
+        return anyhow::anyhow!(message);
+    }
+    anyhow::anyhow!(
+        "{message}\n\nThe bundled PostgreSQL binaries could not be loaded by this system. \
+         The musl build of them is not self-contained: it needs ICU 74 (libicuuc.so.74) \
+         and krb5, which musl distributions do not ship at that version. Either run the \
+         glibc build of the hub, or point WAVVON_DATABASE_URL at a PostgreSQL you provide \
+         — a database you built is never touched by the bundled mode."
+    )
+}
+
 fn random_password() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 24];
@@ -324,10 +353,12 @@ pub async fn start(data_root: &Path) -> Result<EmbeddedPostgres> {
         postgres
             .setup()
             .await
+            .map_err(explain_dynamic_link_failure)
             .context("installing or initialising the embedded PostgreSQL")?;
         postgres
             .start()
             .await
+            .map_err(explain_dynamic_link_failure)
             .context("starting the embedded PostgreSQL")?;
     } else {
         tracing::info!("Adopted the embedded PostgreSQL already running on port {port}");
@@ -410,5 +441,30 @@ mod tests {
             bundled_major().is_some(),
             "the bundled archive must name its version"
         );
+    }
+
+    #[test]
+    fn a_loader_failure_gets_an_explanation_and_nothing_else_does() {
+        // The real thing, from a musl container: initdb from the bundled
+        // archive against Alpine 3.24 (ICU 78).
+        let musl = explain_dynamic_link_failure(
+            "Command error: stdout=; stderr=Error loading shared library \
+             libicuuc.so.74: No such file or directory (needed by .../bin/initdb)",
+        )
+        .to_string();
+        assert!(
+            musl.contains("libicuuc.so.74"),
+            "keeps the original message"
+        );
+        assert!(
+            musl.contains("WAVVON_DATABASE_URL"),
+            "names the way out: {musl}"
+        );
+
+        // Everything else must pass through: a port clash or a corrupt data
+        // directory has nothing to do with dynamic linking, and dressing it up
+        // as an ICU problem would send the operator the wrong way.
+        let other = explain_dynamic_link_failure("could not bind to port 5432").to_string();
+        assert_eq!(other, "could not bind to port 5432");
     }
 }
