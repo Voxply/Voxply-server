@@ -30,6 +30,34 @@ use totp_rs::{Algorithm, Secret, TOTP};
 use wavvon_farm::{db, hub_manager::HubManager, server, state::FarmState, unix_now};
 use wavvon_identity::Identity;
 
+/// Wait until the `servers.host` column reads `want`, or fail saying what it
+/// held instead.
+///
+/// A fixed pause after a WebSocket send is a race the farm loses on a loaded
+/// runner: nothing in the send acknowledges that the hello has been processed.
+/// `a_hello_without_a_host_clears_the_one_recorded_before` failed in CI on
+/// exactly that, having passed everywhere else — and it is worse than one
+/// flake, because two hellos in a row have to land *in order* for the
+/// assertion to mean anything, and a sleep does not establish that either.
+async fn wait_for_host(db: &sqlx::PgPool, server_id: &str, want: Option<&str>) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let got: Option<String> = sqlx::query_scalar("SELECT host FROM servers WHERE id = $1")
+            .bind(server_id)
+            .fetch_one(db)
+            .await
+            .unwrap();
+        if got.as_deref() == want {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for host {want:?}; it is {got:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Test server setup
 // ---------------------------------------------------------------------------
@@ -674,7 +702,7 @@ async fn an_agents_hello_records_where_the_node_is() {
         ))
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_host(&state.db, &server_id, Some("node-2.example")).await;
 
     let row: (Option<String>, String, Option<String>) =
         sqlx::query_as("SELECT host, tls_mode, cert_sha256 FROM servers WHERE id = $1")
@@ -714,9 +742,14 @@ async fn a_hello_without_a_host_clears_the_one_recorded_before() {
     let server_id = reg["server_id"].as_str().unwrap().to_string();
 
     let ws_url = format!("{}/ws/agent", base.replacen("http://", "ws://", 1));
-    for hello in [
-        json!({"type": "hello", "token": reg_token, "host": "node-3.example", "tls_mode": "ca"}),
-        json!({"type": "hello", "token": reg_token}),
+    // Each hello is waited for by its own effect, not by a clock: the second
+    // one only proves anything once the first has actually recorded a host.
+    for (hello, expected) in [
+        (
+            json!({"type": "hello", "token": reg_token, "host": "node-3.example", "tls_mode": "ca"}),
+            Some("node-3.example"),
+        ),
+        (json!({"type": "hello", "token": reg_token}), None),
     ] {
         let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
         let (mut ws_write, _r) = ws_stream.split();
@@ -724,15 +757,8 @@ async fn a_hello_without_a_host_clears_the_one_recorded_before() {
             .send(Message::Text(hello.to_string().into()))
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        wait_for_host(&state.db, &server_id, expected).await;
     }
-
-    let host: Option<String> = sqlx::query_scalar("SELECT host FROM servers WHERE id = $1")
-        .bind(&server_id)
-        .fetch_one(&state.db)
-        .await
-        .unwrap();
-    assert_eq!(host, None, "a hello with no host must clear the column");
 }
 
 /// The spawn command has to carry enough for a node with its own PostgreSQL
