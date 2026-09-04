@@ -501,3 +501,135 @@ async fn auth_post_carries_exactly_one_allow_origin() {
         "expected one Access-Control-Allow-Origin, got {count}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Multi-device: subkey certs
+// ---------------------------------------------------------------------------
+
+/// Sign a cert for `subkey` with `master`, the way a paired device's issuer does.
+fn subkey_cert(master: &Identity, subkey_pubkey: &str) -> serde_json::Value {
+    let master_pubkey = master.public_key_hex();
+    let device_label = "Paired laptop".to_string();
+    let issued_at = 1_700_000_000u64;
+    let signing_bytes = wavvon_identity::SubkeyCert::signing_bytes(
+        &master_pubkey,
+        subkey_pubkey,
+        &device_label,
+        issued_at,
+        None,
+        &[],
+    );
+    json!({
+        "master_pubkey": master_pubkey,
+        "subkey_pubkey": subkey_pubkey,
+        "device_label": device_label,
+        "issued_at": issued_at,
+        "not_after": null,
+        "fallback_hubs": [],
+        "signature": hex::encode(master.sign(&signing_bytes).to_bytes()),
+    })
+}
+
+async fn challenge_and_sign(server: &TestServer, id: &Identity) -> (String, String) {
+    let pubkey = id.public_key_hex();
+    let cr = server
+        .post("/auth/challenge")
+        .json(&json!({ "public_key": pubkey }))
+        .await;
+    cr.assert_status_ok();
+    let challenge_hex = cr.json::<Value>()["challenge"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let sig = id.sign(&hex::decode(&challenge_hex).unwrap());
+    (challenge_hex, hex::encode(sig.to_bytes()))
+}
+
+// A farm-hosted hub's client sends /auth/* here, so the hub never sees the
+// cert — before this, a paired device landed on every farm-hosted hub as a
+// brand-new user. Found by driving the real client against a farm-hosted hub.
+#[tokio::test]
+async fn verify_with_a_subkey_cert_speaks_for_the_master() {
+    let (server, state, _guard) = setup().await;
+    let master = Identity::generate();
+    let device = Identity::generate();
+    let device_pubkey = device.public_key_hex();
+
+    let (challenge, signature) = challenge_and_sign(&server, &device).await;
+    let vr = server
+        .post("/auth/verify")
+        .json(&json!({
+            "public_key": device_pubkey,
+            "challenge": challenge,
+            "signature": signature,
+            "subkey_cert": subkey_cert(&master, &device_pubkey),
+        }))
+        .await;
+    vr.assert_status_ok();
+
+    let token = vr.json::<Value>()["token"].as_str().unwrap().to_string();
+    let payload = verify_token(&state.public_key_hex(), &token).unwrap();
+    assert_eq!(
+        payload.sub,
+        master.public_key_hex(),
+        "sub must be the master"
+    );
+    assert_eq!(
+        payload.master.as_deref(),
+        Some(master.public_key_hex().as_str())
+    );
+
+    // The device's own row records which master it resolved to.
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT master_pubkey FROM farm_users WHERE public_key = $1")
+            .bind(&device_pubkey)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(stored.as_deref(), Some(master.public_key_hex().as_str()));
+}
+
+#[tokio::test]
+async fn verify_rejects_a_cert_issued_for_another_key() {
+    let (server, _, _guard) = setup().await;
+    let master = Identity::generate();
+    let device = Identity::generate();
+    let someone_else = Identity::generate();
+
+    let (challenge, signature) = challenge_and_sign(&server, &device).await;
+    let vr = server
+        .post("/auth/verify")
+        .json(&json!({
+            "public_key": device.public_key_hex(),
+            "challenge": challenge,
+            "signature": signature,
+            // A perfectly valid cert — for a different subkey.
+            "subkey_cert": subkey_cert(&master, &someone_else.public_key_hex()),
+        }))
+        .await;
+    vr.assert_status_unauthorized();
+}
+
+#[tokio::test]
+async fn verify_rejects_a_cert_nobody_signed() {
+    let (server, _, _guard) = setup().await;
+    let master = Identity::generate();
+    let device = Identity::generate();
+    let device_pubkey = device.public_key_hex();
+
+    let mut cert = subkey_cert(&master, &device_pubkey);
+    // Same shape, forged signature.
+    cert["signature"] = json!("11".repeat(64));
+
+    let (challenge, signature) = challenge_and_sign(&server, &device).await;
+    let vr = server
+        .post("/auth/verify")
+        .json(&json!({
+            "public_key": device_pubkey,
+            "challenge": challenge,
+            "signature": signature,
+            "subkey_cert": cert,
+        }))
+        .await;
+    vr.assert_status_unauthorized();
+}
