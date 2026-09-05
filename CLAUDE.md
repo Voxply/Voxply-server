@@ -212,6 +212,15 @@ signed subkey certs. Auth accepts an optional subkey cert — see
 `resolve_canonical_identity` in `crates/hub/src/auth/handlers.rs`; don't bypass
 it in endpoints that key off user identity.
 
+**Resolving a roster pubkey to its master: use `master_of`, never
+`users.master_pubkey` alone.** Clients register a device cert when they
+*connect*, which is strictly earlier than the auth that presents it and writes
+`users.master_pubkey` — so `subkey_certs` is the only place the link exists for
+a while, and often forever. The DM fan-out read `users` alone while the
+mirror path already fell back to certs, so the same recipient was mirrored to
+and never fanned out to, silently. Anything that answers "which master is this
+member?" goes through one resolver.
+
 ---
 
 ## Tests
