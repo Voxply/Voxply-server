@@ -348,14 +348,11 @@ pub async fn send_dm(
 
         // Resolve delivery URLs via the home-hub designation when available.
         let delivery_urls: Vec<String> = {
-            // Step 1: look up master_pubkey for this member.
-            let master_pubkey: Option<String> =
-                sqlx::query_scalar("SELECT master_pubkey FROM users WHERE public_key = $1")
-                    .bind(&m.public_key)
-                    .fetch_optional(&state.db)
-                    .await
-                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?
-                    .flatten();
+            // Step 1: look up master_pubkey for this member. Same resolver the
+            // mirror path uses — reading only `users.master_pubkey` here meant
+            // a member whose cert was registered without a re-auth got mirrored
+            // to but never fanned out to.
+            let master_pubkey: Option<String> = master_of(&state, &m.public_key).await;
 
             // Step 2: if a master is known, try the designation table.
             let designation_urls: Option<Vec<String>> = if let Some(ref mpk) = master_pubkey {

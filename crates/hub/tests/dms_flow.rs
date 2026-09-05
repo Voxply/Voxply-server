@@ -984,6 +984,95 @@ async fn send_dm_uses_home_hub_designation_when_present() {
     assert_eq!(arr[0]["content"], desig_content);
 }
 
+/// The roster→master link can come from a registered cert alone, with no auth
+/// that ever carried it — a device registers its self-cert on connect, and
+/// `users.master_pubkey` is only written when a *later* auth presents it. The
+/// fan-out used to read `users` only while the mirror path already fell back to
+/// `subkey_certs`, so these members were mirrored to and never fanned out to.
+/// Nothing surfaced: the DM was stored locally and the sender saw success.
+#[tokio::test]
+async fn send_dm_uses_designation_when_master_is_known_only_from_a_cert() {
+    let (hub_a, hub_a_state, _hub_a_guard) = start_real_hub_with_state("hub-a-certlink").await;
+    let (hub_b, _hub_b_guard) = start_real_hub("hub-b-certlink").await;
+    let client = reqwest::Client::new();
+
+    let alice = Identity::generate();
+    let bob = Identity::generate();
+    let bob_master = Identity::generate();
+    let alice_token = authenticate_http(&hub_a, &alice).await;
+    authenticate_http(&hub_b, &bob).await;
+
+    let placeholder_url = "http://placeholder.invalid";
+    let resp = client
+        .post(format!("{hub_a}/conversations"))
+        .bearer_auth(&alice_token)
+        .json(&json!({
+            "members": [bob.public_key_hex()],
+            "member_hubs": { bob.public_key_hex(): placeholder_url },
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let conv: ConversationResponse = resp.json().await.unwrap();
+
+    let bob_master_hex = bob_master.public_key_hex();
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    // Deliberately NOT setting users.master_pubkey: the cert row is the only
+    // place this hub can learn the link from.
+    sqlx::query(
+        "INSERT INTO subkey_certs
+         (master_pubkey, subkey_pubkey, device_label, issued_at, not_after,
+          fallback_hubs_json, signature, registered_at)
+         VALUES ($1, $2, 'This device', $3, NULL, '[]', 'test', $3)",
+    )
+    .bind(&bob_master_hex)
+    .bind(bob.public_key_hex())
+    .bind(now_ts)
+    .execute(&hub_a_state.db)
+    .await
+    .unwrap();
+
+    let hubs_json = serde_json::to_string(&vec![hub_b.clone()]).unwrap();
+    sqlx::query(
+        "INSERT INTO home_hub_designations
+         (master_pubkey, hubs_json, issued_at, sequence, signature, updated_at)
+         VALUES ($1, $2, $3, 1, 'test', $4)",
+    )
+    .bind(&bob_master_hex)
+    .bind(&hubs_json)
+    .bind(now_ts)
+    .bind(now_ts)
+    .execute(&hub_a_state.db)
+    .await
+    .unwrap();
+
+    let content = "routed via a cert-only link";
+    let sig = make_plaintext_sig(&alice, &conv.id, &conv.conv_type, content);
+    let resp = client
+        .post(format!("{hub_a}/conversations/{}/messages", conv.id))
+        .bearer_auth(&alice_token)
+        .json(&json!({ "content": content, "plaintext_signature": sig }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+
+    let bob_token = authenticate_http(&hub_b, &bob).await;
+    let messages = wait_for_federated_dms(&client, &hub_b, &bob_token, &conv.id, 1).await;
+    let arr = messages.as_array().unwrap();
+    assert_eq!(
+        arr.len(),
+        1,
+        "a master known only from subkey_certs must still resolve the designation"
+    );
+    assert_eq!(arr[0]["content"], content);
+}
+
 /// When no home_hub_designations row exists, send_dm falls back to the
 /// hub_url from conversation_members (existing behaviour, no regression).
 #[tokio::test]
