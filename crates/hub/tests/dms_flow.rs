@@ -1695,3 +1695,150 @@ async fn federated_dm_accepts_registered_peer_hub() {
     );
     assert_eq!(arr[0]["content"], peer_content);
 }
+
+// ---------------------------------------------------------------------------
+// home-hub.md "DM delivery", step 2: mirror-forward between home hubs
+// ---------------------------------------------------------------------------
+
+/// Sign a self-cert: `master` certifying `subkey` as one of its own devices.
+/// That is the link a hub uses to answer "which master does this roster pubkey
+/// belong to", and so "where else does this person read their DMs".
+fn self_cert(master: &Identity, subkey_pubkey: &str, hub_url: &str) -> serde_json::Value {
+    let issued_at = 1_700_000_000u64;
+    let fallback = vec![hub_url.to_string()];
+    let bytes = wavvon_identity::SubkeyCert::signing_bytes(
+        &master.public_key_hex(),
+        subkey_pubkey,
+        "test device",
+        issued_at,
+        None,
+        &fallback,
+    );
+    json!({
+        "master_pubkey": master.public_key_hex(),
+        "subkey_pubkey": subkey_pubkey,
+        "device_label": "test device",
+        "issued_at": issued_at,
+        "not_after": null,
+        "fallback_hubs": fallback,
+        "signature": hex::encode(master.sign(&bytes).to_bytes()),
+    })
+}
+
+fn home_hub_list(master: &Identity, hubs: &[String]) -> serde_json::Value {
+    let issued_at = 1_700_000_000u64;
+    let bytes =
+        wavvon_identity::HomeHubList::signing_bytes(&master.public_key_hex(), hubs, issued_at, 1);
+    json!({
+        "master_pubkey": master.public_key_hex(),
+        "hubs": hubs,
+        "issued_at": issued_at,
+        "sequence": 1,
+        "signature": hex::encode(master.sign(&bytes).to_bytes()),
+    })
+}
+
+/// The sender's hub knows one address for the recipient; the recipient reads
+/// from another. Without the mirror-forward the message is simply invisible
+/// there — which is the reported bug, and the half of "any hub in the list is
+/// authoritative" that only held for reads.
+#[tokio::test]
+async fn an_accepting_hub_mirrors_a_dm_to_the_other_home_hubs() {
+    use wavvon_hub::dm_worker;
+
+    let (hub_a, _hub_a_guard) = start_real_hub("hub-a").await;
+    let (hub_b, hub_b_state, _hub_b_guard) = start_real_hub_with_state("hub-b").await;
+    let (hub_c, _hub_c_guard) = start_real_hub("hub-c").await;
+    let client = reqwest::Client::new();
+
+    let alice = Identity::generate();
+    let bob = Identity::generate();
+    let bob_master = Identity::generate();
+    let alice_token = authenticate_http(&hub_a, &alice).await;
+    let bob_token_c = authenticate_http(&hub_c, &bob).await;
+    authenticate_http(&hub_b, &bob).await;
+
+    // Bob's home hubs are B and C, and both hubs learn which master he is —
+    // the designation is signed by, and stored under, that key.
+    for hub in [&hub_b, &hub_c] {
+        let resp = client
+            .post(format!(
+                "{hub}/identity/{}/devices",
+                bob_master.public_key_hex()
+            ))
+            .json(&self_cert(&bob_master, &bob.public_key_hex(), hub))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "register cert on {hub}: {}",
+            resp.status()
+        );
+
+        let resp = client
+            .post(format!(
+                "{hub}/identity/{}/designation",
+                bob_master.public_key_hex()
+            ))
+            .json(&home_hub_list(&bob_master, &[hub_b.clone(), hub_c.clone()]))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "publish designation on {hub}: {}",
+            resp.status()
+        );
+    }
+
+    // Alice's hub knows exactly one address for Bob: hub B. This is the case
+    // the mirror exists for — a sender that cannot fan out itself.
+    let mut member_hubs = HashMap::new();
+    member_hubs.insert(bob.public_key_hex(), hub_b.clone());
+    let resp = client
+        .post(format!("{hub_a}/conversations"))
+        .bearer_auth(&alice_token)
+        .json(&json!({ "members": [bob.public_key_hex()], "member_hubs": member_hubs }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let conv: ConversationResponse = resp.json().await.unwrap();
+
+    let content = "you should see this on either hub";
+    let sig = make_plaintext_sig(&alice, &conv.id, &conv.conv_type, content);
+    let resp = client
+        .post(format!("{hub_a}/conversations/{}/messages", conv.id))
+        .bearer_auth(&alice_token)
+        .json(&json!({ "content": content, "plaintext_signature": sig }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+
+    // It lands on B, the address Alice's hub had.
+    let bob_token_b = authenticate_http(&hub_b, &bob).await;
+    wait_for_federated_dms(&client, &hub_b, &bob_token_b, &conv.id, 1).await;
+
+    // B queues the copy for C; the outbox worker is what delivers it, so drive
+    // one pass rather than waiting out its poll interval.
+    dm_worker::tick(&hub_b_state).await.unwrap();
+
+    let messages = wait_for_federated_dms(&client, &hub_c, &bob_token_c, &conv.id, 1).await;
+    let arr = messages.as_array().expect("expected an array");
+    assert_eq!(
+        arr.len(),
+        1,
+        "the other home hub should have the message too"
+    );
+    assert_eq!(arr[0]["content"], content);
+
+    // And C does not forward it onward: a copy is one hop, or n hubs cost n²
+    // deliveries before dedupe settles.
+    let onward: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dm_outbox")
+        .fetch_one(&hub_b_state.db)
+        .await
+        .unwrap();
+    assert_eq!(onward, 0, "the mirror row should be gone once delivered");
+}

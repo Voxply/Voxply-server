@@ -1744,6 +1744,14 @@ pub async fn run(pool: &PgPool) -> Result<()> {
         .execute(pool)
         .await;
 
+    // Mirror-forward between a recipient's home hubs (home-hub.md "DM
+    // delivery", step 2). A queued copy has to be *remembered* as a copy: the
+    // retry worker rebuilds the envelope from dm_messages, and rebuilding it
+    // as an original would have the receiving hub fan out to its own peers.
+    let _ = sqlx::query("ALTER TABLE dm_outbox ADD COLUMN mirror BOOLEAN NOT NULL DEFAULT FALSE")
+        .execute(pool)
+        .await;
+
     // Voice in alliance channels (alliances.md). Who is currently admitted to
     // one of this hub's shared voice rooms as a *visitor* — a member of an
     // allied hub, holding an `alliance_voice`-scoped session and no `users`

@@ -35,7 +35,7 @@ pub async fn tick(state: &AppState) -> Result<(), sqlx::Error> {
     let now = crate::auth::handlers::unix_timestamp();
 
     let due: Vec<OutboxRow> = sqlx::query_as::<_, OutboxRow>(
-        "SELECT message_id, recipient_hub_url, attempts
+        "SELECT message_id, recipient_hub_url, attempts, COALESCE(mirror, FALSE) AS mirror
          FROM dm_outbox
          WHERE bounced_at IS NULL AND next_attempt_at <= $1
          LIMIT 100",
@@ -45,7 +45,7 @@ pub async fn tick(state: &AppState) -> Result<(), sqlx::Error> {
     .await?;
 
     for row in due {
-        let Some(envelope) = load_envelope(state, &row.message_id).await? else {
+        let Some(mut envelope) = load_envelope(state, &row.message_id).await? else {
             // Message was deleted from dm_messages — drop the orphan.
             sqlx::query("DELETE FROM dm_outbox WHERE message_id = $1 AND recipient_hub_url = $2")
                 .bind(&row.message_id)
@@ -54,6 +54,9 @@ pub async fn tick(state: &AppState) -> Result<(), sqlx::Error> {
                 .await?;
             continue;
         };
+
+        // A copy stays a copy across retries — see the `mirror` column.
+        envelope.mirror = row.mirror;
 
         match super::routes::dms::deliver_federated_dm_public(
             state,
@@ -207,6 +210,9 @@ async fn load_envelope(
         group_encrypted_envelope,
         sender_hub_url: None,
         signer_cert,
+        // Set per row by the caller: the message is neither an original nor a
+        // copy, the *delivery* is.
+        mirror: false,
     }))
 }
 
@@ -215,4 +221,5 @@ struct OutboxRow {
     message_id: String,
     recipient_hub_url: String,
     attempts: i64,
+    mirror: bool,
 }

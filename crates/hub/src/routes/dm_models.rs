@@ -176,4 +176,14 @@ pub struct FederatedDmRequest {
     /// primary/legacy-device encrypted DMs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signer_cert: Option<SubkeyCert>,
+    /// True when this delivery is an **inbox copy** being forwarded between a
+    /// recipient's home hubs, rather than the original delivery from the
+    /// sender's hub (home-hub.md "DM delivery", step 2).
+    ///
+    /// It exists to stop the copy being copied again. Dedupe by `message_id`
+    /// already makes a second arrival a no-op, but without this every hub that
+    /// accepted a message would fan out to every other one before the dedupe
+    /// settled — n hubs, n² deliveries. A mirror is one hop by construction.
+    #[serde(default)]
+    pub mirror: bool,
 }
