@@ -115,10 +115,8 @@ jobs:
           cache-from: type=gha,scope=farm
           cache-to: type=gha,mode=max,scope=farm
 
-  # ---- static binaries (Linux musl — no libc deps) ----
-
   binaries:
-    name: Build static binaries
+    name: Build Linux binaries
     needs: changelog
     runs-on: ubuntu-22.04
     permissions:
@@ -131,7 +129,7 @@ jobs:
       - name: Install Rust + musl targets
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
-          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,x86_64-unknown-linux-gnu
 
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
 
@@ -154,11 +152,15 @@ jobs:
       - name: Build hub (aarch64 musl)
         run: cargo zigbuild --release -p wavvon-hub --target aarch64-unknown-linux-musl
 
+      - name: Build hub (x86_64 glibc)
+        run: cargo build --release -p wavvon-hub --target x86_64-unknown-linux-gnu
+
       - name: Rename artifacts
         run: |
           cp target/x86_64-unknown-linux-musl/release/wavvon-hub  wavvon-hub-linux-x86_64
           cp target/x86_64-unknown-linux-musl/release/wavvon-farm wavvon-farm-linux-x86_64
           cp target/aarch64-unknown-linux-musl/release/wavvon-hub wavvon-hub-linux-aarch64
+          cp target/x86_64-unknown-linux-gnu/release/wavvon-hub   wavvon-hub-linux-x86_64-glibc
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
@@ -167,3 +169,4 @@ jobs:
             wavvon-hub-linux-x86_64
             wavvon-farm-linux-x86_64
             wavvon-hub-linux-aarch64
+            wavvon-hub-linux-x86_64-glibc

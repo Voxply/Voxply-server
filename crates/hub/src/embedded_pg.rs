@@ -266,9 +266,37 @@ pub fn running_url(data_root: &Path) -> Option<String> {
     ))
 }
 
+/// Can this build run the bundled server at all?
+///
+/// False on musl, and it is a property of the build rather than of the host:
+/// the archive is picked by target, and the musl one is not self-contained
+/// (see `explain_dynamic_link_failure`). Deciding it at compile time means the
+/// answer is available before anything is downloaded, unpacked or run — which
+/// is what lets `--doctor` and `start` say so in one sentence instead of after
+/// a failed `initdb`.
+pub const BUNDLED_AVAILABLE: bool = !cfg!(target_env = "musl");
+
+/// The one explanation both `start` and `--doctor` use, so they cannot drift.
+pub fn unavailable_reason() -> String {
+    "this is the musl build of the hub, and its bundled PostgreSQL binaries are not \
+     self-contained: initdb needs ICU 74 (libicuuc.so.74) and libpq needs krb5, neither of \
+     which current musl distributions ship. Point WAVVON_DATABASE_URL at a PostgreSQL you \
+     provide — a database you built is never touched by the bundled mode — or run a glibc \
+     build of the hub."
+        .to_string()
+}
+
 /// Start (or adopt) the hub's own PostgreSQL under `data_root`, and return a
 /// handle carrying the URL to connect to.
 pub async fn start(data_root: &Path) -> Result<EmbeddedPostgres> {
+    // Refuse before touching the filesystem. Left to run, this creates the
+    // install root, downloads or unpacks an archive and only then dies inside
+    // initdb — leaving half a data directory behind and a relocation dump on
+    // the one path advertised as needing no prerequisites.
+    if !BUNDLED_AVAILABLE {
+        bail!("{}", unavailable_reason());
+    }
+
     let install_root = data_root.join("pg");
     let data_dir = data_root.join("pgdata");
     let state_file = install_root.join("embedded.json");

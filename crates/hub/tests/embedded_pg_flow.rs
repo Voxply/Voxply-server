@@ -49,6 +49,7 @@ fn scratch(name: &str) -> Scratch {
     Scratch(dir)
 }
 
+#[cfg(not(target_env = "musl"))]
 #[tokio::test]
 async fn the_bundled_postgres_starts_and_takes_the_hub_schema() {
     let _pg_lock = pg_lock().lock().await;
@@ -96,6 +97,7 @@ async fn the_bundled_postgres_starts_and_takes_the_hub_schema() {
 /// Restarting is the common case, and it must keep the data — which means
 /// keeping the port and the password, because initdb set that password once
 /// and a regenerated one would strand the directory it belongs to.
+#[cfg(not(target_env = "musl"))]
 #[tokio::test]
 async fn a_second_start_reuses_the_same_data_and_credentials() {
     let _pg_lock = pg_lock().lock().await;
@@ -142,6 +144,7 @@ async fn a_second_start_reuses_the_same_data_and_credentials() {
 
 /// A data directory from another major is refused, with the dump/restore path
 /// named. Never a half-migration, and never a guess.
+#[cfg(not(target_env = "musl"))]
 #[tokio::test]
 async fn data_from_another_major_is_refused_rather_than_touched() {
     let _pg_lock = pg_lock().lock().await;
@@ -169,6 +172,7 @@ async fn data_from_another_major_is_refused_rather_than_touched() {
 /// against a live data directory fails. Without adoption that means one crash
 /// costs a manual hunt for a process the operator never knew existed — on the
 /// install story whose whole promise is that there is nothing to administer.
+#[cfg(not(target_env = "musl"))]
 #[tokio::test]
 async fn a_server_left_running_is_adopted_rather_than_restarted() {
     let _pg_lock = pg_lock().lock().await;
@@ -201,6 +205,7 @@ async fn a_server_left_running_is_adopted_rather_than_restarted() {
 /// PATH and never will be. Starting the embedded server has to point the dump
 /// path at the binaries it is running, or "download a binary and run it" ships
 /// with a backup command that cannot work.
+#[cfg(not(target_env = "musl"))]
 #[tokio::test]
 async fn backup_and_restore_work_against_the_bundled_server() {
     let _pg_lock = pg_lock().lock().await;
@@ -266,4 +271,38 @@ async fn backup_and_restore_work_against_the_bundled_server() {
 
     pool.close().await;
     pg.stop().await.expect("stop");
+}
+
+// The musl build cannot run the bundled server at all, so on that target the
+// five tests above are not "skipped" — they assert something that is false
+// there, and the truth to assert instead is that the refusal is clean. A
+// silent skip would leave this file with nothing running on the one target
+// where bundled mode misbehaves, which is the failure mode the repo's own
+// WAVVON-TEST-SKIPPED guard exists to prevent.
+#[cfg(target_env = "musl")]
+#[tokio::test]
+async fn bundled_mode_refuses_up_front_and_touches_nothing() {
+    let root = scratch("musl-refusal");
+
+    let err = embedded_pg::start(&root.0)
+        .await
+        .expect_err("bundled mode must refuse on musl rather than half-installing");
+    let message = err.to_string();
+    // The operator needs the way out, not the diagnosis: name the variable
+    // that makes this hub work.
+    assert!(
+        message.contains("WAVVON_DATABASE_URL"),
+        "refusal must name the escape hatch, got: {message}"
+    );
+
+    // Nothing downloaded, unpacked or initialised. Failing inside initdb used
+    // to leave both of these behind.
+    assert!(
+        !root.0.join("pg").exists(),
+        "no install root may be created when bundled mode is unavailable"
+    );
+    assert!(
+        !root.0.join("pgdata").exists(),
+        "no data directory may be created when bundled mode is unavailable"
+    );
 }

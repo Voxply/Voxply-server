@@ -275,6 +275,18 @@ async fn run_doctor() -> bool {
         }
         None => {
             let data_dir = embedded_root.join("pgdata");
+            // Say it here rather than letting the operator find out at first
+            // boot: with no WAVVON_DATABASE_URL this build has no database it
+            // can reach, and doctor exists precisely to answer that before
+            // anything runs.
+            if !wavvon_hub::embedded_pg::BUNDLED_AVAILABLE {
+                println!(
+                    "FAIL  database: none — {} is unset and {}",
+                    wavvon_hub_env::DATABASE_URL,
+                    wavvon_hub::embedded_pg::unavailable_reason()
+                );
+                all_pass = false;
+            }
             match wavvon_hub::embedded_pg::bundled_major() {
                 Some(major) => println!(
                     "INFO  database: built-in PostgreSQL {major}, data in {}",
