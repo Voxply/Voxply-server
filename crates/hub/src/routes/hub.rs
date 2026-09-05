@@ -58,6 +58,19 @@ pub async fn update_hub(
         }
         upsert_setting(&state.db, "welcome_label", label).await?;
     }
+    // Longer than welcome_label because it is a sentence or two rather than a
+    // byline, and still capped: it renders inside a dialog, and an operator
+    // with a wall of text at the moment someone is leaving is the abuse this
+    // bound exists for.
+    if let Some(label) = req.farewell_label.as_deref() {
+        if label.chars().count() > 280 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "farewell_label must be at most 280 characters".to_string(),
+            ));
+        }
+        upsert_setting(&state.db, "farewell_label", label).await?;
+    }
     if let Some(invite_url) = req.welcome_invite_url.as_deref() {
         if !invite_url.is_empty() {
             validate_welcome_invite_url(invite_url)?;
@@ -556,6 +569,10 @@ pub struct UpdateHubRequest {
     /// `wavvon://`. Empty string clears the setting.
     #[serde(default)]
     pub welcome_invite_url: Option<String>,
+    /// Farewell shown when someone removes this hub from their device. Plain
+    /// text, max 280 chars. Empty string clears the setting.
+    #[serde(default)]
+    pub farewell_label: Option<String>,
     /// Hub-level invite role policy default (invite role policies). Role to
     /// grant a new user who joins via an invite that doesn't itself carry an
     /// explicit `grant_role_id`. Must reference an existing role that does

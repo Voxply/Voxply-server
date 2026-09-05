@@ -109,6 +109,19 @@ pub async fn info(State(state): State<Arc<AppState>>) -> Json<InfoResponse> {
     .flatten()
     .filter(|s| !s.is_empty());
 
+    // Shown by a client when someone removes this hub from their device. The
+    // operator writes it; the client renders it attributed and secondary,
+    // because that moment is exactly when a hub has an incentive to mislead
+    // (decisions.md, "Leave hub does not leave").
+    let farewell_label: Option<String> = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM hub_settings WHERE key = 'farewell_label'",
+    )
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten()
+    .filter(|s| !s.is_empty());
+
     let emoji_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM hub_emojis")
         .fetch_optional(&state.db)
         .await
@@ -161,6 +174,7 @@ pub async fn info(State(state): State<Arc<AppState>>) -> Json<InfoResponse> {
         lan_fingerprint: state.lan_fingerprint.clone(),
         welcome_label,
         welcome_invite_url,
+        farewell_label,
         voice_wt_url: state.voice_wt_url.clone(),
         voice_cert_hash: state.voice_cert_hash.read().await.clone(),
         timezone,
@@ -254,6 +268,10 @@ pub struct InfoResponse {
     /// Always `https://` or `wavvon://` when present. Absent when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub welcome_invite_url: Option<String>,
+    /// Operator-written farewell, shown when someone removes this hub from
+    /// their device. Absent when unset. Plain text, capped at 280 chars.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub farewell_label: Option<String>,
     /// Absolute `https://host:port/voice` URL for this hub's WebTransport
     /// voice endpoint (voice-transport-v2.md). Absent when the hub has no
     /// known public host (no `WAVVON_PUBLIC_URL` and not in LAN mode).

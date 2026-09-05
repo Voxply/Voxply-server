@@ -414,3 +414,77 @@ async fn a_message_over_the_configured_cap_is_refused() {
         .await
         .assert_status_success();
 }
+
+// ---------------------------------------------------------------------------
+// Farewell label — shown by a client when someone removes this hub from their
+// device (decisions.md, "Leave hub does not leave").
+
+#[tokio::test]
+async fn farewell_label_absent_by_default() {
+    let server = common::setup().await;
+    let owner = Identity::generate();
+    common::authenticate(&server, &owner).await;
+
+    let info: serde_json::Value = server.get("/info").await.json();
+    assert!(
+        info.get("farewell_label").is_none(),
+        "farewell_label should be absent when unset, not an empty string"
+    );
+}
+
+#[tokio::test]
+async fn farewell_label_round_trips_and_is_cleared_by_an_empty_string() {
+    let server = common::setup().await;
+    let owner = Identity::generate();
+    let token = common::authenticate(&server, &owner).await;
+
+    server
+        .patch("/hub")
+        .authorization_bearer(&token)
+        .json(&json!({ "farewell_label": "Sorry to see you go. The door stays open." }))
+        .await
+        .assert_status_ok();
+
+    let info: serde_json::Value = server.get("/info").await.json();
+    assert_eq!(
+        info["farewell_label"],
+        "Sorry to see you go. The door stays open."
+    );
+
+    server
+        .patch("/hub")
+        .authorization_bearer(&token)
+        .json(&json!({ "farewell_label": "" }))
+        .await
+        .assert_status_ok();
+
+    let info: serde_json::Value = server.get("/info").await.json();
+    assert!(
+        info.get("farewell_label").is_none(),
+        "an empty string clears the setting rather than serving an empty one"
+    );
+}
+
+#[tokio::test]
+async fn farewell_label_is_length_capped() {
+    let server = common::setup().await;
+    let owner = Identity::generate();
+    let token = common::authenticate(&server, &owner).await;
+
+    // Multi-byte on purpose: the cap counts characters, and a byte-length
+    // check would refuse a legitimate message in most of the languages the
+    // client ships.
+    server
+        .patch("/hub")
+        .authorization_bearer(&token)
+        .json(&json!({ "farewell_label": "é".repeat(280) }))
+        .await
+        .assert_status_ok();
+
+    server
+        .patch("/hub")
+        .authorization_bearer(&token)
+        .json(&json!({ "farewell_label": "é".repeat(281) }))
+        .await
+        .assert_status_bad_request();
+}
