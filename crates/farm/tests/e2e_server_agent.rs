@@ -30,15 +30,35 @@ use totp_rs::{Algorithm, Secret, TOTP};
 use wavvon_farm::{db, hub_manager::HubManager, server, state::FarmState, unix_now};
 use wavvon_identity::Identity;
 
-/// Wait until the `servers.host` column reads `want`, or fail saying what it
-/// held instead.
+/// Poll until the condition holds, or fail saying what was being waited for.
 ///
-/// A fixed pause after a WebSocket send is a race the farm loses on a loaded
-/// runner: nothing in the send acknowledges that the hello has been processed.
-/// `a_hello_without_a_host_clears_the_one_recorded_before` failed in CI on
-/// exactly that, having passed everywhere else — and it is worse than one
-/// flake, because two hellos in a row have to land *in order* for the
-/// assertion to mean anything, and a sleep does not establish that either.
+/// Nothing in a WebSocket send acknowledges that the farm has processed it, so
+/// every "say hello, then look" in this file is a race — invisible on a fast
+/// machine and lost on a loaded runner. Two tests here failed in CI that way
+/// while passing everywhere else, which is one per fixed sleep that was left.
+///
+/// The condition may await; it is expanded in place.
+macro_rules! wait_until {
+    ($what:expr, $cond:expr) => {{
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if $cond {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {}",
+                $what
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }};
+}
+
+/// Wait until the `servers.host` column reads `want`, or fail saying what it
+/// held instead. Two hellos in a row also have to land *in order* for the
+/// assertion that follows them to mean anything, and a sleep does not
+/// establish that either.
 async fn wait_for_host(db: &sqlx::PgPool, server_id: &str, want: Option<&str>) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -56,6 +76,28 @@ async fn wait_for_host(db: &sqlx::PgPool, server_id: &str, want: Option<&str>) {
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+/// Whether the farm currently reports `server_id` as connected.
+async fn agent_connected(client: &Client, base: &str, token: &str, server_id: &str) -> bool {
+    let Ok(resp) = client
+        .get(format!("{base}/farm/admin/servers"))
+        .bearer_auth(token)
+        .send()
+        .await
+    else {
+        return false;
+    };
+    let Ok(body) = resp.json::<Value>().await else {
+        return false;
+    };
+    body["servers"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .any(|s| s["id"] == server_id && s["connected"].as_bool().unwrap_or(false))
+        })
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -207,8 +249,10 @@ async fn server_agent_connects_and_receives_hub_spawn() {
         .await
         .unwrap();
 
-    // Brief pause for the farm to process the hello and update last_seen_at.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_until!(
+        "the agent to show connected",
+        agent_connected(&client, &base, &token, &server_id).await
+    );
 
     // --- 4. Confirm server shows as connected ---
     let resp = client
@@ -263,7 +307,15 @@ async fn server_agent_connects_and_receives_hub_spawn() {
         .await
         .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_until!("the hub row to be assigned to the agent", {
+        let assigned: Option<String> =
+            sqlx::query_scalar("SELECT server_id FROM hubs WHERE id = $1")
+                .bind(&hub_id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assigned.is_some()
+    });
 
     // --- 8. Verify hub row is assigned to our server ---
     let assigned_server_id: Option<String> =
@@ -355,8 +407,10 @@ async fn create_hub_via_agent(
         .await
         .unwrap();
 
-    // Brief pause for the farm to process hello and register the sender.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_until!(
+        "the agent to be registered before a hub is created through it",
+        agent_connected(client, base, token, &server_id).await
+    );
 
     // Create a hub — farm should delegate the spawn to our connected agent.
     let resp = client
@@ -500,13 +554,15 @@ async fn force_restart_agent_hosted_hub_offline_agent_returns_503() {
         .await
         .unwrap();
 
-    let (ws_write, ws_read, hub_id, _server_id) =
+    let (ws_write, ws_read, hub_id, server_id) =
         create_hub_via_agent(&client, &base, &token, &state.db).await;
 
     // Drop the mock agent's WebSocket connection to simulate it going offline.
     drop(ws_write);
     drop(ws_read);
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_until!("the agent to show disconnected", {
+        !agent_connected(&client, &base, &token, &server_id).await
+    });
 
     let resp = client
         .post(format!("{base}/farm/hubs/{hub_id}/restart"))
@@ -806,7 +862,7 @@ async fn the_spawn_command_carries_the_database_name_and_template() {
         ))
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_host(&state.db, &server_id, Some("node-4.example")).await;
 
     let resp = client
         .post(format!("{base}/farm/hubs"))
