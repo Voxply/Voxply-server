@@ -444,3 +444,47 @@ async fn auth_records_the_presented_cert_in_the_device_registry() {
     assert_eq!(devices.len(), 1);
     assert_eq!(devices[0]["subkey_pubkey"], laptop.public_key_hex());
 }
+
+/// A rejected sign-in must leave nothing behind. The cert is verified early,
+/// in `resolve_canonical_identity`, but the gates that can still refuse the
+/// request — ban, invite, proof-of-work — all run after it, so recording the
+/// device there would have written a row for someone the hub just turned away.
+#[tokio::test]
+async fn a_banned_device_is_not_recorded_in_the_registry() {
+    let (server, db) = setup().await;
+    let master = Identity::generate().master().unwrap();
+    let laptop = DeviceSubkey::generate("laptop".into());
+    let cert = make_cert(&master, &laptop.public_key_hex(), "laptop");
+
+    // Sign in once so the canonical row exists, then ban it.
+    auth_with_cert(&server, &laptop, Some(&cert))
+        .await
+        .expect("first auth should succeed");
+    sqlx::query(
+        "INSERT INTO bans (target_public_key, banned_by, reason, created_at)
+         VALUES ($1, $1, NULL, 0)",
+    )
+    .bind(master.public_key_hex())
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM subkey_certs WHERE master_pubkey = $1")
+        .bind(master.public_key_hex())
+        .execute(&db)
+        .await
+        .unwrap();
+
+    let second = DeviceSubkey::generate("phone".into());
+    let second_cert = make_cert(&master, &second.public_key_hex(), "phone");
+    auth_with_cert(&server, &second, Some(&second_cert))
+        .await
+        .expect_err("a banned identity must not be able to sign in");
+
+    let rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM subkey_certs WHERE master_pubkey = $1")
+            .bind(master.public_key_hex())
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(rows, 0, "a refused sign-in must not write to the registry");
+}
