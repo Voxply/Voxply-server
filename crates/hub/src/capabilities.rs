@@ -41,6 +41,12 @@ pub const CAPABILITIES: &[&str] = &[
     // hub ignores both and returns one truncated page — a client that pages
     // to exhaustion against an older hub sees a short list, not an error.
     "list.cursor",
+    // `DELETE /me` — a member can remove themselves from the hub: profile and
+    // roles cleared, the pubkey kept as the anchor moderation and message
+    // history point at. Gated because a client must not offer "leave this
+    // community" against a hub that would answer 404, leaving the person
+    // believing they left.
+    "hub.leave",
     // Device pairing: subkey certs presented at `/auth/verify`, and the
     // ECIES-wrapped canonical DH material a paired device needs for DMs.
     "pairing.subkey",

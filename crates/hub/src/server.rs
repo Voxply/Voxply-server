@@ -229,7 +229,12 @@ pub fn create_router_full(
         )
         .merge(auth_routes)
         .merge(write_routes)
-        .route("/me", get(routes::me::me).patch(routes::me::update_me))
+        .route(
+            "/me",
+            get(routes::me::me)
+                .patch(routes::me::update_me)
+                .delete(routes::me::leave_hub),
+        )
         .route("/me/credentials", get(routes::webauthn::list_credentials))
         .route(
             "/me/credentials/{id}",
