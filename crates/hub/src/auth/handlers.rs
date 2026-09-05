@@ -48,6 +48,17 @@ pub async fn resolve_canonical_identity(
     }
     let master = cert.master_pubkey.clone();
 
+    // Record the device while we have a verified cert in hand. Auth used to
+    // write only `users.master_pubkey`, which is the link every home-hub
+    // lookup needs but not what the Devices screen reads — that lists
+    // `subkey_certs`, so a device whose cert arrived at auth rather than
+    // through `POST /identity/{master}/devices` was linked and still absent
+    // from its owner's own device list. Best-effort: a registry write must
+    // not fail a sign-in.
+    if let Err(e) = crate::routes::identity::upsert_subkey_cert(db, cert).await {
+        tracing::warn!("could not record device cert at auth: {e}");
+    }
+
     // Existing multi-device user?
     if let Some(canonical) =
         sqlx::query_scalar::<_, String>("SELECT public_key FROM users WHERE master_pubkey = $1")

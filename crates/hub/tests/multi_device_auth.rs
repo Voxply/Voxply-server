@@ -404,3 +404,43 @@ async fn non_revoked_key_is_not_affected() {
         .await
         .assert_status_unauthorized();
 }
+
+/// A device that presents its cert at auth must land in the device registry,
+/// not only on the user row. The two are read by different things: home-hub
+/// lookups follow `users.master_pubkey`, while the Devices screen lists
+/// `subkey_certs` — so recording one without the other left a device linked
+/// and invisible to its own owner, with nothing reporting it.
+#[tokio::test]
+async fn auth_records_the_presented_cert_in_the_device_registry() {
+    let (server, db) = setup().await;
+    let master = Identity::generate().master().unwrap();
+    let laptop = DeviceSubkey::generate("laptop".into());
+    let cert = make_cert(&master, &laptop.public_key_hex(), "laptop");
+
+    auth_with_cert(&server, &laptop, Some(&cert))
+        .await
+        .expect("auth should succeed");
+
+    let label: Option<String> = sqlx::query_scalar(
+        "SELECT device_label FROM subkey_certs WHERE master_pubkey = $1 AND subkey_pubkey = $2",
+    )
+    .bind(master.public_key_hex())
+    .bind(laptop.public_key_hex())
+    .fetch_optional(&db)
+    .await
+    .unwrap();
+    assert_eq!(
+        label.as_deref(),
+        Some("laptop"),
+        "the cert presented at auth should be in the registry the device list reads"
+    );
+
+    // And the endpoint that list actually calls agrees.
+    let resp = server
+        .get(&format!("/identity/{}/devices", master.public_key_hex()))
+        .await;
+    resp.assert_status_ok();
+    let devices: Vec<serde_json::Value> = resp.json();
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0]["subkey_pubkey"], laptop.public_key_hex());
+}
