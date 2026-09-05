@@ -38,16 +38,20 @@ cargo test -p wavvon-hub                 # single crate
 cargo build --release
 ```
 
-Hub CLI (binary at `target/release/wavvon-hub`):
+Hub CLI (binary at `target/release/wavvon-hub`) — `--help` is the source of
+truth; `--doctor` is an option, not a subcommand:
 
 ```bash
+./target/release/wavvon-hub setup        # interactive wizard: docker-compose.yml + .env
 ./target/release/wavvon-hub migrate      # apply DB migrations
-./target/release/wavvon-hub doctor       # pre-flight checks (ports, TLS, disk)
-./target/release/wavvon-hub admin stats
+./target/release/wavvon-hub --doctor     # pre-flight checks (ports, TLS, disk, DB mode)
+./target/release/wavvon-hub admin stats  # admin <stats|users|channels|tokens|backup|restore>
 ./target/release/wavvon-hub admin users set-owner <pubkey>   # bootstrap ownership
 ./target/release/wavvon-hub backup FILE
-./target/release/wavvon-hub restore FILE
+./target/release/wavvon-hub restore FILE [--force]
+./target/release/wavvon-hub db move --to URL     # copy the DB elsewhere; never switches mode
 ./target/release/wavvon-hub rotate-key
+./target/release/wavvon-hub update [--check]     # Linux x86_64 only
 ```
 
 The farm has an equivalent `migrate` subcommand. All binaries are configured
@@ -71,6 +75,13 @@ moderation, E2E DMs, federation (outbox DMs, alliances, federated ban lists),
 bots/webhooks, soundboard, recovery-contact attestation, and background workers
 for DM outbox delivery, ban-list sync, data retention + rotation-request expiry,
 and cert maintenance.
+
+It is also a **home hub** for whoever designates it: `routes/identity.rs` holds
+the personal axis — the master-signed `HomeHubList` designation, the device
+registry (`subkey_certs`) and revocations, pairing's short-lived state, and the
+user's encrypted prefs blob. A DM accepted here is mirror-forwarded to the
+recipient's other home hubs through the same outbox. See the wiki's
+`home-hub.md`; the split from community-axis state is the two-axis rule below.
 
 Layout under `crates/hub/src/`:
 - `routes/` — one file per HTTP resource group
@@ -167,6 +178,24 @@ runs the matrix against both ends of the supported range. Pool size is
 `WAVVON_DB_MAX_CONNECTIONS` (default 5) on hub and farm — it caps concurrent
 *queries*, not concurrent users, and the sum across hubs sharing one server must
 stay under its `max_connections`.
+
+**The hub bundles PostgreSQL, and the mode is chosen by absence.** With no
+`WAVVON_DATABASE_URL` the hub starts and manages its own server
+(`crates/hub/src/embedded_pg.rs`); with one, it uses that and never touches a
+server it did not create. Installs are version-scoped
+(`<data_root>/pg/<version>/`) and the previous major's binaries are never
+deleted, because they are what can still read old data. On a major mismatch the
+hub **refuses with instructions** rather than starting — half-migrating a data
+directory is unrecoverable. `--doctor` reports which mode is active and where
+the data lives; `backup`/`restore` go through the bundled `pg_dump`.
+
+Two live caveats: **bundled mode does not work on musl** (the archive's `initdb`
+wants `libicuuc.so.74`, which no current Alpine ships, and its `libpq.so.5` also
+wants krb5) even though the release still publishes musl targets advertising a
+no-prerequisites path; and **the major-upgrade path has never been walked end to
+end** — the refusal is tested, the dump-with-old/restore-with-new it names is
+not. Both are open items in the wiki's `next-up.md`. The Docker image is
+unaffected: it is `debian:trixie-slim`, so it gets the glibc archive.
 
 **List endpoints paginate with one dialect:** an array plus `limit` and a keyset
 cursor. No envelope, no offset paging, no second shape. A paginated endpoint also
