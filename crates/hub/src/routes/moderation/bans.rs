@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 
 use crate::auth::middleware::AuthUser;
 use crate::permissions::{self, BAN_MEMBERS, KICK_MEMBERS, MUTE_MEMBERS, TIMEOUT_MEMBERS};
 use crate::routes::moderation_models::*;
+use crate::routes::paging::PageQuery;
 use crate::state::AppState;
 
 use super::models::{require_can_moderate, BanRow, MuteRow};
@@ -128,13 +129,20 @@ pub async fn unban_user(
 pub async fn list_bans(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
+    Query(page): Query<PageQuery>,
 ) -> Result<Json<Vec<BanResponse>>, (StatusCode, String)> {
     let perms = permissions::user_permissions(&state.db, &user.public_key).await?;
     perms.require(BAN_MEMBERS)?;
 
     let rows = sqlx::query_as::<_, BanRow>(
-        "SELECT target_public_key, banned_by, reason, created_at FROM bans ORDER BY created_at DESC",
+        "SELECT target_public_key, banned_by, reason, created_at FROM bans
+         WHERE ($1::text IS NULL OR (created_at, target_public_key) <
+                ((SELECT created_at FROM bans WHERE target_public_key = $1), $1))
+         ORDER BY created_at DESC, target_public_key DESC
+         LIMIT $2",
     )
+    .bind(page.cursor())
+    .bind(page.limit())
     .fetch_all(&state.db)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
@@ -214,13 +222,20 @@ pub async fn unmute_user(
 pub async fn list_mutes(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
+    Query(page): Query<PageQuery>,
 ) -> Result<Json<Vec<MuteResponse>>, (StatusCode, String)> {
     let perms = permissions::user_permissions(&state.db, &user.public_key).await?;
     perms.require(MUTE_MEMBERS)?;
 
     let rows = sqlx::query_as::<_, MuteRow>(
-        "SELECT target_public_key, muted_by, reason, expires_at, created_at FROM mutes ORDER BY created_at DESC",
+        "SELECT target_public_key, muted_by, reason, expires_at, created_at FROM mutes
+         WHERE ($1::text IS NULL OR (created_at, target_public_key) <
+                ((SELECT created_at FROM mutes WHERE target_public_key = $1), $1))
+         ORDER BY created_at DESC, target_public_key DESC
+         LIMIT $2",
     )
+    .bind(page.cursor())
+    .bind(page.limit())
     .fetch_all(&state.db)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;

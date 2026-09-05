@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::Serialize;
@@ -8,6 +8,7 @@ use serde::Serialize;
 use crate::auth::middleware::AuthUser;
 use crate::permissions;
 use crate::routes::chat_models::{ChatEvent, WsServerMessage};
+use crate::routes::paging::PageQuery;
 use crate::state::AppState;
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -119,6 +120,7 @@ pub async fn list_pins(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
     Path(channel_id): Path<String>,
+    Query(page): Query<PageQuery>,
 ) -> Result<Json<Vec<PinResponse>>, (StatusCode, String)> {
     // Verify channel exists.
     let exists: Option<String> = sqlx::query_scalar("SELECT id FROM channels WHERE id = $1")
@@ -156,9 +158,15 @@ pub async fn list_pins(
          INNER JOIN messages m ON m.id = cp.message_id
          LEFT JOIN users u ON u.public_key = m.sender
          WHERE cp.channel_id = $1
-         ORDER BY cp.pinned_at DESC",
+           AND ($2::text IS NULL OR (cp.pinned_at, cp.message_id) <
+                ((SELECT pinned_at FROM channel_pins
+                  WHERE channel_id = $1 AND message_id = $2), $2))
+         ORDER BY cp.pinned_at DESC, cp.message_id DESC
+         LIMIT $3",
     )
     .bind(&channel_id)
+    .bind(page.cursor())
+    .bind(page.limit())
     .fetch_all(&state.db)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;

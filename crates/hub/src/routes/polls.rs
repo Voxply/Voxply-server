@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -10,6 +10,7 @@ use uuid::Uuid;
 use crate::auth::middleware::AuthUser;
 use crate::permissions;
 use crate::routes::chat_models::{ChatEvent, MessageResponse, WsServerMessage};
+use crate::routes::paging::PageQuery;
 use crate::state::AppState;
 
 // ---------------------------------------------------------------------------
@@ -262,6 +263,7 @@ pub async fn list_polls(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
     Path(channel_id): Path<String>,
+    Query(page): Query<PageQuery>,
 ) -> Result<Json<Vec<PollListItem>>, (StatusCode, String)> {
     let exists: Option<String> = sqlx::query_scalar("SELECT id FROM channels WHERE id = $1")
         .bind(&channel_id)
@@ -278,9 +280,14 @@ pub async fn list_polls(
     let polls: Vec<PollResponse> = sqlx::query_as(
         "SELECT id, channel_id, creator_pubkey, question, options, ends_at, max_choices, created_at
          FROM polls WHERE channel_id = $1
-         ORDER BY created_at DESC, id DESC",
+           AND ($2::text IS NULL OR (created_at, id) <
+                ((SELECT created_at FROM polls WHERE id = $2), $2))
+         ORDER BY created_at DESC, id DESC
+         LIMIT $3",
     )
     .bind(&channel_id)
+    .bind(page.cursor())
+    .bind(page.limit())
     .fetch_all(&state.db)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;

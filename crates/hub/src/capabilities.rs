@@ -41,6 +41,14 @@ pub const CAPABILITIES: &[&str] = &[
     // hub ignores both and returns one truncated page — a client that pages
     // to exhaustion against an older hub sees a short list, not an error.
     "list.cursor",
+    // The same `limit` + keyset `cursor` dialect on the rest of the lists that
+    // grow with use: `GET /moderation/bans`, `/moderation/mutes`, `/invites`,
+    // `/hub/pending`, `/conversations`, `/channels/{id}/pins` and
+    // `/channels/{id}/polls`. A second string rather than widening
+    // `list.cursor`, because a client that pages one of these against a hub
+    // advertising only `list.cursor` would page an endpoint that ignores the
+    // cursor and hand back the first page over and over.
+    "list.cursor.lists",
     // `DELETE /me` — a member can remove themselves from the hub: profile and
     // roles cleared, the pubkey kept as the anchor moderation and message
     // history point at. Gated because a client must not offer "leave this

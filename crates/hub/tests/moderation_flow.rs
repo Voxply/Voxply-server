@@ -1096,3 +1096,61 @@ async fn banned_user_leaves_the_member_list_and_cannot_return() {
         .await
         .assert_status(axum::http::StatusCode::FORBIDDEN);
 }
+
+/// The list dialect on `/moderation/bans`: `limit` bounds the page and the
+/// `cursor` resumes strictly past it, so walking pages sees every ban exactly
+/// once. Worth a test because the keyset predicate resolves the cursor with a
+/// subquery against the same table — a wrong comparison there silently drops
+/// or repeats rows rather than erroring.
+#[tokio::test]
+async fn bans_page_by_cursor_without_gaps_or_repeats() {
+    let server = common::setup().await;
+
+    let owner = Identity::generate();
+    let owner_token = common::authenticate(&server, &owner).await;
+
+    let mut banned: Vec<String> = Vec::new();
+    for _ in 0..5 {
+        let victim = Identity::generate();
+        // `bans.target_public_key` is a foreign key: the victim has to have
+        // met the hub before it can ban them.
+        let _ = common::authenticate(&server, &victim).await;
+        let pubkey = victim.public_key_hex();
+        let resp = server
+            .post("/moderation/bans")
+            .authorization_bearer(&owner_token)
+            .json(&json!({ "target_public_key": pubkey, "reason": "test" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        banned.push(pubkey);
+    }
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..10 {
+        let mut path = "/moderation/bans?limit=2".to_string();
+        if let Some(c) = &cursor {
+            path.push_str(&format!("&cursor={c}"));
+        }
+        let page: Vec<BanResponse> = server
+            .get(&path)
+            .authorization_bearer(&owner_token)
+            .await
+            .json();
+        let short = page.len() < 2;
+        cursor = page.last().map(|b| b.target_public_key.clone());
+        seen.extend(page.into_iter().map(|b| b.target_public_key));
+        if short || cursor.is_none() {
+            break;
+        }
+    }
+
+    let mut unique = seen.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), seen.len(), "paging repeated a ban: {seen:?}");
+
+    let mut expected = banned;
+    expected.sort();
+    assert_eq!(unique, expected, "paging dropped a ban");
+}

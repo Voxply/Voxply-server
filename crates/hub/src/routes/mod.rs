@@ -31,6 +31,7 @@ pub mod messages;
 pub mod metrics;
 pub mod moderation;
 pub mod moderation_models;
+pub mod paging;
 pub mod pairing;
 pub mod pins;
 pub mod polls;

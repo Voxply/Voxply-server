@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -9,6 +9,7 @@ use rand::RngCore;
 use crate::auth::middleware::AuthUser;
 use crate::permissions::{self, MANAGE_CHANNELS};
 use crate::routes::invite_models::{CreateInviteRequest, InviteResponse};
+use crate::routes::paging::PageQuery;
 use crate::state::AppState;
 
 /// Short expiry forced onto invites that grant an admin-holding role (or
@@ -115,13 +116,20 @@ pub async fn create_invite(
 pub async fn list_invites(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
+    Query(page): Query<PageQuery>,
 ) -> Result<Json<Vec<InviteResponse>>, (StatusCode, String)> {
     let perms = permissions::user_permissions(&state.db, &user.public_key).await?;
     perms.require(MANAGE_CHANNELS)?;
 
     let rows = sqlx::query_as::<_, InviteRow>(
-        "SELECT code, created_by, max_uses, uses, expires_at, created_at, grant_role_id FROM invites ORDER BY created_at DESC",
+        "SELECT code, created_by, max_uses, uses, expires_at, created_at, grant_role_id FROM invites
+         WHERE ($1::text IS NULL OR (created_at, code) <
+                ((SELECT created_at FROM invites WHERE code = $1), $1))
+         ORDER BY created_at DESC, code DESC
+         LIMIT $2",
     )
+    .bind(page.cursor())
+    .bind(page.limit())
     .fetch_all(&state.db)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;

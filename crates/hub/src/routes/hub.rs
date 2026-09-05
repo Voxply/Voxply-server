@@ -1,13 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::middleware::AuthUser;
 use crate::permissions::{self, ADMIN};
+use crate::routes::paging::PageQuery;
 use crate::routes::role_models::RoleResponse;
 use crate::state::AppState;
 
@@ -236,15 +237,23 @@ fn validate_welcome_invite_url(raw: &str) -> Result<(), (StatusCode, String)> {
 pub async fn list_pending(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
+    Query(page): Query<PageQuery>,
 ) -> Result<Json<Vec<PendingUser>>, (StatusCode, String)> {
     let perms = permissions::user_permissions(&state.db, &user.public_key).await?;
     perms.require(ADMIN)?;
 
+    // Oldest first — the queue is worked from the front, so the cursor moves
+    // forward rather than back like the newest-first lists.
     let rows = sqlx::query_as::<_, PendingUserRow>(
         "SELECT public_key, display_name, first_seen_at
          FROM users WHERE approval_status = 'pending'
-         ORDER BY first_seen_at",
+           AND ($1::text IS NULL OR (first_seen_at, public_key) >
+                ((SELECT first_seen_at FROM users WHERE public_key = $1), $1))
+         ORDER BY first_seen_at, public_key
+         LIMIT $2",
     )
+    .bind(page.cursor())
+    .bind(page.limit())
     .fetch_all(&state.db)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
