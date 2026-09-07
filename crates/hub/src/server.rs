@@ -90,7 +90,7 @@ pub fn create_router_full(
     trusted_proxy: bool,
     web_client: Option<Arc<WebClientConfig>>,
 ) -> Router {
-    let auth_limiter = RateLimiter::new(Config::AUTH, trusted_proxy);
+    let auth_limiter = RateLimiter::new(Config::auth(), trusted_proxy);
     let write_limiter = RateLimiter::new(Config::WRITE, trusted_proxy);
 
     // `GET /join/{code}` answers a browser with the web client and a program
