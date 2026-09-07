@@ -225,6 +225,22 @@ client's WebSocket enum matched unknown events as `Other => {}`, so four hub
 features were simply absent with no symptom. Both cost months. When you add a
 catch-all arm or a cross-process string, make the unknown case say something.
 
+Two hub-side instances from 2026-09-07, both the "transient read as final"
+variant: the DM outbox dropped an unparsable envelope with `.ok()` and
+delivered the message hollow, recording it a success — and the naive fix
+(propagate the error) would have parked the whole queue behind one bad row,
+so the two failures are now distinguished, `Db` ending the pass and
+`Unreadable` bouncing that row alone. The other was the demo bot exiting on a
+429 from the shared per-IP auth limiter while waiting to be invited, which
+kept the clients' live workflow red for days.
+
+**The auth limiter is per IP and one login costs two requests** — a shared
+address (office, school, CGNAT) spends the default budget on ordinary
+arrivals, and to the person turned away it looks like a hub that will not have
+them. `WAVVON_AUTH_RATE_BURST` / `WAVVON_AUTH_RATE_PER_SEC` exist for that;
+the defaults are unchanged. If you are debugging "the client keeps landing on
+the welcome screen", check for 429s before anything else.
+
 **Recovery/attestation signing uses the identity key the hub knows the user by**
 (the roster pubkey), NOT a derived multi-device master key — contacts are
 designated and requests approved against hub-known pubkeys. The master key signs
