@@ -173,21 +173,39 @@ async fn load_envelope(
     let is_encrypted = msg.7;
     let is_group_encrypted = msg.9;
 
-    let encrypted_envelope = if is_encrypted {
-        msg.8
-            .as_deref()
-            .and_then(|s| serde_json::from_str::<EncryptedDmEnvelope>(s).ok())
-    } else {
-        None
+    // A row that says "encrypted" and whose stored envelope will not parse
+    // still gets delivered, as an encrypted DM with nothing in it — which at
+    // the far end is indistinguishable from a tampered message, and the
+    // outbox counts it a success. Nothing has been seen to produce that, but
+    // this is the crate that changes envelope formats without migrating what
+    // is already queued, so say it out loud rather than ship it quietly.
+    // Bouncing the single row (as the delivery-failure branch does) is the
+    // real treatment; it needs `tick` to stop propagating one bad row into
+    // the whole batch first.
+    let parse_envelope = |flag: bool, kind: &str| -> Option<&str> {
+        if !flag {
+            return None;
+        }
+        match msg.8.as_deref() {
+            Some(s) => Some(s),
+            None => {
+                tracing::error!(message_id = %msg.0, "DM {kind} but ciphertext_json is NULL");
+                None
+            }
+        }
     };
 
-    let group_encrypted_envelope = if is_group_encrypted {
-        msg.8
-            .as_deref()
-            .and_then(|s| serde_json::from_str::<GroupEncryptedEnvelope>(s).ok())
-    } else {
-        None
-    };
+    let encrypted_envelope = parse_envelope(is_encrypted, "is_encrypted").and_then(|s| {
+        serde_json::from_str::<EncryptedDmEnvelope>(s)
+            .map_err(|e| tracing::error!(message_id = %msg.0, "unparsable EncryptedDmEnvelope, delivering without it: {e}"))
+            .ok()
+    });
+
+    let group_encrypted_envelope = parse_envelope(is_group_encrypted, "is_group_encrypted").and_then(|s| {
+        serde_json::from_str::<GroupEncryptedEnvelope>(s)
+            .map_err(|e| tracing::error!(message_id = %msg.0, "unparsable GroupEncryptedEnvelope, delivering without it: {e}"))
+            .ok()
+    });
 
     // Re-derive the top-level signer_cert from the stored envelope so a
     // retried delivery carries the same cert-chained attribution proof the
